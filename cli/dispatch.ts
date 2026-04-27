@@ -1,5 +1,11 @@
+import { runApprove } from "./commands/approve.ts";
+import { runDoctor } from "./commands/doctor.ts";
+import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
+import { runPlans } from "./commands/plans.ts";
 import { runProfile } from "./commands/profile.ts";
+import { runReject } from "./commands/reject.ts";
+import { runRevise } from "./commands/revise.ts";
 import { runStub } from "./commands/stubs.ts";
 
 const HELP = `jarvis — autonomous agent system
@@ -9,19 +15,23 @@ Usage: yarn jarvis <command> [options]
 Setup & lifecycle:
   install [--data-dir <path>] [--remote <url>]
                               First-time setup
-  doctor                      Health check (stub — M2 follow-up)
+  doctor                      Health check
   profile                     Show user profile summary
   profile edit                Open user-profile.json in $EDITOR
 
 Plans:
-  plans [filters]             List plans (stub — M2 follow-up)
+  plans [filters]             List plans (filters: --app, --status, --type,
+                              --subtype, --priority, --executing, --approved,
+                              --pending-review, --format table|json)
   plan --app <name> "<brief>" Draft a new plan (stub — M4)
-  approve <id>                Approve a plan (stub — M2 follow-up)
-  revise <id> "<note>"        Send back to draft (stub — M2 follow-up)
-  reject <id>                 Reject a plan (stub — M2 follow-up)
+  approve <id> [--confirm-destructive]
+                              Approve a plan
+  revise <id> "<feedback>"    Send back to draft with feedback
+  reject <id> [--category <cat>] [--note "..."]
+                              Reject a plan
 
 Inbox:
-  inbox                       Show pending reviews (stub — M2 follow-up)
+  inbox                       Show pending plan reviews + setup tasks
 
 Utilities:
   run <agent> <task>          Direct agent invocation (stub — M3+)
@@ -30,16 +40,7 @@ Utilities:
 For full reference see docs/MASTER_PLAN.md §17.
 `;
 
-const STUB_COMMANDS = new Set([
-  "doctor",
-  "inbox",
-  "plans",
-  "approve",
-  "revise",
-  "reject",
-  "plan",
-  "run",
-]);
+const STUB_COMMANDS = new Set(["plan", "run"]);
 
 export async function dispatch(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
@@ -59,6 +60,18 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runInstall(rest);
     case "profile":
       return runProfile(rest);
+    case "doctor":
+      return runDoctor(rest);
+    case "plans":
+      return runPlans(rest);
+    case "inbox":
+      return runInbox(rest);
+    case "approve":
+      return runApprove(rest);
+    case "revise":
+      return runRevise(rest);
+    case "reject":
+      return runReject(rest);
     default:
       if (STUB_COMMANDS.has(command)) {
         return runStub(command);

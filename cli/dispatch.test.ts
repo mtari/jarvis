@@ -74,17 +74,8 @@ describe("dispatch", () => {
     }
   });
 
-  it("routes stub commands to the stub handler (returns 1)", async () => {
-    for (const cmd of [
-      "doctor",
-      "inbox",
-      "plans",
-      "approve",
-      "revise",
-      "reject",
-      "plan",
-      "run",
-    ]) {
+  it("routes remaining stub commands (plan, run) to the stub handler", async () => {
+    for (const cmd of ["plan", "run"]) {
       const cap = captureWrites();
       try {
         const code = await dispatch([cmd]);
