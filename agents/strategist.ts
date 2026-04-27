@@ -7,7 +7,7 @@ import type { Brain } from "../orchestrator/brain.ts";
 import { loadBrain } from "../orchestrator/brain.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
 import { recordFeedback } from "../orchestrator/feedback-store.ts";
-import { savePlan } from "../orchestrator/plan-store.ts";
+import { findPlan, savePlan } from "../orchestrator/plan-store.ts";
 import { parsePlan, transitionPlan } from "../orchestrator/plan.ts";
 import type { Plan } from "../orchestrator/plan.ts";
 import type { Profile } from "../orchestrator/profile.ts";
@@ -385,5 +385,233 @@ export function createStdinPrompter(): Prompter {
     print(message) {
       process.stdout.write(`${message}\n`);
     },
+  };
+}
+
+// ---------- Redraft (revision loop) ----------
+
+export interface RedraftPlanInput {
+  client: AnthropicClient;
+  planId: string;
+  app: string;
+  vault: string;
+  dataDir: string;
+}
+
+export interface RedraftPlanResult {
+  planId: string;
+  planPath: string;
+  revisionRound: number;
+}
+
+interface RedraftHistory {
+  originalBrief: string;
+  revisionFeedback: string[];
+}
+
+function readRedraftHistory(
+  dataDir: string,
+  planId: string,
+): RedraftHistory {
+  const db = new Database(dbFile(dataDir), { readonly: true });
+  try {
+    let originalBrief = "";
+    const draftEvents = db
+      .prepare(
+        "SELECT payload FROM events WHERE kind = 'plan-drafted' ORDER BY id ASC",
+      )
+      .all() as Array<{ payload: string }>;
+    for (const e of draftEvents) {
+      const parsed = JSON.parse(e.payload) as {
+        planId?: string;
+        brief?: string;
+      };
+      if (parsed.planId === planId && typeof parsed.brief === "string") {
+        originalBrief = parsed.brief;
+        break;
+      }
+    }
+    const fbRows = db
+      .prepare(
+        "SELECT note FROM feedback WHERE kind = 'revise' AND target_id = ? ORDER BY id ASC",
+      )
+      .all(planId) as Array<{ note: string | null }>;
+    const revisionFeedback = fbRows
+      .map((r) => r.note ?? "")
+      .filter((n) => n.length > 0);
+    return { originalBrief, revisionFeedback };
+  } finally {
+    db.close();
+  }
+}
+
+function buildRedraftContext(args: {
+  brain: Brain;
+  profile: Profile;
+  planType: StrategistPlanType;
+  subtypeHint?: string;
+  originalBrief: string;
+  currentPlanMarkdown: string;
+  revisionFeedback: string[];
+}): string {
+  const lines: string[] = [];
+  lines.push(`Plan type: ${args.planType}`);
+  lines.push("Action: REDRAFT this plan to address every revision-feedback point.");
+  lines.push("");
+  lines.push(
+    `Original brief: ${args.originalBrief || "(no brief recorded — read it off the current plan's ## Problem section)"}`,
+  );
+  lines.push("");
+  lines.push("Project context (brain):");
+  lines.push(`- name: ${args.brain.projectName}`);
+  lines.push(`- type: ${args.brain.projectType}`);
+  lines.push(`- status: ${args.brain.projectStatus}`);
+  if (args.brain.userPreferences.areasOfInterest?.length) {
+    lines.push(
+      `- areasOfInterest: ${args.brain.userPreferences.areasOfInterest.join(", ")}`,
+    );
+  }
+  if (args.brain.userPreferences.areasToAvoid?.length) {
+    lines.push(
+      `- areasToAvoid: ${args.brain.userPreferences.areasToAvoid.join(", ")}`,
+    );
+  }
+  lines.push("");
+  lines.push("User profile:");
+  lines.push(
+    `- identity: ${args.profile.identity.name || "(unset)"}, ${args.profile.identity.role || "(role unset)"}`,
+  );
+  if (args.profile.preferences.responseStyle) {
+    lines.push(`- responseStyle: ${args.profile.preferences.responseStyle}`);
+  }
+  if (args.profile.preferences.languageRules.length) {
+    lines.push(
+      `- languageRules: ${args.profile.preferences.languageRules.join("; ")}`,
+    );
+  }
+  if (args.profile.preferences.globalExclusions.length) {
+    lines.push(
+      `- globalExclusions: ${args.profile.preferences.globalExclusions.join("; ")}`,
+    );
+  }
+  if (args.subtypeHint) {
+    lines.push("");
+    lines.push(`Subtype hint: ${args.subtypeHint}`);
+  }
+  lines.push("");
+  lines.push("Current plan (the version being revised):");
+  lines.push("```");
+  lines.push(args.currentPlanMarkdown.trim());
+  lines.push("```");
+  lines.push("");
+  lines.push("Revision feedback so far (oldest → newest):");
+  for (let i = 0; i < args.revisionFeedback.length; i += 1) {
+    lines.push(`Round ${i + 1}: ${args.revisionFeedback[i]}`);
+  }
+  lines.push("");
+  lines.push(
+    "Address every point. Produce a <plan> directly — do NOT use <clarify>. Keep Status: draft.",
+  );
+  return lines.join("\n");
+}
+
+export async function redraftPlan(
+  input: RedraftPlanInput,
+): Promise<RedraftPlanResult> {
+  const record = findPlan(input.dataDir, input.planId);
+  if (!record) {
+    throw new StrategistError(`plan ${input.planId} not found`);
+  }
+  if (record.plan.metadata.status !== "draft") {
+    throw new StrategistError(
+      `plan ${input.planId} must be in state "draft" to redraft, got "${record.plan.metadata.status}"`,
+    );
+  }
+  const planType = record.plan.metadata.type;
+  if (planType !== "improvement" && planType !== "business" && planType !== "marketing") {
+    throw new StrategistError(
+      `Strategist cannot redraft plans of type "${planType}"`,
+    );
+  }
+
+  const brain = loadBrain(brainFile(input.dataDir, input.vault, input.app));
+  const profile = loadProfile(profileFile(input.dataDir));
+  const systemPrompt = loadStrategistPrompt(planType);
+  const history = readRedraftHistory(input.dataDir, input.planId);
+  const currentMarkdown = fs.readFileSync(record.path, "utf8");
+
+  const userContext = buildRedraftContext({
+    brain,
+    profile,
+    planType,
+    ...(record.plan.metadata.subtype !== undefined && {
+      subtypeHint: record.plan.metadata.subtype,
+    }),
+    originalBrief: history.originalBrief,
+    currentPlanMarkdown: currentMarkdown,
+    revisionFeedback: history.revisionFeedback,
+  });
+
+  const response = await input.client.chat({
+    system: systemPrompt,
+    cacheSystem: true,
+    messages: [{ role: "user", content: userContext }],
+  });
+  const action = parseStrategistResponse(response);
+  if (action.kind !== "draft") {
+    throw new StrategistError(
+      "Strategist returned <clarify> on a redraft; redrafts must produce a <plan>.",
+    );
+  }
+
+  let plan: Plan;
+  try {
+    plan = parsePlan(action.markdown);
+  } catch (err) {
+    throw new StrategistError(
+      `redrafted plan failed schema validation: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (plan.metadata.type !== planType) {
+    throw new StrategistError(
+      `redrafted plan type "${plan.metadata.type}" doesn't match original "${planType}"`,
+    );
+  }
+  if (plan.metadata.app !== record.plan.metadata.app) {
+    throw new StrategistError(
+      `redrafted plan app "${plan.metadata.app}" doesn't match original "${record.plan.metadata.app}"`,
+    );
+  }
+  if (plan.metadata.status !== "draft") {
+    throw new StrategistError(
+      `Strategist's redraft must have Status: draft, got "${plan.metadata.status}"`,
+    );
+  }
+  plan = transitionPlan(plan, "awaiting-review");
+
+  const writeDb = new Database(dbFile(input.dataDir));
+  try {
+    writeDb.transaction(() => {
+      appendEvent(writeDb, {
+        appId: record.app,
+        vaultId: record.vault,
+        kind: "plan-redrafted",
+        payload: {
+          planId: input.planId,
+          revisionRound: history.revisionFeedback.length,
+          author: "strategist",
+        },
+      });
+    })();
+  } finally {
+    writeDb.close();
+  }
+
+  savePlan(record.path, plan);
+
+  return {
+    planId: input.planId,
+    planPath: record.path,
+    revisionRound: history.revisionFeedback.length,
   };
 }

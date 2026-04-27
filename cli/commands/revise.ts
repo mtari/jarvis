@@ -1,12 +1,28 @@
 import { parseArgs } from "node:util";
+import Anthropic from "@anthropic-ai/sdk";
 import Database from "better-sqlite3";
+import {
+  redraftPlan,
+  StrategistError,
+} from "../../agents/strategist.ts";
+import { createAnthropicClient } from "../../orchestrator/anthropic-client.ts";
+import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { recordFeedback } from "../../orchestrator/feedback-store.ts";
 import { findPlan, savePlan } from "../../orchestrator/plan-store.ts";
 import { transitionPlan } from "../../orchestrator/plan.ts";
-import { dbFile, getDataDir } from "../paths.ts";
+import { dbFile, envFile, getDataDir } from "../paths.ts";
 
-export async function runRevise(rawArgs: string[]): Promise<number> {
+export interface ReviseCommandDeps {
+  client?: ReturnType<typeof createAnthropicClient>;
+}
+
+const MAX_REVISIONS = 3;
+
+export async function runRevise(
+  rawArgs: string[],
+  deps: ReviseCommandDeps = {},
+): Promise<number> {
   let parsed;
   try {
     parsed = parseArgs({
@@ -55,6 +71,34 @@ export async function runRevise(rawArgs: string[]): Promise<number> {
     return 1;
   }
 
+  // §4 cap: 3 revisions max. The 4th attempt escalates without
+  // recording or transitioning — the plan stays in awaiting-review
+  // and the user has to take a different action.
+  let priorRevisions = 0;
+  {
+    const readDb = new Database(dbFile(dataDir), { readonly: true });
+    try {
+      const row = readDb
+        .prepare(
+          "SELECT COUNT(*) AS c FROM feedback WHERE kind = 'revise' AND target_id = ?",
+        )
+        .get(planId) as { c: number };
+      priorRevisions = row.c;
+    } finally {
+      readDb.close();
+    }
+  }
+  if (priorRevisions >= MAX_REVISIONS) {
+    console.log(
+      `⚠ Plan ${planId} has been revised ${priorRevisions} times — at the cap of ${MAX_REVISIONS}.`,
+    );
+    console.log("  Strategist will not auto-redraft another time. Options:");
+    console.log("    - Approve the current draft as-is");
+    console.log("    - Reject and start over");
+    console.log(`    - Edit ${record.path} manually, then approve`);
+    return 0;
+  }
+
   const next = transitionPlan(record.plan, "draft");
 
   const db = new Database(dbFile(dataDir));
@@ -79,6 +123,53 @@ export async function runRevise(rawArgs: string[]): Promise<number> {
   }
 
   savePlan(record.path, next);
-  console.log(`✓ Plan ${planId} sent back to draft with feedback.`);
-  return 0;
+
+  // Auto-redraft via Strategist. Falls back gracefully when no API key
+  // is configured: the plan stays in 'draft' and the user gets a clear
+  // recovery path.
+  loadEnvFile(envFile(dataDir));
+  if (!deps.client && !process.env["ANTHROPIC_API_KEY"]) {
+    console.log(
+      `✓ Plan ${planId} sent back to draft with feedback (round ${priorRevisions + 1}/${MAX_REVISIONS}).`,
+    );
+    console.log(
+      `⚠ ANTHROPIC_API_KEY not set — auto-redraft skipped. Set it in ${envFile(dataDir)} or edit ${record.path} manually.`,
+    );
+    return 0;
+  }
+
+  const client = deps.client ?? createAnthropicClient();
+  console.log(
+    `✓ Plan ${planId} sent back to draft (round ${priorRevisions + 1}/${MAX_REVISIONS}). Strategist redrafting…`,
+  );
+  try {
+    const result = await redraftPlan({
+      client,
+      planId,
+      app: record.app,
+      vault: record.vault,
+      dataDir,
+    });
+    console.log(`✓ Plan ${result.planId} redrafted; now awaiting-review.`);
+    return 0;
+  } catch (err) {
+    if (err instanceof StrategistError) {
+      console.error(`revise: redraft failed — ${err.message}`);
+      console.error(
+        `  Plan stays in 'draft' at ${record.path}. Set Status to 'awaiting-review' there and re-run revise to retry, or edit content directly.`,
+      );
+      return 1;
+    }
+    if (err instanceof Anthropic.APIError) {
+      const status = err.status ?? "?";
+      console.error(
+        `revise: Anthropic API error during redraft (status ${status}): ${err.message}`,
+      );
+      if (err.status === 401 || err.status === 403) {
+        console.error(`revise: check ANTHROPIC_API_KEY in ${envFile(dataDir)}.`);
+      }
+      return 1;
+    }
+    throw err;
+  }
 }

@@ -9,14 +9,18 @@ import type {
 } from "../orchestrator/anthropic-client.ts";
 import { dbFile, planDir } from "../cli/paths.ts";
 import {
+  dropPlan,
   makeInstallSandbox,
   silenceConsole,
   type ConsoleSilencer,
   type InstallSandbox,
 } from "../cli/commands/_test-helpers.ts";
+import { recordFeedback } from "../orchestrator/feedback-store.ts";
+import { appendEvent } from "../orchestrator/event-log.ts";
 import {
   generatePlanId,
   parseStrategistResponse,
+  redraftPlan,
   runStrategist,
   StrategistError,
   type Prompter,
@@ -553,5 +557,193 @@ Pause if open rate < 5%.
     const written = fs.readFileSync(result.planPath, "utf8");
     expect(written).toContain("Type: marketing");
     expect(written).toContain("Subtype: campaign");
+  });
+});
+
+const REDRAFT_RESPONSE = `<plan>
+# Plan: Test plan (after revision)
+Type: improvement
+Subtype: new-feature
+ImplementationReview: required
+App: jarvis
+Priority: normal
+Destructive: false
+Status: draft
+Author: strategist
+Confidence: 80 — addressed feedback
+
+## Problem
+Better problem statement after the user's feedback.
+
+## Build plan
+Updated.
+
+## Testing strategy
+Tests.
+
+## Acceptance criteria
+- ok
+</plan>`;
+
+describe("redraftPlan", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("redrafts a draft plan back to awaiting-review and emits a plan-redrafted event", async () => {
+    const planId = "2026-04-27-redraft";
+    const planPath = dropPlan(sandbox, planId, { status: "draft" });
+
+    const seed = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(seed, {
+        appId: "jarvis",
+        vaultId: "personal",
+        kind: "plan-drafted",
+        payload: { planId, brief: "Original brief", author: "strategist" },
+      });
+      recordFeedback(seed, {
+        kind: "revise",
+        actor: "user",
+        targetType: "plan",
+        targetId: planId,
+        note: "make it tighter",
+      });
+    } finally {
+      seed.close();
+    }
+
+    const { client, calls } = makeMockClient([REDRAFT_RESPONSE]);
+    const result = await redraftPlan({
+      client,
+      planId,
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+    });
+
+    expect(result.planId).toBe(planId);
+    expect(result.revisionRound).toBe(1);
+
+    const reread = fs.readFileSync(planPath, "utf8");
+    expect(reread).toContain("Status: awaiting-review");
+    expect(reread).toContain("Test plan (after revision)");
+
+    const userMsg = String(calls[0]?.request.messages[0]?.content ?? "");
+    expect(userMsg).toContain("Original brief: Original brief");
+    expect(userMsg).toContain("Round 1: make it tighter");
+    expect(userMsg).toContain("Action: REDRAFT");
+
+    const verify = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const events = verify
+        .prepare("SELECT * FROM events WHERE kind = 'plan-redrafted'")
+        .all() as Array<{ payload: string }>;
+      expect(events).toHaveLength(1);
+    } finally {
+      verify.close();
+    }
+  });
+
+  it("throws when the plan is not in draft state", async () => {
+    dropPlan(sandbox, "2026-04-27-not-draft", { status: "awaiting-review" });
+    const { client } = makeMockClient([REDRAFT_RESPONSE]);
+    await expect(
+      redraftPlan({
+        client,
+        planId: "2026-04-27-not-draft",
+        app: "jarvis",
+        vault: "personal",
+        dataDir: sandbox.dataDir,
+      }),
+    ).rejects.toBeInstanceOf(StrategistError);
+  });
+
+  it("throws when Strategist returns <clarify> instead of <plan>", async () => {
+    dropPlan(sandbox, "2026-04-27-clarify", { status: "draft" });
+    const { client } = makeMockClient([CLARIFY_BLOCK]);
+    await expect(
+      redraftPlan({
+        client,
+        planId: "2026-04-27-clarify",
+        app: "jarvis",
+        vault: "personal",
+        dataDir: sandbox.dataDir,
+      }),
+    ).rejects.toThrow(/<plan>/);
+  });
+
+  it("throws when redrafted plan changes Type", async () => {
+    dropPlan(sandbox, "2026-04-27-type-change", { status: "draft" });
+    const businessPlan = `<plan>
+# Plan: Now I'm a business plan
+Type: business
+App: jarvis
+Priority: normal
+Destructive: false
+Status: draft
+Author: strategist
+Confidence: 50
+
+## Current situation
+x
+
+## Strategy
+x
+
+## Target segment
+x
+
+## Key initiatives
+x
+
+## Measurable goals
+x
+
+## Constraints
+x
+
+## Success metric
+- Metric: x
+- Baseline: x
+- Target: x
+- Data source: x
+
+## Observation window
+90d.
+
+## Connections required
+- none: present
+
+## Rollback
+revert.
+
+## Estimated effort
+- Claude calls: x
+- Your review time: x
+- Wall-clock to ship: x
+
+## Amendment clauses
+none
+</plan>`;
+    const { client } = makeMockClient([businessPlan]);
+    await expect(
+      redraftPlan({
+        client,
+        planId: "2026-04-27-type-change",
+        app: "jarvis",
+        vault: "personal",
+        dataDir: sandbox.dataDir,
+      }),
+    ).rejects.toThrow(/type/);
   });
 });
