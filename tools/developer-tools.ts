@@ -17,7 +17,7 @@ export interface DeveloperToolsOptions {
   defaultBashTimeoutSec?: number;
 }
 
-export interface DeveloperTools {
+export interface DeveloperTools extends Record<string, ToolHandler> {
   read_file: ToolHandler;
   write_file: ToolHandler;
   list_dir: ToolHandler;
