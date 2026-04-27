@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type Anthropic from "@anthropic-ai/sdk";
+import Anthropic from "@anthropic-ai/sdk";
 import type {
   AnthropicClient,
   ChatResponse,
@@ -155,5 +155,60 @@ describe("runPlan", () => {
       { client: makeFixedClient(PLAN_BLOCK), prompter: noopPrompter },
     );
     expect(code).toBe(0);
+  });
+
+  it("returns 1 with a clean message on Anthropic API errors (e.g., billing)", async () => {
+    const failingClient: AnthropicClient = {
+      async chat() {
+        throw new Anthropic.APIError(
+          402,
+          {
+            error: {
+              type: "invalid_request_error",
+              message: "Your credit balance is too low to access the Anthropic API.",
+            },
+          },
+          "Your credit balance is too low to access the Anthropic API.",
+          new Headers(),
+        );
+      },
+    };
+    const code = await runPlan(
+      ["--app", "jarvis", "Add a status command"],
+      { client: failingClient, prompter: noopPrompter },
+    );
+    expect(code).toBe(1);
+  });
+
+  it("returns 1 + auth-error hint on 401/403", async () => {
+    const authFailing: AnthropicClient = {
+      async chat() {
+        throw new Anthropic.APIError(
+          401,
+          { error: { type: "authentication_error", message: "invalid x-api-key" } },
+          "invalid x-api-key",
+          new Headers(),
+        );
+      },
+    };
+    const code = await runPlan(
+      ["--app", "jarvis", "Add a status command"],
+      { client: authFailing, prompter: noopPrompter },
+    );
+    expect(code).toBe(1);
+  });
+
+  it("re-throws unknown errors so programming bugs aren't swallowed", async () => {
+    const buggy: AnthropicClient = {
+      async chat() {
+        throw new Error("unexpected programming bug");
+      },
+    };
+    await expect(
+      runPlan(["--app", "jarvis", "Add a status command"], {
+        client: buggy,
+        prompter: noopPrompter,
+      }),
+    ).rejects.toThrow("unexpected programming bug");
   });
 });

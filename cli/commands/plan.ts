@@ -1,4 +1,5 @@
 import { parseArgs } from "node:util";
+import Anthropic from "@anthropic-ai/sdk";
 import {
   createStdinPrompter,
   runStrategist,
@@ -92,6 +93,14 @@ export async function runPlan(
   } catch (err) {
     if (err instanceof StrategistError) {
       console.error(`plan: ${err.message}`);
+      return 1;
+    }
+    if (err instanceof Anthropic.APIError) {
+      const status = err.status ?? "?";
+      console.error(`plan: Anthropic API error (status ${status}): ${err.message}`);
+      if (err.status === 401 || err.status === 403) {
+        console.error(`plan: check ANTHROPIC_API_KEY in ${envFile(dataDir)}.`);
+      }
       return 1;
     }
     throw err;
