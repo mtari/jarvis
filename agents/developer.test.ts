@@ -389,4 +389,78 @@ describe("executePlan", () => {
     expect(result.done).toBe(true);
     expect(result.prUrl).toBeUndefined();
   });
+
+  it("mirrors done onto the parent improvement plan when impl finishes", async () => {
+    const parentId = "2026-04-27-mirror-parent";
+    const implId = `${parentId}-impl`;
+    dropPlan(sandbox, parentId, { status: "executing" });
+    dropPlan(sandbox, implId, {
+      type: "implementation",
+      parentPlan: parentId,
+      status: "approved",
+    });
+    const { client } = scriptedClient([
+      fixedTextResponse("DONE\nBranch: feat/x\nPR URL: https://x\nTests: pass"),
+    ]);
+    await executePlan({
+      client,
+      planId: implId,
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+    });
+
+    const impl = findPlan(sandbox.dataDir, implId);
+    const parent = findPlan(sandbox.dataDir, parentId);
+    expect(impl?.plan.metadata.status).toBe("done");
+    expect(parent?.plan.metadata.status).toBe("done");
+  });
+
+  it("mirrors blocked onto the parent improvement plan when impl is blocked", async () => {
+    const parentId = "2026-04-27-mirror-blocked-parent";
+    const implId = `${parentId}-impl`;
+    dropPlan(sandbox, parentId, { status: "executing" });
+    dropPlan(sandbox, implId, {
+      type: "implementation",
+      parentPlan: parentId,
+      status: "approved",
+    });
+    const { client } = scriptedClient([
+      fixedTextResponse("BLOCKED: tests fail\nBranch: none\nTests: fail"),
+    ]);
+    await executePlan({
+      client,
+      planId: implId,
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+    });
+
+    const parent = findPlan(sandbox.dataDir, parentId);
+    expect(parent?.plan.metadata.status).toBe("blocked");
+  });
+
+  it("does not touch parent when parent is not in 'executing'", async () => {
+    const parentId = "2026-04-27-no-mirror";
+    const implId = `${parentId}-impl`;
+    dropPlan(sandbox, parentId, { status: "approved" });
+    dropPlan(sandbox, implId, {
+      type: "implementation",
+      parentPlan: parentId,
+      status: "approved",
+    });
+    const { client } = scriptedClient([
+      fixedTextResponse("DONE\nBranch: x\nPR URL: y\nTests: pass"),
+    ]);
+    await executePlan({
+      client,
+      planId: implId,
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+    });
+
+    const parent = findPlan(sandbox.dataDir, parentId);
+    expect(parent?.plan.metadata.status).toBe("approved");
+  });
 });

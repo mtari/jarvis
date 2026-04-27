@@ -239,13 +239,33 @@ export async function executePlan(
 
   // Reload record after the executing-transition wrote the file
   const updatedRecord = findPlan(input.dataDir, input.planId);
+  let finalStatus: PlanStatus | null = null;
   if (updatedRecord) {
     if (done) {
       recordTransition(updatedRecord, "done", input.dataDir);
+      finalStatus = "done";
     } else if (blocked) {
       recordTransition(updatedRecord, "blocked", input.dataDir);
+      finalStatus = "blocked";
     }
     // Otherwise leave at "executing" — caller can inspect and decide.
+  }
+
+  // §4: when an implementation plan finishes (done or blocked), mirror
+  // that on the parent improvement plan. Parent stays put if it's not
+  // currently "executing" (e.g., user paused or cancelled it manually).
+  if (
+    finalStatus !== null &&
+    updatedRecord?.plan.metadata.type === "implementation" &&
+    updatedRecord.plan.metadata.parentPlan
+  ) {
+    const parent = findPlan(
+      input.dataDir,
+      updatedRecord.plan.metadata.parentPlan,
+    );
+    if (parent && parent.plan.metadata.status === "executing") {
+      recordTransition(parent, finalStatus, input.dataDir);
+    }
   }
 
   const out: ExecutePlanResult = {

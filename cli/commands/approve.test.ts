@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { findPlan } from "../../orchestrator/plan-store.ts";
 import { parsePlan } from "../../orchestrator/plan.ts";
 import { dbFile } from "../paths.ts";
 import {
@@ -97,5 +98,59 @@ describe("runApprove", () => {
 
   it("returns 1 with no plan id", async () => {
     expect(await runApprove([])).toBe(1);
+  });
+
+  it("transitions parent improvement plan approved → executing on impl approval", async () => {
+    const parentId = "2026-04-27-parent";
+    const implId = "2026-04-27-parent-impl";
+    dropPlan(sandbox, parentId, { status: "approved" });
+    dropPlan(sandbox, implId, {
+      type: "implementation",
+      parentPlan: parentId,
+      status: "awaiting-review",
+    });
+
+    expect(await runApprove([implId])).toBe(0);
+
+    const parent = findPlan(sandbox.dataDir, parentId);
+    const impl = findPlan(sandbox.dataDir, implId);
+    expect(parent?.plan.metadata.status).toBe("executing");
+    expect(impl?.plan.metadata.status).toBe("approved");
+
+    const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const transitions = db
+        .prepare(
+          "SELECT * FROM events WHERE kind = 'plan-transition' ORDER BY id",
+        )
+        .all() as Array<{ payload: string }>;
+      const decoded = transitions.map(
+        (e) => JSON.parse(e.payload) as { planId: string; from: string; to: string },
+      );
+      expect(decoded).toContainEqual(
+        expect.objectContaining({ planId: implId, from: "awaiting-review", to: "approved" }),
+      );
+      expect(decoded).toContainEqual(
+        expect.objectContaining({ planId: parentId, from: "approved", to: "executing" }),
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it("does not touch parent if parent isn't currently approved", async () => {
+    const parentId = "2026-04-27-parent-paused";
+    const implId = `${parentId}-impl`;
+    dropPlan(sandbox, parentId, { status: "executing" });
+    dropPlan(sandbox, implId, {
+      type: "implementation",
+      parentPlan: parentId,
+      status: "awaiting-review",
+    });
+
+    expect(await runApprove([implId])).toBe(0);
+
+    const parent = findPlan(sandbox.dataDir, parentId);
+    expect(parent?.plan.metadata.status).toBe("executing");
   });
 });

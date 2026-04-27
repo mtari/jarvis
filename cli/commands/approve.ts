@@ -56,6 +56,24 @@ export async function runApprove(rawArgs: string[]): Promise<number> {
 
   const next = transitionPlan(record.plan, "approved");
 
+  // §4: when an implementation plan is approved, the parent improvement
+  // plan transitions approved → executing (the parent stays in approved
+  // until impl is approved; once impl is approved, "Developer codes per
+  // the implementation plan").
+  let parentChain: { record: typeof record; next: typeof next } | null = null;
+  if (
+    record.plan.metadata.type === "implementation" &&
+    record.plan.metadata.parentPlan
+  ) {
+    const parent = findPlan(dataDir, record.plan.metadata.parentPlan);
+    if (parent && parent.plan.metadata.status === "approved") {
+      parentChain = {
+        record: parent,
+        next: transitionPlan(parent.plan, "executing"),
+      };
+    }
+  }
+
   const db = new Database(dbFile(dataDir));
   try {
     db.transaction(() => {
@@ -71,12 +89,34 @@ export async function runApprove(rawArgs: string[]): Promise<number> {
         targetType: "plan",
         targetId: planId,
       });
+      if (parentChain) {
+        appendEvent(db, {
+          appId: parentChain.record.app,
+          vaultId: parentChain.record.vault,
+          kind: "plan-transition",
+          payload: {
+            planId: parentChain.record.id,
+            from: "approved",
+            to: "executing",
+            actor: "system",
+            reason: `child impl plan ${planId} approved`,
+          },
+        });
+      }
     })();
   } finally {
     db.close();
   }
 
   savePlan(record.path, next);
+  if (parentChain) {
+    savePlan(parentChain.record.path, parentChain.next);
+  }
   console.log(`✓ Approved plan ${planId}.`);
+  if (parentChain) {
+    console.log(
+      `  Parent ${parentChain.record.id} transitioned approved → executing.`,
+    );
+  }
   return 0;
 }
