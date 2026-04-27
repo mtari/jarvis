@@ -8,6 +8,7 @@ import { runProfile } from "./commands/profile.ts";
 import { runReject } from "./commands/reject.ts";
 import { runRevise } from "./commands/revise.ts";
 import { runRun } from "./commands/run.ts";
+import { runVersion } from "./commands/version.ts";
 
 const HELP = `jarvis — autonomous agent system
 
@@ -38,6 +39,7 @@ Inbox:
 Utilities:
   run developer <plan-id>     Fire Developer (auto-detects: draft impl plan vs execute)
   run <agent> <task>          Other agents not yet wired (Phase 1+)
+  version                     Print Jarvis version
   help, --help, -h            Show this message
 
 For full reference see docs/MASTER_PLAN.md §17.
@@ -77,6 +79,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runPlan(rest);
     case "run":
       return runRun(rest);
+    case "version":
+      return runVersion(rest);
     default:
       process.stderr.write(`jarvis: unknown command "${command}"\n\n`);
       process.stdout.write(HELP);
