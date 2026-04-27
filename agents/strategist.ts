@@ -25,13 +25,25 @@ export interface Prompter {
   print(message: string): void;
 }
 
+export type StrategistPlanType = "improvement" | "business" | "marketing";
+
+const STRATEGIST_PLAN_TYPES: ReadonlySet<StrategistPlanType> = new Set([
+  "improvement",
+  "business",
+  "marketing",
+]);
+
+export function isStrategistPlanType(value: string): value is StrategistPlanType {
+  return STRATEGIST_PLAN_TYPES.has(value as StrategistPlanType);
+}
+
 export interface StrategistInput {
   client: AnthropicClient;
   brief: string;
   app: string;
   vault: string;
   dataDir: string;
-  type?: string;
+  type?: StrategistPlanType;
   subtype?: string;
   challenge?: boolean;
   prompter?: Prompter;
@@ -62,16 +74,17 @@ export async function runStrategist(
   input: StrategistInput,
 ): Promise<StrategistResult> {
   const challenge = input.challenge ?? true;
+  const planType: StrategistPlanType = input.type ?? "improvement";
 
   const brain = loadBrain(brainFile(input.dataDir, input.vault, input.app));
   const profile = loadProfile(profileFile(input.dataDir));
-  const systemPrompt = loadStrategistPrompt();
+  const systemPrompt = loadStrategistPrompt(planType);
 
   const initialContext = buildContext({
     brain,
     profile,
     brief: input.brief,
-    ...(input.type !== undefined && { typeHint: input.type }),
+    planType,
     ...(input.subtype !== undefined && { subtypeHint: input.subtype }),
   });
 
@@ -255,10 +268,11 @@ function buildContext(args: {
   brain: Brain;
   profile: Profile;
   brief: string;
-  typeHint?: string;
+  planType: StrategistPlanType;
   subtypeHint?: string;
 }): string {
   const lines: string[] = [];
+  lines.push(`Plan type: ${args.planType}`);
   lines.push(`Brief: ${args.brief}`);
   lines.push("");
   lines.push("Project context (brain):");
@@ -297,11 +311,8 @@ function buildContext(args: {
       `- globalExclusions: ${args.profile.preferences.globalExclusions.join("; ")}`,
     );
   }
-  if (args.typeHint) {
-    lines.push("");
-    lines.push(`Type hint from CLI: ${args.typeHint}`);
-  }
   if (args.subtypeHint) {
+    lines.push("");
     lines.push(`Subtype hint from CLI: ${args.subtypeHint}`);
   }
   return lines.join("\n");
@@ -346,12 +357,18 @@ export function generatePlanId(
   return candidate;
 }
 
-let cachedPrompt: string | null = null;
-function loadStrategistPrompt(): string {
-  if (cachedPrompt !== null) return cachedPrompt;
-  const promptPath = path.join(repoRoot(), "prompts", "strategist.md");
-  cachedPrompt = fs.readFileSync(promptPath, "utf8");
-  return cachedPrompt;
+const cachedPrompts: Partial<Record<StrategistPlanType, string>> = {};
+function loadStrategistPrompt(planType: StrategistPlanType): string {
+  const cached = cachedPrompts[planType];
+  if (cached !== undefined) return cached;
+  const promptPath = path.join(
+    repoRoot(),
+    "prompts",
+    `strategist-${planType}.md`,
+  );
+  const text = fs.readFileSync(promptPath, "utf8");
+  cachedPrompts[planType] = text;
+  return text;
 }
 
 export function createStdinPrompter(): Prompter {

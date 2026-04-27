@@ -2,12 +2,18 @@ import { parseArgs } from "node:util";
 import Anthropic from "@anthropic-ai/sdk";
 import {
   createStdinPrompter,
+  isStrategistPlanType,
   runStrategist,
   StrategistError,
   type Prompter,
+  type StrategistPlanType,
 } from "../../agents/strategist.ts";
 import { createAnthropicClient } from "../../orchestrator/anthropic-client.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
+import {
+  improvementSubtypeSchema,
+  marketingSubtypeSchema,
+} from "../../orchestrator/plan.ts";
 import { envFile, getDataDir } from "../paths.ts";
 
 export interface PlanCommandDeps {
@@ -56,6 +62,42 @@ export async function runPlan(
     return 1;
   }
 
+  // Validate --type
+  let planType: StrategistPlanType = "improvement";
+  if (v.type !== undefined) {
+    if (!isStrategistPlanType(v.type)) {
+      console.error(
+        `plan: invalid --type "${v.type}". Strategist drafts: improvement | business | marketing.`,
+      );
+      return 1;
+    }
+    planType = v.type;
+  }
+
+  // Validate --subtype against the chosen type
+  if (v.subtype !== undefined) {
+    if (planType === "improvement") {
+      if (!improvementSubtypeSchema.safeParse(v.subtype).success) {
+        console.error(
+          `plan: invalid --subtype "${v.subtype}" for improvement plans.`,
+        );
+        return 1;
+      }
+    } else if (planType === "marketing") {
+      if (!marketingSubtypeSchema.safeParse(v.subtype).success) {
+        console.error(
+          `plan: invalid --subtype "${v.subtype}" for marketing plans (use campaign or single-post).`,
+        );
+        return 1;
+      }
+    } else if (planType === "business") {
+      console.error(
+        `plan: --subtype is not used for business plans; remove it.`,
+      );
+      return 1;
+    }
+  }
+
   const dataDir = getDataDir();
   loadEnvFile(envFile(dataDir));
 
@@ -77,7 +119,7 @@ export async function runPlan(
       app: v.app,
       vault: v.vault ?? "personal",
       dataDir,
-      ...(v.type !== undefined && { type: v.type }),
+      type: planType,
       ...(v.subtype !== undefined && { subtype: v.subtype }),
       challenge: !v["no-challenge"],
       ...(prompter !== undefined && { prompter }),

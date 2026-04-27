@@ -382,3 +382,176 @@ describe("runStrategist", () => {
     ).rejects.toThrow(/schema validation/);
   });
 });
+
+describe("runStrategist — type-specific prompts", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("loads strategist-improvement.md for type='improvement' (default)", async () => {
+    const { client, calls } = makeMockClient([PLAN_BLOCK]);
+    await runStrategist({
+      client,
+      brief: "Add a CLI status command",
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+    });
+    const sys = String(calls[0]?.request.system ?? "");
+    expect(sys).toContain("improvement plans");
+  });
+
+  it("loads strategist-business.md for type='business' and persists Type: business", async () => {
+    const businessPlan = `<plan>
+# Plan: Q2 2026 — focus on returning customers
+Type: business
+App: jarvis
+Priority: normal
+Destructive: false
+Status: draft
+Author: strategist
+Confidence: 70 — based on the brief
+
+## Current situation
+Active dev pipeline; no formal Q2 frame yet.
+
+## Strategy
+Returning-customer focus.
+
+## Target segment
+Existing users who haven't shipped a plan in 30 days.
+
+## Key initiatives
+- Re-engagement digest.
+- Friction audit.
+
+## Measurable goals
+30-day return rate up by 10pp.
+
+## Constraints
+Solo founder; one app live.
+
+## Success metric
+- Metric: 30-day return rate
+- Baseline: ~22%
+- Target: 32%
+- Data source: app analytics
+
+## Observation window
+90d.
+
+## Connections required
+- analytics: present
+
+## Rollback
+Park the strategy; resume previous focus.
+
+## Estimated effort
+- Claude calls: ~15
+- Your review time: 20 min
+- Wall-clock to ship: 1 day
+
+## Amendment clauses
+Pause and amend if monthly metrics drift > 15% mid-window.
+</plan>`;
+    const { client, calls } = makeMockClient([businessPlan]);
+    const result = await runStrategist({
+      client,
+      brief: "Quarterly business plan focusing on returning customers",
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      type: "business",
+    });
+
+    const sys = String(calls[0]?.request.system ?? "");
+    expect(sys).toContain("business plans");
+    const written = fs.readFileSync(result.planPath, "utf8");
+    expect(written).toContain("Type: business");
+    expect(written).toContain("Status: awaiting-review");
+  });
+
+  it("loads strategist-marketing.md for type='marketing' and persists Type: marketing + Subtype", async () => {
+    const marketingPlan = `<plan>
+# Plan: April 2026 — returning-user campaign
+Type: marketing
+Subtype: campaign
+App: jarvis
+Priority: normal
+Destructive: false
+Status: draft
+Author: strategist
+Confidence: 65 — first draft
+
+## Opportunity
+Returning users haven't seen recent improvements.
+
+## Audience
+Past users last active > 30 days ago.
+
+## Channels
+Email primary, X secondary.
+
+## Content calendar
+- 2026-04-29 (email): "What changed in Q2 — [actual subject + body draft would go here]"
+
+## Schedule
+2026-04-29 09:00.
+
+## Tracking & KPIs
+Open rate, click-through.
+
+## Success metric
+- Metric: 7d return after campaign
+- Baseline: 22%
+- Target: 30%
+- Data source: app analytics
+
+## Observation window
+30d.
+
+## Connections required
+- email: present
+
+## Rollback
+Stop campaign; remove scheduled posts.
+
+## Estimated effort
+- Claude calls: ~20
+- Your review time: 30 min
+- Wall-clock to ship: 1 day
+
+## Amendment clauses
+Pause if open rate < 5%.
+</plan>`;
+    const { client, calls } = makeMockClient([marketingPlan]);
+    const result = await runStrategist({
+      client,
+      brief: "April campaign re-engaging returning users",
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      type: "marketing",
+      subtype: "campaign",
+    });
+
+    const sys = String(calls[0]?.request.system ?? "");
+    expect(sys).toContain("marketing plans");
+    const userMsg = String(calls[0]?.request.messages[0]?.content ?? "");
+    expect(userMsg).toContain("Plan type: marketing");
+    expect(userMsg).toContain("Subtype hint from CLI: campaign");
+
+    const written = fs.readFileSync(result.planPath, "utf8");
+    expect(written).toContain("Type: marketing");
+    expect(written).toContain("Subtype: campaign");
+  });
+});
