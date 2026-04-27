@@ -1197,22 +1197,31 @@ Once the code-repo structure is in place, write `jarvis/CLAUDE.md` (the repo-lev
 
 ### Phase 1 — Capability expansion + Slack (Week 3–5)
 
-**Goal:** extend the proven Phase 0 loop with broader plan types, the Slack surface, and the onboard command. Apps come online when you choose, not on a schedule.
+**Goal:** extend the proven Phase 0 loop with broader plan types, the Slack surface (plan-review only), and the onboard command. Apps come online when you choose, not on a schedule.
 
-- Strategist extended to draft business plans + marketing plans (subtypes `campaign` and `single-post`; format-aware: post / blog / video-script / newsletter)
-- Backlog management: `yarn jarvis backlog --app <name>`, `yarn jarvis reprioritize`, the 3-improvement-plan cap rule (§5)
-- Escalate-within-plan + amendment flow + revision loops
-- **Slack adapter:** Socket Mode bot, Block Kit message builders for plan / impl / setup / amendment / escalation / scheduled-post review, action handlers, slash commands, `#jarvis-inbox` + `#jarvis-alerts` channel split
-- **Humanizer tool** (`jarvis/tools/humanizer.ts`) — Marketer + Developer-touching-user-text use it pre-publish
-- **Umami install** — when you're ready (deploy to Vercel, schema on Supabase, script tag added on whichever app you're about to use it on; baseline accrues for 2–4 weeks before signals are reliable)
-- **`yarn jarvis onboard --app <name> --repo <path> [--monorepo-path <subdir>] [--docs <paths-or-urls>...]`** implemented and tested. Phase 1 supports local files + public URLs; authenticated sources (Google Drive, Notion) deferred to Phase 2.
+**Build order (locked):**
 
-**Exit:** any project (real app, consulting, personal-brand) can be onboarded by you at will, plans of all three types flow through Slack, and at least one real-project plan has shipped to main.
+1. **Daemon + checkpointing** (§6). Long-running local process (`yarn jarvis daemon`) Slack Socket Mode needs. Resumes in-flight plans from `jarvis-data/logs/checkpoints/`.
+2. **Strategist extensions.** Drafts business plans and marketing plans (subtypes `campaign` and `single-post`; format-aware: post / blog / video-script / newsletter). Improvement plan drafting from Phase 0 unchanged.
+3. **Backlog management** (§5). `yarn jarvis backlog --app <name>`, `yarn jarvis reprioritize`, the 3-improvement-plan cap rule + meta-queue split.
+4. **Revision loops + amendment flow + escalate-within-plan** (§12). Revise actually re-runs Strategist with the feedback in context. Mid-execution amendments surface in inbox; approved amendments resume from the M1 checkpoint. Escalation surfaces blocks.
+5. **`yarn jarvis cost`** (§18). Per-plan / per-agent token spend + cache-hit-rate readout from the `events` table. Default warning at 80% of the configured monthly cap (Phase 1 cap: $50).
+6. **Slack adapter (foundation)**: Socket Mode bot, `#jarvis-inbox` + `#jarvis-alerts` channel split, Block Kit for **plan-review** (improvement / impl / business / marketing single-post), action handlers for approve / revise / reject, slash commands `/jarvis plan` and `/jarvis bug`. Block Kit for setup-task / amendment / escalation / scheduled-post review **deferred** to Phase 1.5 or absorbed into Phase 2.
+7. **`yarn jarvis onboard --app <name> --repo <path> [--monorepo-path <subdir>] [--vault <vault-name>] [--docs <paths-or-urls>...] [--docs-keep <paths-or-urls>...]`** (§10). Strategist drafts an initial brain from repo inspection + absorbs docs (local files + public URLs). Authenticated sources (Drive, Notion) deferred to Phase 2.
+
+**Deferred from Phase 1:**
+- **Humanizer tool** — moved to Phase 3 alongside Marketer (no caller in Phase 1; deduplicates the previous double-listing).
+- **Umami install** — moved to Phase 2 alongside Analyst's signal collectors (the data is only useful once Analyst can read it).
+- **Slack Block Kit beyond plan-review** — landed in Phase 1.5/2 as the use cases arrive.
+
+**Exit:** `erdei-fahazak` is onboarded as the first real app, plans of all three types flow through Slack plan-review, and at least one real-project plan has shipped to main.
 
 ### Phase 2 — Analyst + Scout (Week 5–6)
 - **Analyst:** signal collectors (metrics, yarn audit, broken links first), event log + filter → trigger logic, post-merge observation
+- **Umami install** (deferred from Phase 1) — deploy Umami to Vercel, schema on Supabase Postgres, script tag on `erdei-fahazak` first, then other onboarded apps. Baseline accrues for 2–4 weeks; Analyst reads via the Umami programmatic API.
 - **Scout:** research tool (search API mock first), idea scoring for Business_Ideas.md, weekly portfolio triage
 - Triage output delivered to `#jarvis-inbox` as the Monday morning summary
+- Slack Block Kit expansion (deferred from Phase 1 if not already shipped): setup-task / amendment / escalation / scheduled-post review surfaces.
 
 **Exit:** Monday morning you get a triage report that actually influences what plan gets drafted next.
 
