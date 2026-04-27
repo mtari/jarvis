@@ -1,4 +1,5 @@
 import { runApprove } from "./commands/approve.ts";
+import { runDaemon } from "./commands/daemon.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
@@ -17,6 +18,7 @@ Usage: yarn jarvis <command> [options]
 Setup & lifecycle:
   install [--data-dir <path>] [--remote <url>]
                               First-time setup
+  daemon                      Start the long-running local process
   doctor                      Health check
   profile                     Show user profile summary
   profile edit                Open user-profile.json in $EDITOR
@@ -65,6 +67,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runProfile(rest);
     case "doctor":
       return runDoctor(rest);
+    case "daemon":
+      return runDaemon(rest);
     case "plans":
       return runPlans(rest);
     case "inbox":

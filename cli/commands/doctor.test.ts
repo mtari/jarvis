@@ -35,6 +35,7 @@ describe("runDoctor", () => {
     expect(code).toBe(0);
     const out = logs.join("\n");
     expect(out).toContain("Daemon: not running");
+    expect(out).toContain("yarn jarvis daemon");
     expect(out).toContain("No stale brain locks");
     expect(out).toContain("No plans awaiting review");
     expect(out).toContain("personal: (no remote)");

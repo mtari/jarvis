@@ -46,6 +46,10 @@ export function sandboxDir(dataDir: string): string {
   return path.join(dataDir, "sandbox");
 }
 
+export function daemonPidFile(dataDir: string): string {
+  return path.join(dataDir, ".daemon.pid");
+}
+
 export function vaultDir(dataDir: string, vaultName: string): string {
   return path.join(dataDir, "vaults", vaultName);
 }

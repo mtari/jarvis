@@ -1,9 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import {
+  defaultIsPidAlive,
+  readPidFile,
+} from "../../orchestrator/daemon-pid.ts";
 import { inspectLock, isLockStale } from "../../orchestrator/lock.ts";
 import { scanPlans } from "../../orchestrator/plan-store.ts";
-import { dbFile, getDataDir } from "../paths.ts";
+import { daemonPidFile, dbFile, getDataDir } from "../paths.ts";
 
 export async function runDoctor(_rawArgs: string[]): Promise<number> {
   const dataDir = getDataDir();
@@ -19,19 +23,23 @@ export async function runDoctor(_rawArgs: string[]): Promise<number> {
   lines.push(`Data dir: ${dataDir}`);
 
   // Daemon
-  const pidFile = path.join(dataDir, ".daemon.pid");
-  if (!fs.existsSync(pidFile)) {
-    lines.push("• Daemon: not running (expected during Phase 0).");
+  const pidPath = daemonPidFile(dataDir);
+  if (!fs.existsSync(pidPath)) {
+    lines.push("• Daemon: not running. Start with 'yarn jarvis daemon'.");
   } else {
-    const pidText = fs.readFileSync(pidFile, "utf8").trim();
-    const pid = parseInt(pidText, 10);
-    if (Number.isNaN(pid)) {
-      lines.push(`✗ Daemon PID file malformed: ${pidText}`);
+    const pidData = readPidFile(pidPath);
+    if (!pidData) {
+      lines.push(`✗ Daemon PID file malformed at ${pidPath}`);
       issues += 1;
-    } else if (isPidAlive(pid)) {
-      lines.push(`✓ Daemon running (pid ${pid}).`);
+    } else if (defaultIsPidAlive(pidData.pid)) {
+      lines.push(
+        `✓ Daemon running (pid ${pidData.pid}, since ${pidData.startedAt}).`,
+      );
     } else {
-      lines.push(`✗ Daemon PID file present but pid ${pid} is dead.`);
+      lines.push(
+        `✗ Daemon PID file present but pid ${pidData.pid} is dead. ` +
+          `Restart with 'yarn jarvis daemon' (the new instance will take over).`,
+      );
       issues += 1;
     }
   }
@@ -104,13 +112,4 @@ export async function runDoctor(_rawArgs: string[]): Promise<number> {
 
   console.log(lines.join("\n"));
   return issues > 0 ? 1 : 0;
-}
-
-function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
 }
