@@ -74,15 +74,13 @@ describe("dispatch", () => {
     }
   });
 
-  it("routes remaining stub commands (plan, run) to the stub handler", async () => {
-    for (const cmd of ["plan", "run"]) {
-      const cap = captureWrites();
-      try {
-        const code = await dispatch([cmd]);
-        expect(code).toBe(1);
-      } finally {
-        cap.restore();
-      }
+  it("routes the remaining stub command (run) to the stub handler", async () => {
+    const cap = captureWrites();
+    try {
+      const code = await dispatch(["run"]);
+      expect(code).toBe(1);
+    } finally {
+      cap.restore();
     }
   });
 

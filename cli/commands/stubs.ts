@@ -8,13 +8,9 @@ interface Stub {
 }
 
 const STUBS: Record<string, Stub> = {
-  plan: {
-    message: "plan: Strategist drafts a new improvement plan",
-    milestone: "M4 (Strategist agent)",
-  },
   run: {
     message: "run: direct agent invocation",
-    milestone: "M3 (Anthropic client wrapper) and beyond",
+    milestone: "M5 (Developer agent) and beyond",
   },
 };
 

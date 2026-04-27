@@ -2,6 +2,7 @@ import { runApprove } from "./commands/approve.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
+import { runPlan } from "./commands/plan.ts";
 import { runPlans } from "./commands/plans.ts";
 import { runProfile } from "./commands/profile.ts";
 import { runReject } from "./commands/reject.ts";
@@ -23,7 +24,8 @@ Plans:
   plans [filters]             List plans (filters: --app, --status, --type,
                               --subtype, --priority, --executing, --approved,
                               --pending-review, --format table|json)
-  plan --app <name> "<brief>" Draft a new plan (stub — M4)
+  plan --app <name> [--type improvement] [--subtype <s>] [--vault <v>] [--no-challenge] "<brief>"
+                              Draft a new plan via Strategist
   approve <id> [--confirm-destructive]
                               Approve a plan
   revise <id> "<feedback>"    Send back to draft with feedback
@@ -40,7 +42,7 @@ Utilities:
 For full reference see docs/MASTER_PLAN.md §17.
 `;
 
-const STUB_COMMANDS = new Set(["plan", "run"]);
+const STUB_COMMANDS = new Set(["run"]);
 
 export async function dispatch(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
@@ -72,6 +74,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runRevise(rest);
     case "reject":
       return runReject(rest);
+    case "plan":
+      return runPlan(rest);
     default:
       if (STUB_COMMANDS.has(command)) {
         return runStub(command);
