@@ -7,7 +7,7 @@ import { runPlans } from "./commands/plans.ts";
 import { runProfile } from "./commands/profile.ts";
 import { runReject } from "./commands/reject.ts";
 import { runRevise } from "./commands/revise.ts";
-import { runStub } from "./commands/stubs.ts";
+import { runRun } from "./commands/run.ts";
 
 const HELP = `jarvis — autonomous agent system
 
@@ -36,13 +36,12 @@ Inbox:
   inbox                       Show pending plan reviews + setup tasks
 
 Utilities:
-  run <agent> <task>          Direct agent invocation (stub — M3+)
+  run developer <plan-id>     Fire Developer (auto-detects: draft impl plan vs execute)
+  run <agent> <task>          Other agents not yet wired (Phase 1+)
   help, --help, -h            Show this message
 
 For full reference see docs/MASTER_PLAN.md §17.
 `;
-
-const STUB_COMMANDS = new Set(["run"]);
 
 export async function dispatch(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
@@ -76,10 +75,9 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runReject(rest);
     case "plan":
       return runPlan(rest);
+    case "run":
+      return runRun(rest);
     default:
-      if (STUB_COMMANDS.has(command)) {
-        return runStub(command);
-      }
       process.stderr.write(`jarvis: unknown command "${command}"\n\n`);
       process.stdout.write(HELP);
       return 1;

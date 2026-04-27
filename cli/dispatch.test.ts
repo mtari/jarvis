@@ -74,7 +74,7 @@ describe("dispatch", () => {
     }
   });
 
-  it("routes the remaining stub command (run) to the stub handler", async () => {
+  it("run with no agent returns 1", async () => {
     const cap = captureWrites();
     try {
       const code = await dispatch(["run"]);
