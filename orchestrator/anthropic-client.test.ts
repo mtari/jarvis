@@ -206,6 +206,88 @@ describe("createAnthropicClient.chat", () => {
   });
 });
 
+describe("createAnthropicClient.chat with block-array content", () => {
+  it("redacts secrets inside text blocks of message content", async () => {
+    let captured: Anthropic.MessageCreateParamsNonStreaming | undefined;
+    const transport: Transport = async (params) => {
+      captured = params;
+      return makeFakeMessage();
+    };
+    const client = createAnthropicClient({ transport });
+    await client.chat({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: `Token: ${REAL_GH_PAT}` } as Anthropic.TextBlockParam,
+          ],
+        },
+      ],
+    });
+    const blocks = captured?.messages[0]?.content as Anthropic.ContentBlockParam[];
+    expect(blocks[0]?.type).toBe("text");
+    if (blocks[0]?.type === "text") {
+      expect(blocks[0].text).toBe(`Token: ${REDACTION_PLACEHOLDER}`);
+    }
+  });
+
+  it("redacts secrets inside tool_result content (string form)", async () => {
+    let captured: Anthropic.MessageCreateParamsNonStreaming | undefined;
+    const transport: Transport = async (params) => {
+      captured = params;
+      return makeFakeMessage();
+    };
+    const client = createAnthropicClient({ transport });
+    await client.chat({
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "u1",
+              content: `Found token ${REAL_GH_PAT} in file`,
+            } as Anthropic.ToolResultBlockParam,
+          ],
+        },
+      ],
+    });
+    const blocks = captured?.messages[0]?.content as Anthropic.ContentBlockParam[];
+    expect(blocks[0]?.type).toBe("tool_result");
+    if (blocks[0]?.type === "tool_result") {
+      expect(blocks[0].content).toBe(
+        `Found token ${REDACTION_PLACEHOLDER} in file`,
+      );
+    }
+  });
+
+  it("passes tool_use blocks through unchanged", async () => {
+    let captured: Anthropic.MessageCreateParamsNonStreaming | undefined;
+    const transport: Transport = async (params) => {
+      captured = params;
+      return makeFakeMessage();
+    };
+    const client = createAnthropicClient({ transport });
+    await client.chat({
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "u1",
+              name: "echo",
+              input: { value: "x" },
+            } as Anthropic.ToolUseBlockParam,
+          ],
+        },
+      ],
+    });
+    const blocks = captured?.messages[0]?.content as Anthropic.ContentBlockParam[];
+    expect(blocks[0]?.type).toBe("tool_use");
+  });
+});
+
 describe("estimateTokens", () => {
   it("counts characters across system and messages, divides by 4", () => {
     const params: Anthropic.MessageCreateParamsNonStreaming = {

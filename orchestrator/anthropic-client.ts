@@ -13,7 +13,7 @@ export interface ChatRequest {
   cacheSystem?: boolean;
   messages: Array<{
     role: "user" | "assistant";
-    content: string;
+    content: string | Anthropic.ContentBlockParam[];
   }>;
   /** Output cap; defaults to client.defaultMaxTokens. */
   maxTokens?: number;
@@ -86,7 +86,10 @@ export function createAnthropicClient(
       const messageParams: Anthropic.MessageParam[] = req.messages.map(
         (m) => ({
           role: m.role,
-          content: redactString(m.content),
+          content:
+            typeof m.content === "string"
+              ? redactString(m.content)
+              : redactBlocks(m.content, redactString),
         }),
       );
 
@@ -173,6 +176,33 @@ export function estimateTokens(
   }
 
   return Math.ceil(totalChars / 4);
+}
+
+function redactBlocks(
+  blocks: Anthropic.ContentBlockParam[],
+  redactString: (s: string) => string,
+): Anthropic.ContentBlockParam[] {
+  return blocks.map((block) => {
+    if (block.type === "text") {
+      return { ...block, text: redactString(block.text) };
+    }
+    if (block.type === "tool_result") {
+      if (typeof block.content === "string") {
+        return { ...block, content: redactString(block.content) };
+      }
+      if (Array.isArray(block.content)) {
+        return {
+          ...block,
+          content: block.content.map((c) =>
+            c.type === "text"
+              ? { ...c, text: redactString(c.text) }
+              : c,
+          ),
+        };
+      }
+    }
+    return block;
+  });
 }
 
 function createSdkTransport(apiKey: string | undefined): Transport {
