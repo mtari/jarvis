@@ -97,6 +97,17 @@ describe("dispatch", () => {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
   });
+
+  it("version returns 0 and prints Jarvis v", async () => {
+    const cap = captureWrites();
+    try {
+      const code = await dispatch(["version"]);
+      expect(code).toBe(0);
+      expect(cap.stdout.join("")).toContain("Jarvis v");
+    } finally {
+      cap.restore();
+    }
+  });
 });
 
 describe("profile command", () => {
