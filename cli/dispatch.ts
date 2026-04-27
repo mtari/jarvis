@@ -1,4 +1,5 @@
 import { runApprove } from "./commands/approve.ts";
+import { runBacklog } from "./commands/backlog.ts";
 import { runDaemon } from "./commands/daemon.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInbox } from "./commands/inbox.ts";
@@ -7,6 +8,7 @@ import { runPlan } from "./commands/plan.ts";
 import { runPlans } from "./commands/plans.ts";
 import { runProfile } from "./commands/profile.ts";
 import { runReject } from "./commands/reject.ts";
+import { runReprioritize } from "./commands/reprioritize.ts";
 import { runRevise } from "./commands/revise.ts";
 import { runRun } from "./commands/run.ts";
 import { runVersion } from "./commands/version.ts";
@@ -27,8 +29,12 @@ Plans:
   plans [filters]             List plans (filters: --app, --status, --type,
                               --subtype, --priority, --executing, --approved,
                               --pending-review, --format table|json)
-  plan --app <name> [--type improvement] [--subtype <s>] [--vault <v>] [--no-challenge] "<brief>"
+  plan --app <name> [--type improvement|business|marketing] [--subtype <s>] [--vault <v>] [--no-challenge] "<brief>"
                               Draft a new plan via Strategist
+  backlog --app <name> [--meta-only | --no-meta]
+                              Show product backlog (3-cap) + meta queue
+  reprioritize --app <name> --plan <id> --priority <level>
+                              Reorder a backlog plan (low|normal|high|blocking)
   approve <id> [--confirm-destructive]
                               Approve a plan
   revise <id> "<feedback>"    Send back to draft with feedback
@@ -81,6 +87,10 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runReject(rest);
     case "plan":
       return runPlan(rest);
+    case "backlog":
+      return runBacklog(rest);
+    case "reprioritize":
+      return runReprioritize(rest);
     case "run":
       return runRun(rest);
     case "version":
