@@ -1,10 +1,4 @@
-const args = process.argv.slice(2);
+import { dispatch } from "./dispatch.ts";
 
-if (args.length === 0) {
-  console.log("jarvis — Phase 0 in progress. CLI commands land in M2.");
-  console.log("See docs/MASTER_PLAN.md §17 for the planned surface.");
-  process.exit(0);
-}
-
-console.log(`jarvis: command "${args[0]}" not implemented yet (Phase 0).`);
-process.exit(1);
+const code = await dispatch(process.argv.slice(2));
+process.exit(code);
