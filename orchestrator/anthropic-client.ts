@@ -32,6 +32,8 @@ export interface ChatResponse {
   text: string;
   blocks: Anthropic.ContentBlock[];
   stopReason: Anthropic.StopReason | null;
+  /** Model the API actually used (from response.model). Used by cost telemetry. */
+  model: string;
   usage: ChatUsage;
   redactions: RedactionMatch[];
 }
@@ -135,6 +137,7 @@ export function createAnthropicClient(
         text,
         blocks: response.content,
         stopReason: response.stop_reason,
+        model: response.model,
         usage: {
           inputTokens: response.usage.input_tokens,
           outputTokens: response.usage.output_tokens,

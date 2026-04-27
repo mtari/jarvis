@@ -108,6 +108,7 @@ function makeMockClient(responses: string[]): {
           } as Anthropic.TextBlock,
         ],
         stopReason: "end_turn",
+        model: "claude-sonnet-4-6",
         usage: {
           inputTokens: 100,
           outputTokens: 50,
@@ -149,6 +150,7 @@ describe("parseStrategistResponse", () => {
       text,
       blocks: [],
       stopReason: "end_turn",
+      model: "claude-sonnet-4-6",
       usage: {
         inputTokens: 0,
         outputTokens: 0,

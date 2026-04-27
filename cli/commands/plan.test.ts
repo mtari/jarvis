@@ -71,6 +71,7 @@ function makeFixedClient(text: string): AnthropicClient {
           { type: "text", text, citations: null } as Anthropic.TextBlock,
         ],
         stopReason: "end_turn",
+        model: "claude-sonnet-4-6",
         usage: {
           inputTokens: 0,
           outputTokens: 0,

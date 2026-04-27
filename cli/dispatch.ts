@@ -1,5 +1,6 @@
 import { runApprove } from "./commands/approve.ts";
 import { runBacklog } from "./commands/backlog.ts";
+import { runCost } from "./commands/cost.ts";
 import { runDaemon } from "./commands/daemon.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInbox } from "./commands/inbox.ts";
@@ -47,6 +48,8 @@ Inbox:
 Utilities:
   run developer <plan-id>     Fire Developer (auto-detects: draft impl plan vs execute)
   run <agent> <task>          Other agents not yet wired (Phase 1+)
+  cost [--cap N] [--warn-at R] [--format table|json]
+                              Current-month token spend, cache hit rate, by agent / plan / model
   version                     Print Jarvis version
   help, --help, -h            Show this message
 
@@ -93,6 +96,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runReprioritize(rest);
     case "run":
       return runRun(rest);
+    case "cost":
+      return runCost(rest);
     case "version":
       return runVersion(rest);
     default:

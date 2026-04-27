@@ -6,6 +6,7 @@ import {
   StrategistError,
 } from "../../agents/strategist.ts";
 import { createAnthropicClient } from "../../orchestrator/anthropic-client.ts";
+import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { recordFeedback } from "../../orchestrator/feedback-store.ts";
@@ -138,21 +139,29 @@ export async function runRevise(
     return 0;
   }
 
-  const client = deps.client ?? createAnthropicClient();
+  const baseClient = deps.client ?? createAnthropicClient();
+  const recorder = buildAgentCallRecorder(baseClient, dbFile(dataDir), {
+    app: record.app,
+    vault: record.vault,
+    agent: "strategist",
+    planId,
+  });
   console.log(
     `✓ Plan ${planId} sent back to draft (round ${priorRevisions + 1}/${MAX_REVISIONS}). Strategist redrafting…`,
   );
   try {
     const result = await redraftPlan({
-      client,
+      client: recorder.client,
       planId,
       app: record.app,
       vault: record.vault,
       dataDir,
     });
+    recorder.flush();
     console.log(`✓ Plan ${result.planId} redrafted; now awaiting-review.`);
     return 0;
   } catch (err) {
+    recorder.flush();
     if (err instanceof StrategistError) {
       console.error(`revise: redraft failed — ${err.message}`);
       console.error(

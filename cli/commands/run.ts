@@ -5,10 +5,11 @@ import {
   executePlan,
 } from "../../agents/developer.ts";
 import { createAnthropicClient } from "../../orchestrator/anthropic-client.ts";
+import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
 import type { Plan } from "../../orchestrator/plan.ts";
-import { envFile, getDataDir } from "../paths.ts";
+import { dbFile, envFile, getDataDir } from "../paths.ts";
 
 export interface RunCommandDeps {
   client?: ReturnType<typeof createAnthropicClient>;
@@ -84,17 +85,26 @@ export async function runRun(
     );
     return 1;
   }
-  const client = deps.client ?? createAnthropicClient();
+  const baseClient = deps.client ?? createAnthropicClient();
+  const recorder = buildAgentCallRecorder(baseClient, dbFile(dataDir), {
+    app: record.app,
+    vault: record.vault,
+    agent: "developer",
+    planId,
+  });
 
   try {
     if (mode === "draft-impl") {
       const result = await draftImplementationPlan({
-        client,
+        client: recorder.client,
         parentPlanId: planId,
         app: record.app,
         vault: record.vault,
         dataDir,
       });
+      // The freshly-drafted impl plan is the more useful planId for telemetry
+      recorder.ctx.planId = result.planId;
+      recorder.flush();
       console.log(`✓ Drafted implementation plan ${result.planId}`);
       console.log(`  Path: ${result.planPath}`);
       console.log(`  Iterations: ${result.iterations}`);
@@ -105,12 +115,13 @@ export async function runRun(
     }
 
     const result = await executePlan({
-      client,
+      client: recorder.client,
       planId,
       app: record.app,
       vault: record.vault,
       dataDir,
     });
+    recorder.flush();
 
     console.log(result.finalText);
     console.log("");
@@ -134,6 +145,7 @@ export async function runRun(
     );
     return 1;
   } catch (err) {
+    recorder.flush();
     if (err instanceof DeveloperError) {
       console.error(`run developer: ${err.message}`);
       return 1;

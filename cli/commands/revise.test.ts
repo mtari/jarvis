@@ -64,6 +64,7 @@ function fixedClient(text: string): {
             } as Anthropic.TextBlock,
           ],
           stopReason: "end_turn",
+          model: "claude-sonnet-4-6",
           usage: {
             inputTokens: 0,
             outputTokens: 0,

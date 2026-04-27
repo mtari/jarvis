@@ -40,6 +40,7 @@ function fakeResponse(spec: FakeResponseSpec): ChatResponse {
     text: spec.text ?? "",
     blocks,
     stopReason: spec.stopReason ?? "end_turn",
+    model: "claude-sonnet-4-6",
     usage: {
       inputTokens: spec.inputTokens ?? 50,
       outputTokens: spec.outputTokens ?? 20,

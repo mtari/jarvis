@@ -9,12 +9,13 @@ import {
   type StrategistPlanType,
 } from "../../agents/strategist.ts";
 import { createAnthropicClient } from "../../orchestrator/anthropic-client.ts";
+import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import {
   improvementSubtypeSchema,
   marketingSubtypeSchema,
 } from "../../orchestrator/plan.ts";
-import { envFile, getDataDir } from "../paths.ts";
+import { dbFile, envFile, getDataDir } from "../paths.ts";
 
 export interface PlanCommandDeps {
   client?: ReturnType<typeof createAnthropicClient>;
@@ -108,13 +109,18 @@ export async function runPlan(
     return 1;
   }
 
-  const client = deps.client ?? createAnthropicClient();
+  const baseClient = deps.client ?? createAnthropicClient();
+  const recorder = buildAgentCallRecorder(baseClient, dbFile(dataDir), {
+    app: v.app,
+    vault: v.vault ?? "personal",
+    agent: "strategist",
+  });
   const prompter =
     deps.prompter ?? (v["no-challenge"] ? undefined : createStdinPrompter());
 
   try {
     const result = await runStrategist({
-      client,
+      client: recorder.client,
       brief,
       app: v.app,
       vault: v.vault ?? "personal",
@@ -125,6 +131,9 @@ export async function runPlan(
       ...(prompter !== undefined && { prompter }),
     });
 
+    recorder.ctx.planId = result.planId;
+    recorder.flush();
+
     console.log(`✓ Drafted plan ${result.planId}`);
     console.log(`  Path: ${result.planPath}`);
     console.log(`  Clarification rounds: ${result.rounds}`);
@@ -133,6 +142,7 @@ export async function runPlan(
     );
     return 0;
   } catch (err) {
+    recorder.flush();
     if (err instanceof StrategistError) {
       console.error(`plan: ${err.message}`);
       return 1;

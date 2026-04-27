@@ -94,6 +94,7 @@ function fixedTextResponse(text: string): ChatResponse {
       { type: "text", text, citations: null } as Anthropic.TextBlock,
     ],
     stopReason: "end_turn",
+    model: "claude-sonnet-4-6",
     usage: {
       inputTokens: 100,
       outputTokens: 50,
