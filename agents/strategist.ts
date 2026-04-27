@@ -8,7 +8,7 @@ import { loadBrain } from "../orchestrator/brain.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
 import { recordFeedback } from "../orchestrator/feedback-store.ts";
 import { savePlan } from "../orchestrator/plan-store.ts";
-import { parsePlan } from "../orchestrator/plan.ts";
+import { parsePlan, transitionPlan } from "../orchestrator/plan.ts";
 import type { Plan } from "../orchestrator/plan.ts";
 import type { Profile } from "../orchestrator/profile.ts";
 import { loadProfile } from "../orchestrator/profile.ts";
@@ -193,6 +193,12 @@ async function persistDraft(
       `Strategist's draft failed schema validation: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+  if (plan.metadata.status !== "draft") {
+    throw new StrategistError(
+      `Strategist's draft must have Status: draft, got "${plan.metadata.status}"`,
+    );
+  }
+  plan = transitionPlan(plan, "awaiting-review");
 
   const planId = generatePlanId(
     plan.metadata.title,

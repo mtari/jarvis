@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import type { AnthropicClient } from "../orchestrator/anthropic-client.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
 import { findPlan, savePlan, type PlanRecord } from "../orchestrator/plan-store.ts";
+import type { Plan } from "../orchestrator/plan.ts";
 import {
   parsePlan,
   transitionPlan,
@@ -97,7 +98,7 @@ export async function draftImplementationPlan(
       "Developer's final response had no <plan> block",
     );
   }
-  let plan;
+  let plan: Plan;
   try {
     plan = parsePlan(planMatch[1].trim());
   } catch (err) {
@@ -115,6 +116,12 @@ export async function draftImplementationPlan(
       `ParentPlan must equal "${input.parentPlanId}", got "${plan.metadata.parentPlan}"`,
     );
   }
+  if (plan.metadata.status !== "draft") {
+    throw new DeveloperError(
+      `Developer's draft must have Status: draft, got "${plan.metadata.status}"`,
+    );
+  }
+  plan = transitionPlan(plan, "awaiting-review");
 
   fs.mkdirSync(planFolder, { recursive: true });
 
