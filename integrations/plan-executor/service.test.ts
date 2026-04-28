@@ -21,6 +21,7 @@ import {
 import { findPlan } from "../../orchestrator/plan-store.ts";
 import {
   assertCleanMain,
+  createPlanExecutorService,
   readFiredPlanIds,
   runPlanExecutorTick,
 } from "./service.ts";
@@ -469,4 +470,107 @@ describe("plan-executor execute-queue", () => {
       repo.cleanup();
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// tickInFlight guard — createPlanExecutorService must not invoke the tick
+// body concurrently when a previous invocation is still running.
+//
+// Strategy: inject a `_tickBody` stub via the test-only option so we can
+// precisely control timing without spying on module internals.
+// ---------------------------------------------------------------------------
+
+describe("createPlanExecutorService tickInFlight guard", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("does not invoke the tick body concurrently: 3 interval fires with a slow tick → body called exactly once", async () => {
+    // We start the service with a slow _tickBody that holds until we release
+    // it. While tick #1 is suspended we stop the service (stopping clears the
+    // interval), then release tick #1. The call count must be exactly 1
+    // because all subsequent interval firings during the hold period were
+    // dropped by the tickInFlight guard.
+    const tickMs = 20;
+
+    let tickCallCount = 0;
+    let resolveSlowTick!: () => void;
+    const slowTickDone = new Promise<void>((resolve) => {
+      resolveSlowTick = resolve;
+    });
+
+    const service = createPlanExecutorService({
+      dataDir: sandbox.dataDir,
+      tickMs,
+      enabledApps: ["jarvis"],
+      _tickBody: async () => {
+        tickCallCount++;
+        // First invocation: block until we explicitly release.
+        if (tickCallCount === 1) {
+          await slowTickDone;
+        }
+      },
+    });
+
+    service.start(fakeDaemonCtx());
+
+    // Give the initial void tickFn() a microtask turn to set tickInFlight=true
+    // and reach the await inside _tickBody.
+    await Promise.resolve();
+
+    // Now wait 3× tickMs so the interval fires at least 3 times while tick #1
+    // is still awaiting slowTickDone. All of those must be dropped.
+    await new Promise<void>((r) => setTimeout(r, tickMs * 3 + 10));
+
+    // Stop the service — clears the interval so no new firings can occur.
+    service.stop();
+
+    // Assert while tick #1 is still in flight: count must still be 1.
+    expect(tickCallCount).toBe(1);
+
+    // Release tick #1 (just to avoid hanging promises / unhandled rejections).
+    resolveSlowTick();
+
+    // Drain the promise chain.
+    await Promise.resolve();
+  }, 3000);
+
+  it("tickInFlight resets to false after the tick body throws, allowing subsequent ticks to run", async () => {
+    // tick #1 throws; after the finally block resets tickInFlight, tick #2
+    // (fired on the next interval) must be allowed through.
+    const tickMs = 20;
+    let tickCallCount = 0;
+
+    const service = createPlanExecutorService({
+      dataDir: sandbox.dataDir,
+      tickMs,
+      enabledApps: ["jarvis"],
+      _tickBody: async () => {
+        tickCallCount++;
+        if (tickCallCount === 1) {
+          throw new Error("simulated tick failure");
+        }
+      },
+    });
+
+    service.start(fakeDaemonCtx());
+
+    // Wait for tick #1 (throws immediately) to complete its finally block,
+    // then one full interval for tick #2 to fire and finish.
+    await new Promise<void>((r) => setTimeout(r, tickMs * 3));
+
+    service.stop();
+
+    // tickInFlight must have been reset by finally; tick #2 was allowed in.
+    expect(tickCallCount).toBeGreaterThanOrEqual(2);
+  }, 3000);
 });

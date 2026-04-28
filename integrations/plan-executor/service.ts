@@ -28,6 +28,14 @@ export interface PlanExecutorOptions {
   enabledApps?: ReadonlyArray<string>;
   /** Override repo root for assertCleanMain (tests inject a fixture repo). */
   repoRoot?: string;
+  /**
+   * Override the tick body for testing. When provided, replaces the default
+   * runPlanExecutorTick call so tests can inject timing-controlled stubs
+   * without spying on module internals.
+   *
+   * @internal — not part of the public API.
+   */
+  _tickBody?: (ctx: DaemonContext) => Promise<void>;
 }
 
 const DEFAULT_ENABLED_APPS: ReadonlyArray<string> = ["jarvis"];
@@ -364,16 +372,32 @@ export function createPlanExecutorService(
   const enabledApps = opts.enabledApps ?? DEFAULT_ENABLED_APPS;
   const tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
 
+  // Guards against overlapping ticks: if a tick is still running when the
+  // interval fires again, the new interval callback returns immediately.
+  // The flag is always reset in a `finally` block so a thrown/rejected tick
+  // never permanently stalls the executor.
+  let tickInFlight = false;
+
   return {
     name: "plan-executor",
     start(ctx: DaemonContext): void {
       const tickFn = async (): Promise<void> => {
-        // Lazy-build the Anthropic client so the daemon can boot when the
-        // API key is missing — the auto-fire just won't have anything to do.
-        if (!process.env["ANTHROPIC_API_KEY"]) {
+        if (tickInFlight) {
           return;
         }
+        tickInFlight = true;
         try {
+          // When a test-only tick body is injected, use it directly and skip
+          // the API-key check and client setup below.
+          if (opts._tickBody !== undefined) {
+            await opts._tickBody(ctx);
+            return;
+          }
+          // Lazy-build the Anthropic client so the daemon can boot when the
+          // API key is missing — the auto-fire just won't have anything to do.
+          if (!process.env["ANTHROPIC_API_KEY"]) {
+            return;
+          }
           if (!lazyClient) {
             lazyClient = opts.buildAnthropicClient
               ? opts.buildAnthropicClient()
@@ -405,6 +429,8 @@ export function createPlanExecutorService(
           }
         } catch (err) {
           ctx.logger.error("plan-executor tick errored", err);
+        } finally {
+          tickInFlight = false;
         }
       };
 
