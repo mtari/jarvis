@@ -1,9 +1,5 @@
 import { parseArgs } from "node:util";
-import Database from "better-sqlite3";
-import { appendEvent } from "../../orchestrator/event-log.ts";
-import { recordFeedback } from "../../orchestrator/feedback-store.ts";
-import { findPlan, savePlan } from "../../orchestrator/plan-store.ts";
-import { transitionPlan } from "../../orchestrator/plan.ts";
+import { approvePlan } from "../../orchestrator/plan-lifecycle.ts";
 import { dbFile, getDataDir } from "../paths.ts";
 
 export async function runApprove(rawArgs: string[]): Promise<number> {
@@ -30,92 +26,28 @@ export async function runApprove(rawArgs: string[]): Promise<number> {
   }
 
   const dataDir = getDataDir();
-  const record = findPlan(dataDir, planId);
-  if (!record) {
-    console.error(`approve: plan ${planId} not found.`);
-    return 1;
-  }
+  const result = approvePlan(dataDir, dbFile(dataDir), planId, {
+    actor: "user",
+    ...(parsed.values["confirm-destructive"] === true && {
+      confirmDestructive: true,
+    }),
+  });
 
-  const fromStatus = record.plan.metadata.status;
-  if (fromStatus !== "awaiting-review") {
-    console.error(
-      `approve: plan ${planId} is in state "${fromStatus}", not "awaiting-review".`,
-    );
-    return 1;
-  }
-
-  if (
-    record.plan.metadata.destructive &&
-    !parsed.values["confirm-destructive"]
-  ) {
-    console.error(
-      `approve: plan ${planId} is marked Destructive: true. Re-run with --confirm-destructive.`,
-    );
-    return 1;
-  }
-
-  const next = transitionPlan(record.plan, "approved");
-
-  // §4: when an implementation plan is approved, the parent improvement
-  // plan transitions approved → executing (the parent stays in approved
-  // until impl is approved; once impl is approved, "Developer codes per
-  // the implementation plan").
-  let parentChain: { record: typeof record; next: typeof next } | null = null;
-  if (
-    record.plan.metadata.type === "implementation" &&
-    record.plan.metadata.parentPlan
-  ) {
-    const parent = findPlan(dataDir, record.plan.metadata.parentPlan);
-    if (parent && parent.plan.metadata.status === "approved") {
-      parentChain = {
-        record: parent,
-        next: transitionPlan(parent.plan, "executing"),
-      };
+  if (!result.ok) {
+    if (result.reason === "destructive-not-confirmed") {
+      console.error(
+        `approve: ${result.message} Re-run with --confirm-destructive.`,
+      );
+    } else {
+      console.error(`approve: ${result.message}`);
     }
+    return 1;
   }
 
-  const db = new Database(dbFile(dataDir));
-  try {
-    db.transaction(() => {
-      appendEvent(db, {
-        appId: record.app,
-        vaultId: record.vault,
-        kind: "plan-transition",
-        payload: { planId, from: fromStatus, to: "approved" },
-      });
-      recordFeedback(db, {
-        kind: "approve",
-        actor: "user",
-        targetType: "plan",
-        targetId: planId,
-      });
-      if (parentChain) {
-        appendEvent(db, {
-          appId: parentChain.record.app,
-          vaultId: parentChain.record.vault,
-          kind: "plan-transition",
-          payload: {
-            planId: parentChain.record.id,
-            from: "approved",
-            to: "executing",
-            actor: "system",
-            reason: `child impl plan ${planId} approved`,
-          },
-        });
-      }
-    })();
-  } finally {
-    db.close();
-  }
-
-  savePlan(record.path, next);
-  if (parentChain) {
-    savePlan(parentChain.record.path, parentChain.next);
-  }
   console.log(`✓ Approved plan ${planId}.`);
-  if (parentChain) {
+  if (result.parentTransitioned) {
     console.log(
-      `  Parent ${parentChain.record.id} transitioned approved → executing.`,
+      `  Parent ${result.parentTransitioned.id} transitioned approved → executing.`,
     );
   }
   return 0;

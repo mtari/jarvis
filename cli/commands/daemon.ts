@@ -9,9 +9,15 @@ import {
   releasePidFile,
   type PidFileData,
 } from "../../orchestrator/daemon-pid.ts";
+import { loadEnvFile } from "../../orchestrator/env-loader.ts";
+import {
+  createSlackService,
+  readSlackEnv,
+} from "../../integrations/slack/service.ts";
 import {
   daemonPidFile,
   dbFile,
+  envFile,
   getDataDir,
   logsDir,
 } from "../paths.ts";
@@ -130,9 +136,13 @@ export async function runDaemon(rawArgs: string[]): Promise<number> {
     return 1;
   }
 
+  // Load .env so SLACK_*_TOKEN etc. are available before service startup.
+  const dataDir = getDataDir();
+  loadEnvFile(envFile(dataDir));
+
   let handle: DaemonHandle;
   try {
-    handle = await bootstrapDaemon({ services: defaultServices() });
+    handle = await bootstrapDaemon({ services: defaultServices(dataDir) });
   } catch (err) {
     if (err instanceof PidFileHeldError) {
       console.error(`daemon: ${err.message}`);
@@ -171,12 +181,28 @@ export async function runDaemon(rawArgs: string[]): Promise<number> {
 }
 
 /**
- * Default services bundled with the daemon. Phase 1 ships only the
- * heartbeat — Slack adapter, schedulers, etc. plug in as new milestones
- * deliver them.
+ * Default services bundled with the daemon. Heartbeat always; Slack lights up
+ * when SLACK_BOT_TOKEN + SLACK_APP_TOKEN + JARVIS_SLACK_*_CHANNEL are present
+ * in jarvis-data/.env.
  */
-function defaultServices(): DaemonService[] {
-  return [createHeartbeatService()];
+function defaultServices(dataDir: string): DaemonService[] {
+  const services: DaemonService[] = [createHeartbeatService()];
+  const slackConfig = readSlackEnv();
+  if (slackConfig) {
+    services.push(
+      createSlackService({
+        botToken: slackConfig.botToken,
+        appToken: slackConfig.appToken,
+        ...(slackConfig.signingSecret !== undefined && {
+          signingSecret: slackConfig.signingSecret,
+        }),
+        inboxChannel: slackConfig.inboxChannel,
+        alertsChannel: slackConfig.alertsChannel,
+        dataDir,
+      }),
+    );
+  }
+  return services;
 }
 
 interface HeartbeatService extends DaemonService {
