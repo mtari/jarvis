@@ -4,12 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type Anthropic from "@anthropic-ai/sdk";
 import type {
-  AnthropicClient,
-  ChatRequest,
-  ChatResponse,
-} from "../../orchestrator/anthropic-client.ts";
+  RunAgentResolvedOptions,
+  RunAgentResult,
+  RunAgentTransport,
+} from "../../orchestrator/agent-sdk-runtime.ts";
 import { dbFile } from "../../cli/paths.ts";
 import {
   dropPlan,
@@ -84,44 +83,46 @@ See parent.
 None.
 </plan>`;
 
-interface ScriptedClient {
-  client: AnthropicClient;
-  calls: ChatRequest[];
+interface ScriptedTransport {
+  transport: RunAgentTransport;
+  calls: RunAgentResolvedOptions[];
 }
 
-function fixedTextResponse(text: string): ChatResponse {
+function fixedRunResult(
+  text: string,
+  overrides: Partial<RunAgentResult> = {},
+): RunAgentResult {
   return {
     text,
-    blocks: [
-      { type: "text", text, citations: null } as Anthropic.TextBlock,
-    ],
-    stopReason: "end_turn",
-    model: "claude-sonnet-4-6",
+    subtype: "success",
+    numTurns: 5,
+    durationMs: 1234,
+    totalCostUsd: 0,
     usage: {
       inputTokens: 100,
       outputTokens: 50,
       cachedInputTokens: 0,
       cacheCreationTokens: 0,
     },
-    redactions: [],
+    permissionDenials: 0,
+    errors: [],
+    model: "claude-sonnet-4-6",
+    stopReason: "end_turn",
+    ...overrides,
   };
 }
 
-function scriptedClient(responses: string[]): ScriptedClient {
-  const calls: ChatRequest[] = [];
+function scriptedTransport(responses: string[]): ScriptedTransport {
+  const calls: RunAgentResolvedOptions[] = [];
   let i = 0;
-  return {
-    calls,
-    client: {
-      async chat(req) {
-        calls.push(req);
-        if (i >= responses.length) {
-          throw new Error("scripted client out of responses");
-        }
-        return fixedTextResponse(responses[i++]!);
-      },
-    },
+  const transport: RunAgentTransport = async (resolved) => {
+    calls.push(resolved);
+    if (i >= responses.length) {
+      throw new Error("scripted transport out of responses");
+    }
+    return fixedRunResult(responses[i++]!);
   };
+  return { calls, transport };
 }
 
 function fakeDaemonCtx(): DaemonContext {
@@ -231,11 +232,11 @@ describe("plan-executor", () => {
       status: "approved",
       implementationReview: "required",
     });
-    const { client } = scriptedClient([VALID_IMPL_PLAN_BLOCK(parentId)]);
+    const { transport } = scriptedTransport([VALID_IMPL_PLAN_BLOCK(parentId)]);
     const result = await runPlanExecutorTick({
       dataDir: sandbox.dataDir,
       enabledApps: ["jarvis"],
-      client,
+      transport,
       ctx: fakeDaemonCtx(),
     });
     expect(result.fired).toHaveLength(1);
@@ -251,14 +252,14 @@ describe("plan-executor", () => {
       status: "approved",
       implementationReview: "required",
     });
-    const { client, calls } = scriptedClient([
+    const { transport, calls } = scriptedTransport([
       VALID_IMPL_PLAN_BLOCK(parentId),
     ]);
 
     const first = await runPlanExecutorTick({
       dataDir: sandbox.dataDir,
       enabledApps: ["jarvis"],
-      client,
+      transport,
       ctx: fakeDaemonCtx(),
     });
     expect(first.fired).toHaveLength(1);
@@ -267,7 +268,7 @@ describe("plan-executor", () => {
     const second = await runPlanExecutorTick({
       dataDir: sandbox.dataDir,
       enabledApps: ["jarvis"],
-      client,
+      transport,
       ctx: fakeDaemonCtx(),
     });
     expect(second.fired).toHaveLength(0);
@@ -279,11 +280,11 @@ describe("plan-executor", () => {
       status: "approved",
       app: "erdei-fahazak",
     });
-    const { client, calls } = scriptedClient([]);
+    const { transport, calls } = scriptedTransport([]);
     const result = await runPlanExecutorTick({
       dataDir: sandbox.dataDir,
       enabledApps: ["jarvis"],
-      client,
+      transport,
       ctx: fakeDaemonCtx(),
     });
     expect(result.fired).toHaveLength(0);
@@ -299,11 +300,11 @@ describe("plan-executor", () => {
   it("skips plans not in approved state", async () => {
     dropPlan(sandbox, "2026-04-28-draft", { status: "draft" });
     dropPlan(sandbox, "2026-04-28-pending", { status: "awaiting-review" });
-    const { client } = scriptedClient([]);
+    const { transport } = scriptedTransport([]);
     const result = await runPlanExecutorTick({
       dataDir: sandbox.dataDir,
       enabledApps: ["jarvis"],
-      client,
+      transport,
       ctx: fakeDaemonCtx(),
     });
     expect(result.fired).toHaveLength(0);
@@ -316,11 +317,11 @@ describe("plan-executor", () => {
       implementationReview: "required",
     });
     // Mock returns a non-plan response → draftImpl throws
-    const { client } = scriptedClient(["not a plan"]);
+    const { transport } = scriptedTransport(["not a plan"]);
     const result = await runPlanExecutorTick({
       dataDir: sandbox.dataDir,
       enabledApps: ["jarvis"],
-      client,
+      transport,
       ctx: fakeDaemonCtx(),
     });
     expect(result.fired).toHaveLength(1);
@@ -360,11 +361,11 @@ describe("plan-executor execute-queue", () => {
         implementationReview: "skip",
       });
 
-      const { client } = scriptedClient([]);
+      const { transport } = scriptedTransport([]);
       const result = await runPlanExecutorTick({
         dataDir: sandbox.dataDir,
         enabledApps: ["jarvis"],
-        client,
+        transport,
         ctx: fakeDaemonCtx(),
         repoRoot: repo.dir,
       });
@@ -386,11 +387,11 @@ describe("plan-executor execute-queue", () => {
         implementationReview: "skip",
       });
 
-      const { client } = scriptedClient([]);
+      const { transport } = scriptedTransport([]);
       const result = await runPlanExecutorTick({
         dataDir: sandbox.dataDir,
         enabledApps: ["jarvis"],
-        client,
+        transport,
         ctx: fakeDaemonCtx(),
         repoRoot: repo.dir,
       });
@@ -414,11 +415,11 @@ describe("plan-executor execute-queue", () => {
         implementationReview: "required",
       });
 
-      const { client } = scriptedClient([VALID_IMPL_PLAN_BLOCK(parentId)]);
+      const { transport } = scriptedTransport([VALID_IMPL_PLAN_BLOCK(parentId)]);
       const result = await runPlanExecutorTick({
         dataDir: sandbox.dataDir,
         enabledApps: ["jarvis"],
-        client,
+        transport,
         ctx: fakeDaemonCtx(),
         repoRoot: repo.dir,
       });
@@ -449,11 +450,11 @@ describe("plan-executor execute-queue", () => {
         implementationReview: "skip",
       });
 
-      const { client } = scriptedClient([]);
+      const { transport } = scriptedTransport([]);
       const result = await runPlanExecutorTick({
         dataDir: sandbox.dataDir,
         enabledApps: ["jarvis"],
-        client,
+        transport,
         ctx: fakeDaemonCtx(),
         repoRoot: repo.dir,
       });

@@ -257,6 +257,213 @@ function pickModel(
 }
 
 // ---------------------------------------------------------------------------
+// runAgent — tool-loop variant. For Developer (and any future agent that
+// needs file/edit/bash tools). The SDK's query() is its own agent loop, so
+// runAgent is a thin wrapper that drives query() with the right options,
+// streams the message envelope, and returns the result message normalised
+// for our event log.
+// ---------------------------------------------------------------------------
+
+export type RunAgentToolPreset =
+  | { kind: "none" }
+  | { kind: "readonly" } // ['Read', 'Glob', 'Grep'] — for Developer's draft-impl mode
+  | { kind: "claude_code"; disallow?: string[] }; // full preset for execute mode
+
+export type RunAgentResultSubtype =
+  | "success"
+  | "error_max_turns"
+  | "error_during_execution"
+  | "error_max_budget_usd"
+  | "error_max_structured_output_retries";
+
+export interface RunAgentResult {
+  /** Final assistant text from the SDK's result message. */
+  text: string;
+  /** SDK result subtype. `success` is the only happy path. */
+  subtype: RunAgentResultSubtype;
+  numTurns: number;
+  durationMs: number;
+  totalCostUsd: number;
+  usage: ChatUsage;
+  permissionDenials: number;
+  errors: string[];
+  model: string;
+  stopReason: string | null;
+}
+
+export interface RunAgentOptions {
+  systemPrompt: string;
+  /** Appended to the chosen system prompt (e.g., our developer-execute.md text on top of the claude_code preset). */
+  appendSystemPrompt?: string;
+  /** When true, send the systemPrompt as `{ type: 'preset', preset: 'claude_code', append: appendSystemPrompt }`. Otherwise raw string. */
+  presetSystemPrompt?: boolean;
+  userPrompt: string;
+  cwd: string;
+  maxTurns: number;
+  toolPreset: RunAgentToolPreset;
+  model?: string;
+  /** Injected for tests; production drives the real SDK via `query()`. */
+  transport?: RunAgentTransport;
+}
+
+export type RunAgentTransport = (
+  resolved: RunAgentResolvedOptions,
+) => Promise<RunAgentResult>;
+
+export interface RunAgentResolvedOptions {
+  prompt: string;
+  systemPrompt:
+    | string
+    | { type: "preset"; preset: "claude_code"; append?: string };
+  cwd: string;
+  maxTurns: number;
+  tools: string[] | { type: "preset"; preset: "claude_code" };
+  disallowedTools?: string[];
+  model: string;
+  redactions: RedactionMatch[];
+}
+
+const DEFAULT_DISALLOWED_FOR_CLAUDE_CODE: ReadonlyArray<string> = [
+  "WebFetch",
+  "WebSearch",
+  "Task",
+  "NotebookEdit",
+];
+
+const READONLY_TOOLS: ReadonlyArray<string> = ["Read", "Glob", "Grep"];
+
+export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
+  const allRedactions: RedactionMatch[] = [];
+  const redactString = (s: string): string => {
+    const r = redact(s);
+    for (const m of r.matches) allRedactions.push(m);
+    return r.text;
+  };
+
+  const userPrompt = redactString(opts.userPrompt);
+  const rawSystem = redactString(opts.systemPrompt);
+  const appendSystem = opts.appendSystemPrompt
+    ? redactString(opts.appendSystemPrompt)
+    : undefined;
+
+  const systemPrompt: RunAgentResolvedOptions["systemPrompt"] = opts.presetSystemPrompt
+    ? {
+        type: "preset" as const,
+        preset: "claude_code" as const,
+        ...(appendSystem !== undefined ? { append: appendSystem } : {}),
+      }
+    : appendSystem !== undefined
+      ? `${rawSystem}\n\n${appendSystem}`
+      : rawSystem;
+
+  const tools: RunAgentResolvedOptions["tools"] =
+    opts.toolPreset.kind === "none"
+      ? []
+      : opts.toolPreset.kind === "readonly"
+        ? [...READONLY_TOOLS]
+        : { type: "preset", preset: "claude_code" };
+
+  const disallowedTools =
+    opts.toolPreset.kind === "claude_code"
+      ? [
+          ...DEFAULT_DISALLOWED_FOR_CLAUDE_CODE,
+          ...(opts.toolPreset.disallow ?? []),
+        ]
+      : undefined;
+
+  const resolved: RunAgentResolvedOptions = {
+    prompt: userPrompt,
+    systemPrompt,
+    cwd: opts.cwd,
+    maxTurns: opts.maxTurns,
+    tools,
+    ...(disallowedTools && disallowedTools.length > 0 && { disallowedTools }),
+    model: opts.model ?? DEFAULT_MODEL,
+    redactions: allRedactions,
+  };
+
+  const transport = opts.transport ?? defaultRunAgentTransport;
+  return transport(resolved);
+}
+
+const defaultRunAgentTransport: RunAgentTransport = async (resolved) => {
+  const { query } = await import("@anthropic-ai/claude-agent-sdk");
+
+  // Build SDK options. We use bypassPermissions in the daemon — no TTY for
+  // interactive prompts. Tool restrictions come via `tools` + `disallowedTools`
+  // and Developer's prompt rules + the assertCleanMain pre-check.
+  const sdkOpts: Record<string, unknown> = {
+    systemPrompt: resolved.systemPrompt,
+    cwd: resolved.cwd,
+    maxTurns: resolved.maxTurns,
+    permissionMode: "bypassPermissions",
+    tools: resolved.tools,
+    model: resolved.model,
+  };
+  if (resolved.disallowedTools && resolved.disallowedTools.length > 0) {
+    sdkOpts["disallowedTools"] = resolved.disallowedTools;
+  }
+
+  const handle = query({
+    prompt: resolved.prompt,
+    options: sdkOpts as never,
+  });
+
+  for await (const message of handle) {
+    if (message.type === "rate_limit_event") {
+      const info = message.rate_limit_info;
+      if (info.status === "rejected") {
+        const resetsAt =
+          info.resetsAt !== undefined ? new Date(info.resetsAt * 1000) : undefined;
+        throw new RateLimitedError(
+          `Claude subscription rate limit (${info.rateLimitType ?? "unknown"})`,
+          resetsAt,
+          info.rateLimitType,
+        );
+      }
+      continue;
+    }
+
+    if (message.type === "assistant" && message.error === "rate_limit") {
+      throw new RateLimitedError(
+        "Claude subscription rate limit (assistant message)",
+      );
+    }
+
+    if (message.type === "result") {
+      const usage = message.usage as unknown as Record<
+        string,
+        number | null | undefined
+      >;
+      const errors = "errors" in message ? message.errors : [];
+      return {
+        text: "result" in message ? message.result : "",
+        subtype: message.subtype as RunAgentResultSubtype,
+        numTurns: message.num_turns,
+        durationMs: message.duration_ms,
+        totalCostUsd: message.total_cost_usd,
+        usage: {
+          inputTokens: (usage["input_tokens"] as number) ?? 0,
+          outputTokens: (usage["output_tokens"] as number) ?? 0,
+          cachedInputTokens: (usage["cache_read_input_tokens"] as number) ?? 0,
+          cacheCreationTokens:
+            (usage["cache_creation_input_tokens"] as number) ?? 0,
+        },
+        permissionDenials: message.permission_denials.length,
+        errors,
+        model: pickModel(
+          message.modelUsage as unknown as Record<string, unknown>,
+          resolved.model,
+        ),
+        stopReason: message.stop_reason,
+      };
+    }
+  }
+
+  throw new Error("SDK query stream ended without a result message");
+};
+
+// ---------------------------------------------------------------------------
 // Top-level factory: reads JARVIS_AGENT_RUNTIME and returns the right client.
 // Default: 'sdk' (subscription via local claude CLI, see §18). Override with
 // JARVIS_AGENT_RUNTIME=api to fall back to the legacy Anthropic client. The

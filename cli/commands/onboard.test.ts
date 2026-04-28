@@ -1,13 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type Anthropic from "@anthropic-ai/sdk";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type {
-  AnthropicClient,
-  ChatResponse,
-} from "../../orchestrator/anthropic-client.ts";
+  RunAgentResult,
+  RunAgentTransport,
+} from "../../orchestrator/agent-sdk-runtime.ts";
 import { loadBrain } from "../../orchestrator/brain.ts";
 import { brainDocsFile, brainFile, dbFile, planDir } from "../paths.ts";
 import {
@@ -18,27 +17,28 @@ import {
 } from "./_test-helpers.ts";
 import { runOnboard } from "./onboard.ts";
 
-function fixedClient(text: string): AnthropicClient {
+function fixedRunResult(text: string): RunAgentResult {
   return {
-    async chat() {
-      const response: ChatResponse = {
-        text,
-        blocks: [
-          { type: "text", text, citations: null } as Anthropic.TextBlock,
-        ],
-        stopReason: "end_turn",
-        model: "claude-sonnet-4-6",
-        usage: {
-          inputTokens: 50,
-          outputTokens: 30,
-          cachedInputTokens: 0,
-          cacheCreationTokens: 0,
-        },
-        redactions: [],
-      };
-      return response;
+    text,
+    subtype: "success",
+    numTurns: 5,
+    durationMs: 1234,
+    totalCostUsd: 0,
+    usage: {
+      inputTokens: 50,
+      outputTokens: 30,
+      cachedInputTokens: 0,
+      cacheCreationTokens: 0,
     },
+    permissionDenials: 0,
+    errors: [],
+    model: "claude-sonnet-4-6",
+    stopReason: "end_turn",
   };
+}
+
+function fixedTransport(text: string): RunAgentTransport {
+  return async () => fixedRunResult(text);
 }
 
 const BRAIN_FOR = (app: string): string => `<brain>
@@ -86,7 +86,7 @@ describe("runOnboard", () => {
     expect(
       await runOnboard(
         ["--app", "DemoApp", "--repo", repoRoot],
-        { client: fixedClient(BRAIN_FOR("demoapp")) },
+        { transport: fixedTransport(BRAIN_FOR("demoapp")) },
       ),
     ).toBe(1);
   });
@@ -95,7 +95,7 @@ describe("runOnboard", () => {
     expect(
       await runOnboard(
         ["--app", "demoapp", "--repo", "relative/path"],
-        { client: fixedClient(BRAIN_FOR("demoapp")) },
+        { transport: fixedTransport(BRAIN_FOR("demoapp")) },
       ),
     ).toBe(1);
   });
@@ -104,7 +104,7 @@ describe("runOnboard", () => {
     expect(
       await runOnboard(
         ["--app", "demoapp", "--repo", repoRoot, "--vault", "ghost"],
-        { client: fixedClient(BRAIN_FOR("demoapp")) },
+        { transport: fixedTransport(BRAIN_FOR("demoapp")) },
       ),
     ).toBe(1);
   });
@@ -112,13 +112,13 @@ describe("runOnboard", () => {
   it("refuses to overwrite an existing brain", async () => {
     const code1 = await runOnboard(
       ["--app", "demoapp", "--repo", repoRoot],
-      { client: fixedClient(BRAIN_FOR("demoapp")) },
+      { transport: fixedTransport(BRAIN_FOR("demoapp")) },
     );
     expect(code1).toBe(0);
 
     const code2 = await runOnboard(
       ["--app", "demoapp", "--repo", repoRoot],
-      { client: fixedClient(BRAIN_FOR("demoapp")) },
+      { transport: fixedTransport(BRAIN_FOR("demoapp")) },
     );
     expect(code2).toBe(1);
   });
@@ -126,7 +126,7 @@ describe("runOnboard", () => {
   it("writes a valid brain.json + docs.json + plans dir + app-onboarded event", async () => {
     const code = await runOnboard(
       ["--app", "demoapp", "--repo", repoRoot],
-      { client: fixedClient(BRAIN_FOR("demoapp")) },
+      { transport: fixedTransport(BRAIN_FOR("demoapp")) },
     );
     expect(code).toBe(0);
 
@@ -163,27 +163,9 @@ describe("runOnboard", () => {
     fs.writeFileSync(docPath, "BRAND=tegező");
 
     let captured = "";
-    const captureClient: AnthropicClient = {
-      async chat(req) {
-        const text = String(req.messages[0]?.content ?? "");
-        captured = text;
-        const text2 = BRAIN_FOR("demoapp");
-        return {
-          text: text2,
-          blocks: [
-            { type: "text", text: text2, citations: null } as Anthropic.TextBlock,
-          ],
-          stopReason: "end_turn",
-          model: "claude-sonnet-4-6",
-          usage: {
-            inputTokens: 50,
-            outputTokens: 30,
-            cachedInputTokens: 0,
-            cacheCreationTokens: 0,
-          },
-          redactions: [],
-        };
-      },
+    const captureTransport: RunAgentTransport = async (resolved) => {
+      captured = resolved.prompt;
+      return fixedRunResult(BRAIN_FOR("demoapp"));
     };
 
     const code = await runOnboard(
@@ -195,7 +177,7 @@ describe("runOnboard", () => {
         "--docs",
         docPath,
       ],
-      { client: captureClient },
+      { transport: captureTransport },
     );
     expect(code).toBe(0);
     expect(captured).toContain("BRAND=tegező");
@@ -214,7 +196,7 @@ describe("runOnboard", () => {
 
     const code = await runOnboard(
       ["--app", "demoapp", "--repo", repoRoot, "--docs-keep", docPath],
-      { client: fixedClient(BRAIN_FOR("demoapp")) },
+      { transport: fixedTransport(BRAIN_FOR("demoapp")) },
     );
     expect(code).toBe(0);
 
@@ -247,7 +229,7 @@ describe("runOnboard", () => {
         "https://example.com/spec",
       ],
       {
-        client: fixedClient(BRAIN_FOR("demoapp")),
+        transport: fixedTransport(BRAIN_FOR("demoapp")),
         fetchUrl: async (url) => {
           fetched.push(url);
           return { content: "fetched-spec-body", contentType: "text/plain" };
@@ -276,7 +258,7 @@ describe("runOnboard", () => {
         cachedPath,
         "--move-docs",
       ],
-      { client: fixedClient(BRAIN_FOR("demoapp")) },
+      { transport: fixedTransport(BRAIN_FOR("demoapp")) },
     );
     expect(code).toBe(0);
     expect(fs.existsSync(absorbedPath)).toBe(false);
@@ -319,7 +301,7 @@ describe("runOnboard", () => {
         "--move-docs",
       ],
       {
-        client: fixedClient(BRAIN_FOR("demoapp")),
+        transport: fixedTransport(BRAIN_FOR("demoapp")),
         fetchUrl: async () => ({ content: "fetched", contentType: "text/plain" }),
       },
     );
@@ -339,7 +321,7 @@ describe("runOnboard", () => {
         "--docs-keep",
         localPath,
       ],
-      { client: fixedClient(BRAIN_FOR("demoapp")) },
+      { transport: fixedTransport(BRAIN_FOR("demoapp")) },
     );
     expect(code).toBe(0);
     expect(fs.existsSync(localPath)).toBe(true);
@@ -358,7 +340,7 @@ describe("runOnboard", () => {
         localPath,
         "--move-docs",
       ],
-      { client: fixedClient("not a brain") },
+      { transport: fixedTransport("not a brain") },
     );
     expect(code).toBe(1);
     expect(fs.existsSync(localPath)).toBe(true);
