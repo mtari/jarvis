@@ -24,7 +24,7 @@
 15. [Repository layout](#15-repository-layout)
 16. [Phased build plan](#16-phased-build-plan)
 17. [CLI reference](#17-cli-reference)
-18. [Cost model](#18-cost-model)
+18. [Resource model](#18-resource-model)
 19. [Open items](#19-open-items)
 
 ---
@@ -981,7 +981,7 @@ Amendments are a normal part of the loop, not a failure. Strategist learns from 
 - **Secrets scanner pre-Claude.** Every outbound prompt passes through a regex-based redactor covering: Anthropic, OpenAI, AWS, GitHub, Stripe, Postmark, Supabase, Vercel, Doppler keys + generic JWT + full `.env` fragments. Matches → `[REDACTED_SECRET]` + log + inbox entry. Known limitations acknowledged: regex won't catch obfuscated or encoded secrets — design prompts to not need raw secrets in the first place.
 - **No destructive ops autonomously.** DB drops, `rm -rf`, force-push, license changes, public-repo flips — all require plans with `Destructive: true` in the front-matter. Approval requires a second confirmation: Slack asks for a secondary button click, CLI requires `yarn jarvis approve <id> --confirm-destructive`. Strategist must set this flag whenever the Build plan includes any irreversible op.
 - **Timeouts:** any agent step that blocks > 30 min escalates and releases its lock.
-- **Rate-limit aware:** all external API calls go through a rate-limiter wrapper with exponential backoff; 429s log as signals.
+- **Rate-limit aware:** the agent runtime listens for `SDKRateLimitEvent` from the Claude Agent SDK and for `rate_limit` on assistant-message errors. On hit, the plan-executor pauses, posts to `#jarvis-alerts` with the reset time, and resumes automatically after the window expires. Other external APIs (GitHub, Umami, Slack) wrap with exponential backoff; 429s log as signals. See §18.
 - **Backup check:** restore smoke-test runs on first `yarn jarvis install` (so you know the restore path works before you need it) AND monthly thereafter. Rebuilds SQLite from JSONL exports into a scratch dir and verifies row counts match.
 - **Dry-run mode:** Developer and Marketer accept `--dry-run` to produce outputs with no side effects (no git commit, no Slack/FB post). Use when onboarding a new agent version or debugging suspicious behavior.
 - **Humanizer pass on user-facing text.** Any text destined for an external audience (social posts, campaign copy, app marketing content, blog) runs through `jarvis/tools/humanizer.ts` before publication or PR. The humanizer is a Claude call with style rules from the Wikipedia "Signs of AI writing" guide — strips inflated symbolism, rule-of-three, em-dash overuse, vague attributions, and promotional language. **Applies to:** all Marketer outputs, Developer outputs when a plan touches user-facing text (per the repo `CLAUDE.md` writing style). **Exempt:** plans, amendments, PR descriptions, commit messages, code comments, internal logs, Slack messages to you.
@@ -1022,13 +1022,13 @@ Each agent's recent outcomes (approved, rejected, dismissed, reworked) are track
 | Package manager | **yarn** | |
 | Language | **TypeScript** (strict) | |
 | Runtime | **Node + tsx** | |
-| LLM SDK | **Claude Agent SDK** | API-billed; structured tool use + MCP for Developer agent. Separate billing from your Pro subscription. |
+| LLM runtime | **`@anthropic-ai/claude-agent-sdk`** driving the local `claude` CLI | Runs every agent under the user's Claude Code subscription (Pro/MAX) — the SDK spawns the `claude` subprocess which uses the local auth at `~/.claude/`. No `ANTHROPIC_API_KEY` required. See §18 for the resource model. |
 | App DB (per onboarded app) | **Postgres via Drizzle** | Apps Jarvis works on, not Jarvis itself. |
 | Jarvis own DB | **SQLite via `better-sqlite3`** | File-based, no extra infra. Synchronous API keeps the single-writer-lock + atomic-write model simple; native bindings ship prebuilt for darwin/linux/win. |
 | DB migrations | **Custom lightweight runner** | Numbered TS files in `jarvis/migrations/db/`, `jarvis/migrations/brain/`, `jarvis/migrations/profile/`. Each exports `up()` / `down()`. Runner records applied versions in a `_migrations` table; ~100 LOC. Avoids dragging in `umzug` or Drizzle Kit for Jarvis's own DB. |
 | Unit tests | **Vitest** | |
 | E2E tests | **Playwright** | |
-| Secrets (Phase 1) | **`.env`** | `jarvis-data/.env` holds Jarvis's own secrets (Anthropic key, Slack tokens, Umami credentials); per-app `.env` files stay where they are. Doppler if/when it becomes unwieldy. |
+| Secrets (Phase 1) | **`.env`** | `jarvis-data/.env` holds Jarvis's own secrets (Slack tokens, Umami credentials, etc.); per-app `.env` files stay where they are. Doppler if/when it becomes unwieldy. **No Anthropic API key** — the agent runtime authenticates through the local `claude` CLI (§18). |
 | Data location | **`$JARVIS_DATA_DIR`** env var | Default `../jarvis-data` relative to the Jarvis repo root. Separates user-specific state from shippable code (§15). |
 | User interface (Phase 0) | **CLI** (`yarn jarvis ...`) | Admin and debug surface, retained forever |
 | User interface (Phase 1+) | **Slack** (Socket Mode) | Primary surface; split channels `#jarvis-inbox` + `#jarvis-alerts` |
@@ -1179,21 +1179,21 @@ Once the code-repo structure is in place, write `jarvis/CLAUDE.md` (the repo-lev
 
 **Prerequisites (one-time, before `yarn jarvis install`):**
 - Code repo exists at `~/Projects/jarvis/` (this repo) with a private GitHub remote configured. Phase 0's exit-criteria PR target.
-- Anthropic API key acquired (separate billing from your Claude Pro subscription per §14). The `install` command writes a `.env` stub with `ANTHROPIC_API_KEY=` and refuses to spawn agents until it's filled in.
+- **Claude Code installed and authenticated locally.** Jarvis runs every agent via the `@anthropic-ai/claude-agent-sdk`, which spawns the local `claude` CLI subprocess. The CLI inherits your Pro/MAX subscription auth from `~/.claude/`. Verify before install: `claude --version` returns ≥ 2.x. No `ANTHROPIC_API_KEY` is needed.
 
 **Build order:**
-- **Repo skeleton:** `package.json`, `tsconfig.json` (strict), `tsx` runtime, `vitest`, `better-sqlite3`, Anthropic SDK pinned. `jarvis/CLAUDE.md` written per §15.
+- **Repo skeleton:** `package.json`, `tsconfig.json` (strict), `tsx` runtime, `vitest`, `better-sqlite3`, `@anthropic-ai/claude-agent-sdk` pinned. `jarvis/CLAUDE.md` written per §15.
 - **SQLite layer:** custom migration runner (numbered TS files in `jarvis/migrations/db/`, `migrations/brain/`, `migrations/profile/`; runner records applied versions in a `_migrations` table). Initial DB migration creates `events`, `agent_state`, `feedback`, `suppressions`, `scheduled_posts`, `vault_state` tables (most stay unused until later phases — schema is forward-looking so we don't break things on phase boundaries).
 - **Brain schema (Zod) + loader/saver** with atomic-write semantics (tempfile + fsync + rename, sequenced after the SQLite transaction commits per §15 atomicity note).
 - **Single-writer lock** with PID + heartbeat per §7.
 - **Secrets redactor** (`jarvis/orchestrator/redactor.ts`) — regex coverage per §13. Unit-tested before any LLM call lands.
-- **Anthropic client wrapper:** context-budget tracking + prompt caching markers + redactor in the outbound path. **Sandbox-pattern helpers (`orchestrator/sandbox.ts`) are deferred to Phase 1+** — Phase 0's only tools are file reads, GitHub API, and git, none of which need bulk-output sandboxing yet. The file is created with a TODO header; tools wired up later.
+- **Agent SDK runtime wrapper** (`jarvis/orchestrator/agent-sdk-runtime.ts`): one-shot `runAgent({systemPrompt, userPrompt, tools, cwd, maxTurns, canUseTool})` helper around `query()` from `@anthropic-ai/claude-agent-sdk`. Sets `permissionMode: "bypassPermissions"` so the daemon never blocks on prompts. Captures the result message — token usage, `total_cost_usd` (informational under the subscription), `num_turns`, `permission_denials`, any `errors`. Listens for `SDKRateLimitEvent` and surfaces a structured `RateLimitedError` so the plan-executor can pause and resume per §18. Redactor still runs on the user prompt + system prompt before they leave the process. **Sandbox-pattern helpers (`orchestrator/sandbox.ts`) are deferred to Phase 1+** — Phase 0's only tools are SDK built-ins (Read, Write, Bash, Grep), the GitHub CLI via Bash, and git, none of which need bulk-output sandboxing yet. The file is created with a TODO header; tools wired up later.
 - **Plan templates** (`jarvis/plan-templates/`) for improvement, implementation, business, marketing — even though only improvement+implementation are exercised in Phase 0. Plan loader/parser handles front-matter + body sections per §4. Plan-ID format per §4 (`YYYY-MM-DD-<slug>`).
 - **Plan state machine** end-to-end: `draft → awaiting-review → approved → executing → done`, plus `revise`/`reject` transitions and the parent-improvement ↔ implementation-plan two-phase approval flow per §4.
-- **`yarn jarvis install`:** creates `jarvis-data/` (at `$JARVIS_DATA_DIR` or `../jarvis-data`), writes `.env` stub (Anthropic key required, Slack tokens commented out), initializes `jarvis.db`, runs migrations, runs `git init` at the `jarvis-data/` root and writes the canonical `.gitignore` (per §15 — shared root layer is gitignored, vaults/ is tracked), **creates the default `personal` vault directory** at `vaults/personal/`, seeds the `jarvis` brain inside `vaults/personal/brains/jarvis/` (the system itself, `projectType: other`), creates the user-profile template at `jarvis-data/user-profile.json` (identity + preferences fields blank, you fill before first Strategist run), runs the restore smoke-test, and prints next-steps:
+- **`yarn jarvis install`:** verifies `claude --version` (fails fast if Claude Code isn't installed or auth is missing), creates `jarvis-data/` (at `$JARVIS_DATA_DIR` or `../jarvis-data`), writes `.env` stub (Slack tokens commented out — no Anthropic key), initializes `jarvis.db`, runs migrations, runs `git init` at the `jarvis-data/` root and writes the canonical `.gitignore` (per §15 — shared root layer is gitignored, vaults/ is tracked), **creates the default `personal` vault directory** at `vaults/personal/`, seeds the `jarvis` brain inside `vaults/personal/brains/jarvis/` (the system itself, `projectType: other`), creates the user-profile template at `jarvis-data/user-profile.json` (identity + preferences fields blank, you fill before first Strategist run), runs the restore smoke-test, and prints next-steps:
   ```
-  ✓ Installed. Default vault `personal` created. jarvis-data git repo initialized (no remote).
-  → Fill in API key: edit jarvis-data/.env
+  ✓ Installed. Claude Code 2.1.x detected — agents will run under your subscription.
+  ✓ Default vault `personal` created. jarvis-data git repo initialized (no remote).
   → Fill in profile: yarn jarvis profile edit
   → Add a remote:    git -C $JARVIS_DATA_DIR remote add origin <git-url>
   → Add more vaults: yarn jarvis vault create <name>
@@ -1217,7 +1217,7 @@ Once the code-repo structure is in place, write `jarvis/CLAUDE.md` (the repo-lev
 2. **Strategist extensions.** Drafts business plans and marketing plans (subtypes `campaign` and `single-post`; format-aware: post / blog / video-script / newsletter). Improvement plan drafting from Phase 0 unchanged.
 3. **Backlog management** (§5). `yarn jarvis backlog --app <name>`, `yarn jarvis reprioritize`, the 3-improvement-plan cap rule + meta-queue split.
 4. **Revision loops** (§4). `revise <id> "<feedback>"` actually re-runs Strategist with the feedback in context — the plan flips awaiting-review → draft → awaiting-review with new content addressing the feedback. Bounded at 3 revisions; the 4th attempt refuses with an escalation message. Amendment flow + escalate-within-plan (§12) defer to Phase 2 — they need daemon-driven background execution to pause/resume plans, which lands alongside Analyst's signal collectors.
-5. **`yarn jarvis cost`** (§18). Per-plan / per-agent token spend + cache-hit-rate readout from the `events` table. Default warning at 80% of the configured monthly cap (Phase 1 cap: $50).
+5. **`yarn jarvis cost`** (§18). Per-plan / per-agent **call count + token volume + duration** readout from the `events` table. Defaults to a daily cap (Phase 1: 150 calls/day) since agents run under your Claude Code subscription — see §18 for the resource model. `total_cost_usd` from each agent run is shown as informational only.
 6. **Slack adapter (foundation)**: Socket Mode bot, `#jarvis-inbox` + `#jarvis-alerts` channel split, Block Kit for **plan-review** (improvement / impl / business / marketing single-post), action handlers for approve / revise / reject, slash commands `/jarvis plan` and `/jarvis bug`. Block Kit for setup-task / amendment / escalation / scheduled-post review **deferred** to Phase 1.5 or absorbed into Phase 2.
 7. **`yarn jarvis onboard --app <name> --repo <path> [--monorepo-path <subdir>] [--vault <vault-name>] [--docs <paths-or-urls>...] [--docs-keep <paths-or-urls>...]`** (§10). Strategist drafts an initial brain from repo inspection + absorbs docs (local files + public URLs). Authenticated sources (Drive, Notion) deferred to Phase 2.
 
@@ -1303,7 +1303,7 @@ All commands prefixed `yarn jarvis ...`. Grouped by purpose.
 ### Setup & lifecycle
 | Command | Purpose |
 |---------|---------|
-| `install` | First-time setup. Creates `jarvis-data/` (at `$JARVIS_DATA_DIR` or `../jarvis-data`), writes `.env` stub, initializes `jarvis.db`, runs migrations from `jarvis/migrations/`, seeds `brains/` structure, runs restore smoke-test. |
+| `install` | First-time setup. Verifies `claude --version` (fails fast if Claude Code isn't installed or local auth is missing — agents won't run without it). Creates `jarvis-data/` (at `$JARVIS_DATA_DIR` or `../jarvis-data`), writes `.env` stub (no Anthropic key — agents authenticate via the local `claude` CLI per §18), initializes `jarvis.db`, runs migrations from `jarvis/migrations/`, seeds `brains/` structure, runs restore smoke-test. |
 | `daemon` | Start the long-running local process (see §6). Manual start; no OS-level autostart in Phase 1. |
 | `doctor` | Health check: daemon liveness, last scan, last sample, pending inbox, stale locks. Auto-invoked by other commands. |
 | `doctor --rebuild-brain <app>` | Full brain rebuild from events (see §7 update model). |
@@ -1387,7 +1387,7 @@ All commands prefixed `yarn jarvis ...`. Grouped by purpose.
 | Command | Purpose |
 |---------|---------|
 | `timeline` | Unified activity feed. Filters: `--plan <id>`, `--agent <name>`, `--kind signal\|plan\|pr\|cost`, `--since 24h`. |
-| `cost` | Per-plan and per-agent Claude spend + cache hit rate for the current month. |
+| `cost` | Call count + token volume + cache hit rate per plan / agent / model for the current month. Daily cap (default 150 calls/day) since agents run under the subscription. `total_cost_usd` shown for informational tracking. Flags `--cap <N>`, `--warn-at <ratio>`, `--by-day`, `--format table\|json` per §18. |
 
 ### Suppression & circuit breaker
 | Command | Purpose |
@@ -1416,17 +1416,55 @@ All commands prefixed `yarn jarvis ...`. Grouped by purpose.
 
 ---
 
-## 18. Cost model
+## 18. Resource model
 
-- **Agents run on the Anthropic API** via Claude Agent SDK. Billed per token.
-- **Your Pro subscription** covers your own Claude Code use (reviewing plans, merging PRs, debugging). Completely separate from Jarvis's agent spend.
-- **Expected Jarvis spend:** ~$10–30/month at planned autonomy levels, assuming:
-  - Prompt caching on system prompts + brain context (~90% reduction on repeated context)
-  - Model tiering: Haiku for Analyst/scanners, Sonnet for Strategist/Marketer, Opus only on hard Developer tasks
-  - 30–60 autonomous agent calls/day
-- **Hard monthly cap** enforced by a budget middleware (default $50). Exceeding cap → non-critical agents pause; escalation to inbox so you can raise the cap or investigate the burn.
-- **Budget telemetry:** every Claude call logged with model, input / output / cached token counts, cost, plan ID. `yarn jarvis cost` shows per-plan and per-agent spend **plus cache hit rate** for the current month — so you can see where caching is effective and where a prompt assembler needs tightening.
-- **MAX upgrade not needed for Jarvis.** If you move to MAX, it's for your own interactive Claude Code use, not because Jarvis requires it.
+Jarvis runs every agent under the user's existing Claude Code subscription (Pro or MAX). The runtime is the `@anthropic-ai/claude-agent-sdk` driving the local `claude` CLI subprocess; the subprocess inherits auth from `~/.claude/`. **There is no `ANTHROPIC_API_KEY`, no per-token billing, and no separate Anthropic account for Jarvis.** This section explains what *is* metered (subscription rate limit) and how the daemon stays a good citizen.
+
+### What's metered
+
+- **Rate limit, not dollars.** Claude Code subscriptions (Pro and MAX) have a 5-hour rolling rate-limit window — every Claude call (yours, Jarvis's) shares that bucket. There is no monetary cost per call.
+- **Cap is now `calls/day`.** Default 150 calls/day across all agents (Strategist + Developer + Marketer + Analyst + Scout combined). Tunable via `yarn jarvis cost --cap <N>`. Approaching the cap → non-critical agents pause; `#jarvis-alerts` escalation. **Hard cap is per UTC day**, not rolling; resets at 00:00 UTC.
+- **Subscription rate-limit handling.** The Agent SDK emits `SDKRateLimitEvent` and surfaces `error: 'rate_limit'` on assistant messages. The agent-runtime wrapper translates either into a `RateLimitedError`. The plan-executor catches it, pauses Developer fires, posts to `#jarvis-alerts` with the reset time, and resumes automatically when the window opens. Other agents' fires are also paused for the duration.
+
+### Telemetry (still collected, semantics shifted)
+
+Every agent run is recorded as an `agent-call` event in `jarvis.db` with:
+- `agent`, `planId`, `model`, `numTurns`, `durationMs`, `permissionDenials`
+- `usage`: `inputTokens`, `outputTokens`, `cachedInputTokens`, `cacheCreationTokens` (still tracked — useful as an effort signal, surfaces caching effectiveness)
+- `totalCostUsd`: returned by the SDK on the result message; **informational only** under the subscription. Aggregate it for "what would this have cost on the API" reporting; do not use it for cap enforcement.
+
+`yarn jarvis cost` shows:
+- Total calls today / month, with `--cap <N>` warning at the configured ratio (default 80%)
+- Cache hit rate (single most actionable knob — high cache rate = cheap calls, low = prompt assembler needs tightening)
+- Token volume per plan / agent / model
+- `total_cost_usd` aggregate (informational; labeled "would-have-been API cost")
+- `--by-day` opt-in for the daily breakdown
+- `--format json` for scripting
+
+### Expected agent volume (Phase 1)
+
+| Agent | Typical fires/day |
+|---|---|
+| Strategist (drafts + redrafts + clarifications) | 5–15 |
+| Developer (impl plan drafts + execute fires) | 3–8, each consuming many turns |
+| Onboard (Strategist variant) | only on `yarn jarvis onboard` |
+| Future Analyst / Scout / Marketer | TBD per phase |
+
+A typical Developer execute fire spans many `numTurns` (each turn = one Claude call), so the practical daily ceiling is set more by **turns** than by **fires**. The default 150-call cap accommodates 5 Developer fires of ~20 turns each plus 50 Strategist/clarification calls — well within MAX's 5-hour rolling window for typical use.
+
+### Safety against runaway loops
+
+- **Per-fire `maxTurns` cap.** Set on every `query()` call. Default 60 (Developer execute), 30 (Strategist draft), 15 (Strategist redraft). Hits → SDK returns `result.subtype: "error_max_turns"`; plan transitions to `BLOCKED`; alert.
+- **Per-day `maxCalls` cap.** Aggregate of all agent calls across the daemon. Default 150. Hits → daemon pauses the plan-executor service; alert. Resumes at 00:00 UTC.
+- **Subscription rate-limit pause.** On `SDKRateLimitEvent`, plan-executor pauses; resumes at the reset time the SDK reports.
+
+### Why no per-dollar cap
+
+The subscription is flat-rate; spending more or fewer turns doesn't change the bill. The actual scarce resource is **rate-limit headroom shared with the user's interactive work** — capping calls/day directly is the right surrogate.
+
+### Migration note
+
+Pre-pivot deployments have `agent-call` events recorded with API per-token billing semantics. The `cost` command treats both formats: events emitted before the pivot show their original USD; events after show subscription-mode telemetry. The `byMonth` and `byDay` rollups annotate which mode each event used.
 
 ---
 
