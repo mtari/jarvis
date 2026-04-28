@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import Database from "better-sqlite3";
 import {
   detectDeveloperMode,
@@ -25,6 +26,8 @@ export interface PlanExecutorOptions {
   buildAnthropicClient?: () => AnthropicClient;
   /** Apps the executor will fire Developer for. Default: ["jarvis"] until multi-repo lands. */
   enabledApps?: ReadonlyArray<string>;
+  /** Override repo root for assertCleanMain (tests inject a fixture repo). */
+  repoRoot?: string;
 }
 
 const DEFAULT_ENABLED_APPS: ReadonlyArray<string> = ["jarvis"];
@@ -36,6 +39,31 @@ interface FiredPayload {
   reason?: string;
   result?: Record<string, unknown>;
   durationMs?: number;
+}
+
+/**
+ * Throws if the repo at `root` is not on the main branch with a clean
+ * working tree. This is a hard gate — execute fires must never start with
+ * dirty state or on the wrong branch.
+ */
+export function assertCleanMain(root?: string): void {
+  const cwd = root ?? process.cwd();
+  const branch = execSync("git branch --show-current", { cwd })
+    .toString()
+    .trim();
+  if (branch !== "main") {
+    throw new DeveloperError(
+      `assertCleanMain: HEAD is on branch "${branch}", not "main" — aborting execute fire`,
+    );
+  }
+  const status = execSync("git status --porcelain", { cwd })
+    .toString()
+    .trim();
+  if (status !== "") {
+    throw new DeveloperError(
+      `assertCleanMain: working tree is dirty — aborting execute fire\n${status}`,
+    );
+  }
 }
 
 /**
@@ -69,6 +97,7 @@ interface FireOnce {
   client: AnthropicClient;
   dataDir: string;
   ctx: DaemonContext;
+  repoRoot?: string;
 }
 
 async function fireDeveloper(
@@ -123,6 +152,7 @@ async function fireDeveloper(
       app,
       vault: record.vault,
       dataDir: fire.dataDir,
+      ...(fire.repoRoot !== undefined && { repoRoot: fire.repoRoot }),
     });
     recorder.flush();
     return {
@@ -161,11 +191,60 @@ async function fireDeveloper(
   }
 }
 
+/**
+ * Module-level serial queue for `execute`-mode fires. Each execute fire is
+ * chained onto this promise so fires that arrive within the same event-loop
+ * tick (or from rapid ticks) never run concurrently. Errors inside a fire are
+ * caught by `runExecute` and never break the chain.
+ *
+ * `draft-impl` fires bypass the queue because they do not touch the git tree.
+ */
+let executeQueue: Promise<void> = Promise.resolve();
+
+/**
+ * Wraps a single execute fire with:
+ * 1. `assertCleanMain` — hard gate: abort if tree is dirty or HEAD is not main.
+ * 2. Error isolation — any thrown error is caught and resolved so the queue
+ *    continues processing subsequent fires.
+ *
+ * Returns the FiredPayload (including the error reason when the gate or fire
+ * throws).
+ */
+async function runExecute(
+  record: PlanRecord,
+  fire: FireOnce,
+): Promise<FiredPayload> {
+  try {
+    assertCleanMain(fire.repoRoot);
+  } catch (err) {
+    const message =
+      err instanceof DeveloperError
+        ? err.message
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    fire.ctx.logger.error(
+      "plan-executor: assertCleanMain blocked execute fire",
+      err,
+      { planId: record.id },
+    );
+    return {
+      planId: record.id,
+      app: record.app,
+      mode: "execute",
+      reason: `BLOCKED: ${message}`,
+    };
+  }
+  return fireDeveloper(record, fire);
+}
+
 export interface TickInput {
   dataDir: string;
   enabledApps: ReadonlyArray<string>;
   client: AnthropicClient;
   ctx: DaemonContext;
+  /** Override repo root (tests inject a fixture path). */
+  repoRoot?: string;
 }
 
 export interface TickResult {
@@ -173,11 +252,26 @@ export interface TickResult {
   skipped: Array<{ planId: string; reason: string }>;
 }
 
+function buildFireOnce(input: TickInput): FireOnce {
+  const base: FireOnce = {
+    client: input.client,
+    dataDir: input.dataDir,
+    ctx: input.ctx,
+  };
+  if (input.repoRoot !== undefined) {
+    base.repoRoot = input.repoRoot;
+  }
+  return base;
+}
+
 /**
  * One tick: scans approved plans that haven't been fired yet and fires
  * Developer on each. Records a plan-executor-fired event before the call so a
  * mid-fire crash doesn't double-fire on restart (the user can manually
  * re-fire via `yarn jarvis run developer <id>`).
+ *
+ * Execute-mode fires are serialised through `executeQueue`. Draft-impl fires
+ * run immediately (they don't touch the git tree).
  */
 export async function runPlanExecutorTick(
   input: TickInput,
@@ -206,6 +300,8 @@ export async function runPlanExecutorTick(
       continue;
     }
 
+    const mode = detectDeveloperMode(candidate.plan);
+
     // Claim the work BEFORE the fire, so a mid-fire crash doesn't re-fire.
     writeFiredEvent(input.dataDir, candidate, {
       planId: candidate.id,
@@ -214,15 +310,28 @@ export async function runPlanExecutorTick(
       reason: "claimed; result pending",
     });
 
-    const payload = await fireDeveloper(candidate, {
-      client: input.client,
-      dataDir: input.dataDir,
-      ctx: input.ctx,
-    });
-    // Replace the claim with the actual outcome (append; the read-side picks
-    // either since both share planId in the set check).
-    writeFiredEvent(input.dataDir, candidate, payload);
-    fired.push(payload);
+    const fire = buildFireOnce(input);
+
+    if (mode === "execute") {
+      // Serialise execute fires through the module-level queue so concurrent
+      // ticks never run two execute fires at the same time.
+      const capturedCandidate = candidate;
+      const capturedFire = fire;
+      const firedRef: FiredPayload[] = fired;
+      const dataDirRef = input.dataDir;
+      executeQueue = executeQueue.then(async () => {
+        const payload = await runExecute(capturedCandidate, capturedFire);
+        writeFiredEvent(dataDirRef, capturedCandidate, payload);
+        firedRef.push(payload);
+      });
+      // Await the queue so the tick result includes this fire's outcome.
+      await executeQueue;
+    } else {
+      // draft-impl and not-runnable bypass the execute queue.
+      const payload = await fireDeveloper(candidate, fire);
+      writeFiredEvent(input.dataDir, candidate, payload);
+      fired.push(payload);
+    }
   }
 
   return { fired, skipped };
@@ -270,12 +379,16 @@ export function createPlanExecutorService(
               ? opts.buildAnthropicClient()
               : createAnthropicClient();
           }
-          const result = await runPlanExecutorTick({
+          const tickInput: TickInput = {
             dataDir: opts.dataDir,
             enabledApps,
             client: lazyClient,
             ctx,
-          });
+          };
+          if (opts.repoRoot !== undefined) {
+            tickInput.repoRoot = opts.repoRoot;
+          }
+          const result = await runPlanExecutorTick(tickInput);
           if (result.fired.length > 0) {
             ctx.logger.info("plan-executor: fired", {
               count: result.fired.length,
