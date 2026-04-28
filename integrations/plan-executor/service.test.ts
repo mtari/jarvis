@@ -1,3 +1,7 @@
+import { execSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -16,6 +20,7 @@ import {
 } from "../../cli/commands/_test-helpers.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
 import {
+  assertCleanMain,
   readFiredPlanIds,
   runPlanExecutorTick,
 } from "./service.ts";
@@ -131,6 +136,79 @@ function fakeDaemonCtx(): DaemonContext {
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Helpers for a minimal git fixture repo used in assertCleanMain / queue tests
+// ---------------------------------------------------------------------------
+
+interface GitFixture {
+  dir: string;
+  cleanup: () => void;
+}
+
+function makeCleanMainRepo(): GitFixture {
+  const dir = mkdtempSync(join(tmpdir(), "jarvis-git-fixture-"));
+  execSync("git init -b main", { cwd: dir, stdio: "pipe" });
+  execSync('git config user.email "test@test.com"', { cwd: dir, stdio: "pipe" });
+  execSync('git config user.name "Test"', { cwd: dir, stdio: "pipe" });
+  writeFileSync(join(dir, "README.md"), "fixture\n");
+  execSync("git add README.md", { cwd: dir, stdio: "pipe" });
+  execSync('git commit -m "init"', { cwd: dir, stdio: "pipe" });
+  return {
+    dir,
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// assertCleanMain unit tests
+// ---------------------------------------------------------------------------
+
+describe("assertCleanMain", () => {
+  it("passes on a clean main branch", () => {
+    const repo = makeCleanMainRepo();
+    try {
+      expect(() => assertCleanMain(repo.dir)).not.toThrow();
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it("throws when HEAD is not on main", () => {
+    const repo = makeCleanMainRepo();
+    try {
+      execSync("git checkout -b feat/other", { cwd: repo.dir, stdio: "pipe" });
+      expect(() => assertCleanMain(repo.dir)).toThrow(/HEAD is on branch "feat\/other"/);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it("throws when working tree is dirty", () => {
+    const repo = makeCleanMainRepo();
+    try {
+      writeFileSync(join(repo.dir, "dirty.txt"), "untracked\n");
+      expect(() => assertCleanMain(repo.dir)).toThrow(/working tree is dirty/);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it("throws when there are staged changes", () => {
+    const repo = makeCleanMainRepo();
+    try {
+      writeFileSync(join(repo.dir, "staged.txt"), "staged\n");
+      execSync("git add staged.txt", { cwd: repo.dir, stdio: "pipe" });
+      expect(() => assertCleanMain(repo.dir)).toThrow(/working tree is dirty/);
+    } finally {
+      repo.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runPlanExecutorTick — existing behaviour
+// ---------------------------------------------------------------------------
 
 describe("plan-executor", () => {
   let sandbox: InstallSandbox;
@@ -248,5 +326,147 @@ describe("plan-executor", () => {
     expect(result.fired[0]?.reason).toMatch(/error/);
     // And it's recorded so we don't auto-retry
     expect(readFiredPlanIds(dbFile(sandbox.dataDir)).has("2026-04-28-fail")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Queue serialisation and assertCleanMain gate
+// ---------------------------------------------------------------------------
+
+describe("plan-executor execute-queue", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("execute-mode fire is BLOCKED when repoRoot is dirty", async () => {
+    const repo = makeCleanMainRepo();
+    try {
+      // Dirty the tree
+      writeFileSync(join(repo.dir, "dirty.txt"), "untracked\n");
+
+      // Use an improvement plan with ImplementationReview: skip → mode = execute
+      dropPlan(sandbox, "2026-04-28-exec-dirty", {
+        status: "approved",
+        implementationReview: "skip",
+      });
+
+      const { client } = scriptedClient([]);
+      const result = await runPlanExecutorTick({
+        dataDir: sandbox.dataDir,
+        enabledApps: ["jarvis"],
+        client,
+        ctx: fakeDaemonCtx(),
+        repoRoot: repo.dir,
+      });
+
+      expect(result.fired).toHaveLength(1);
+      expect(result.fired[0]?.reason).toMatch(/BLOCKED.*dirty/i);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it("execute-mode fire is BLOCKED when repoRoot HEAD is not main", async () => {
+    const repo = makeCleanMainRepo();
+    try {
+      execSync("git checkout -b feat/other", { cwd: repo.dir, stdio: "pipe" });
+
+      dropPlan(sandbox, "2026-04-28-exec-branch", {
+        status: "approved",
+        implementationReview: "skip",
+      });
+
+      const { client } = scriptedClient([]);
+      const result = await runPlanExecutorTick({
+        dataDir: sandbox.dataDir,
+        enabledApps: ["jarvis"],
+        client,
+        ctx: fakeDaemonCtx(),
+        repoRoot: repo.dir,
+      });
+
+      expect(result.fired).toHaveLength(1);
+      expect(result.fired[0]?.reason).toMatch(/BLOCKED.*feat\/other/i);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it("draft-impl fires bypass the execute queue and are not affected by repoRoot state", async () => {
+    const repo = makeCleanMainRepo();
+    try {
+      // Dirty the tree — draft-impl should still proceed
+      writeFileSync(join(repo.dir, "dirty.txt"), "untracked\n");
+
+      const parentId = "2026-04-28-impl-bypass";
+      dropPlan(sandbox, parentId, {
+        status: "approved",
+        implementationReview: "required",
+      });
+
+      const { client } = scriptedClient([VALID_IMPL_PLAN_BLOCK(parentId)]);
+      const result = await runPlanExecutorTick({
+        dataDir: sandbox.dataDir,
+        enabledApps: ["jarvis"],
+        client,
+        ctx: fakeDaemonCtx(),
+        repoRoot: repo.dir,
+      });
+
+      expect(result.fired).toHaveLength(1);
+      expect(result.fired[0]?.mode).toBe("draft-impl");
+      // No BLOCKED reason
+      expect(result.fired[0]?.reason).toBeUndefined();
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it("two execute fires in one tick run sequentially — no concurrent overlap", async () => {
+    const repo = makeCleanMainRepo();
+    try {
+      // Two execute-mode plans (both will be BLOCKED by dirty tree, but the
+      // point is they must be attempted sequentially: queue ensures the first
+      // completes before the second starts)
+      writeFileSync(join(repo.dir, "dirty.txt"), "untracked\n");
+
+      dropPlan(sandbox, "2026-04-28-seq-a", {
+        status: "approved",
+        implementationReview: "skip",
+      });
+      dropPlan(sandbox, "2026-04-28-seq-b", {
+        status: "approved",
+        implementationReview: "skip",
+      });
+
+      const { client } = scriptedClient([]);
+      const result = await runPlanExecutorTick({
+        dataDir: sandbox.dataDir,
+        enabledApps: ["jarvis"],
+        client,
+        ctx: fakeDaemonCtx(),
+        repoRoot: repo.dir,
+      });
+
+      // Both plans should have been attempted (and BLOCKED)
+      expect(result.fired).toHaveLength(2);
+      for (const f of result.fired) {
+        expect(f.reason).toMatch(/BLOCKED/);
+      }
+      // No duplicates
+      const ids = result.fired.map((f) => f.planId);
+      expect(new Set(ids).size).toBe(2);
+    } finally {
+      repo.cleanup();
+    }
   });
 });

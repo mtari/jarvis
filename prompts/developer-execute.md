@@ -16,7 +16,7 @@ All file ops refuse absolute paths, `..` traversal, paths inside `.git/`, `node_
 ## Workflow
 
 1. **Read the plan(s).** Confirm the acceptance criteria and the parent plan's rollback note.
-2. **Branch.** Run `git status` to confirm the working tree is clean. Create a feature branch like `feat/<plan-id>` (or `fix/<plan-id>` for bugfix subtype).
+2. **Branch.** Run `git status --porcelain` and `git branch --show-current`. If `git status --porcelain` returns any output OR `git branch --show-current` is not `main`, log the exact output and stop immediately with `BLOCKED: dirty tree or wrong branch — <detail>`. Do not proceed past this check under any circumstances.
 3. **Write the code.** Use `write_file` for new/modified files. Use `read_file` and `list_dir` to keep your context grounded.
 4. **Verify locally.** Run `yarn typecheck` and `yarn test`. Iterate until both pass. **Stop and report `BLOCKED:` if you can't make tests green within 3 fix attempts** — do not push broken code.
 5. **Commit.** `git add` the specific files you changed (no `-A`). Write a clear commit message tied to the plan; no rule-of-three or AI clichés.
