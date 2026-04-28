@@ -5,6 +5,7 @@ import { runDaemon } from "./commands/daemon.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
+import { runLogs } from "./commands/logs.ts";
 import { runOnboard } from "./commands/onboard.ts";
 import { runPlan } from "./commands/plan.ts";
 import { runPlans } from "./commands/plans.ts";
@@ -53,6 +54,8 @@ Utilities:
   run <agent> <task>          Other agents not yet wired (Phase 1+)
   cost [--cap N] [--warn-at R] [--format table|json]
                               Current-month token spend, cache hit rate, by agent / plan / model
+  logs tail [--file <path>]   Stream today's daemon log (tail -f). Use --file
+                              to override the log path.
   version                     Print Jarvis version
   help, --help, -h            Show this message
 
@@ -103,6 +106,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runRun(rest);
     case "cost":
       return runCost(rest);
+    case "logs":
+      return runLogs(rest);
     case "version":
       return runVersion(rest);
     default:
