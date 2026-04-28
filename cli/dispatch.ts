@@ -5,6 +5,7 @@ import { runDaemon } from "./commands/daemon.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
+import { runOnboard } from "./commands/onboard.ts";
 import { runPlan } from "./commands/plan.ts";
 import { runPlans } from "./commands/plans.ts";
 import { runProfile } from "./commands/profile.ts";
@@ -25,6 +26,8 @@ Setup & lifecycle:
   doctor                      Health check
   profile                     Show user profile summary
   profile edit                Open user-profile.json in $EDITOR
+  onboard --app <name> --repo <abs-path> [--monorepo-path <subdir>] [--vault <name>] [--docs <path-or-url>]... [--docs-keep <path-or-url>]...
+                              Bring a new app under Jarvis
 
 Plans:
   plans [filters]             List plans (filters: --app, --status, --type,
@@ -78,6 +81,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runDoctor(rest);
     case "daemon":
       return runDaemon(rest);
+    case "onboard":
+      return runOnboard(rest);
     case "plans":
       return runPlans(rest);
     case "inbox":
