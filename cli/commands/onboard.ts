@@ -57,6 +57,7 @@ export async function runOnboard(
         vault: { type: "string" },
         docs: { type: "string", multiple: true },
         "docs-keep": { type: "string", multiple: true },
+        "move-docs": { type: "boolean" },
       },
       allowPositionals: false,
     });
@@ -268,10 +269,48 @@ export async function runOnboard(
     db.close();
   }
 
+  // §7: --move-docs deletes the source files for any local doc (absorbed or
+  // cached) once the brain + cached copies are durably on disk. URL docs are
+  // never touched; we don't own them. Skipped silently when the flag is off.
+  const moveDocs = v["move-docs"] === true;
+  const moveResults: { moved: string[]; failed: Array<{ source: string; error: string }> } = {
+    moved: [],
+    failed: [],
+  };
+  if (moveDocs) {
+    const sourcesToDelete: string[] = [];
+    for (const a of absorbedDocs) {
+      if (!isUrl(a.source)) sourcesToDelete.push(a.source);
+    }
+    for (const c of cachedDocs) {
+      if (!isUrl(c.summary.source)) sourcesToDelete.push(c.summary.source);
+    }
+    for (const source of sourcesToDelete) {
+      try {
+        fs.rmSync(source, { force: true });
+        moveResults.moved.push(source);
+      } catch (err) {
+        moveResults.failed.push({
+          source,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
   console.log(`✓ Onboarded ${app}`);
   console.log(`  Brain: ${targetBrain}`);
   console.log(`  Plans dir: ${planDir(dataDir, vault, app)}`);
   console.log(`  Iterations: ${agentResult.iterations}`);
+  if (moveDocs) {
+    if (moveResults.moved.length > 0) {
+      console.log(`  Moved ${moveResults.moved.length} source doc(s) into jarvis-data:`);
+      for (const m of moveResults.moved) console.log(`    - ${m} (deleted)`);
+    }
+    for (const f of moveResults.failed) {
+      console.log(`  ⚠ Failed to delete ${f.source}: ${f.error}`);
+    }
+  }
   console.log(
     `  Next: yarn jarvis plan --app ${app} "<your first plan brief>"`,
   );

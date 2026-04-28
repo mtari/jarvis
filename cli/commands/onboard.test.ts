@@ -257,4 +257,110 @@ describe("runOnboard", () => {
     expect(code).toBe(0);
     expect(fetched).toEqual(["https://example.com/spec"]);
   });
+
+  it("--move-docs deletes local source docs after a successful onboard", async () => {
+    const absorbedPath = path.join(docsDir, "spec.md");
+    const cachedPath = path.join(docsDir, "guidelines.md");
+    fs.writeFileSync(absorbedPath, "BRAND=tegező");
+    fs.writeFileSync(cachedPath, "House style: terse.");
+
+    const code = await runOnboard(
+      [
+        "--app",
+        "demoapp",
+        "--repo",
+        repoRoot,
+        "--docs",
+        absorbedPath,
+        "--docs-keep",
+        cachedPath,
+        "--move-docs",
+      ],
+      { client: fixedClient(BRAIN_FOR("demoapp")) },
+    );
+    expect(code).toBe(0);
+    expect(fs.existsSync(absorbedPath)).toBe(false);
+    expect(fs.existsSync(cachedPath)).toBe(false);
+
+    // Cached copy is preserved inside jarvis-data
+    const docsJson = JSON.parse(
+      fs.readFileSync(brainDocsFile(sandbox.dataDir, "personal", "demoapp"), "utf8"),
+    ) as Array<Record<string, unknown>>;
+    const cached = docsJson.find((d) => d["retention"] === "cached");
+    expect(cached).toBeDefined();
+    const cachedFile = String(cached?.["cachedFile"] ?? "");
+    expect(
+      fs.existsSync(
+        path.join(
+          sandbox.dataDir,
+          "vaults",
+          "personal",
+          "brains",
+          "demoapp",
+          cachedFile,
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("--move-docs leaves URL docs alone", async () => {
+    const localPath = path.join(docsDir, "local.md");
+    fs.writeFileSync(localPath, "local body");
+    const code = await runOnboard(
+      [
+        "--app",
+        "demoapp",
+        "--repo",
+        repoRoot,
+        "--docs",
+        localPath,
+        "--docs",
+        "https://example.com/spec",
+        "--move-docs",
+      ],
+      {
+        client: fixedClient(BRAIN_FOR("demoapp")),
+        fetchUrl: async () => ({ content: "fetched", contentType: "text/plain" }),
+      },
+    );
+    expect(code).toBe(0);
+    expect(fs.existsSync(localPath)).toBe(false);
+  });
+
+  it("does not delete sources when --move-docs is absent", async () => {
+    const localPath = path.join(docsDir, "still-here.md");
+    fs.writeFileSync(localPath, "stay");
+    const code = await runOnboard(
+      [
+        "--app",
+        "demoapp",
+        "--repo",
+        repoRoot,
+        "--docs-keep",
+        localPath,
+      ],
+      { client: fixedClient(BRAIN_FOR("demoapp")) },
+    );
+    expect(code).toBe(0);
+    expect(fs.existsSync(localPath)).toBe(true);
+  });
+
+  it("preserves the source file when the onboard agent fails", async () => {
+    const localPath = path.join(docsDir, "preserved.md");
+    fs.writeFileSync(localPath, "stay");
+    const code = await runOnboard(
+      [
+        "--app",
+        "demoapp",
+        "--repo",
+        repoRoot,
+        "--docs",
+        localPath,
+        "--move-docs",
+      ],
+      { client: fixedClient("not a brain") },
+    );
+    expect(code).toBe(1);
+    expect(fs.existsSync(localPath)).toBe(true);
+  });
 });

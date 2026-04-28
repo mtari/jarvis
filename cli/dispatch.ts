@@ -26,8 +26,8 @@ Setup & lifecycle:
   doctor                      Health check
   profile                     Show user profile summary
   profile edit                Open user-profile.json in $EDITOR
-  onboard --app <name> --repo <abs-path> [--monorepo-path <subdir>] [--vault <name>] [--docs <path-or-url>]... [--docs-keep <path-or-url>]...
-                              Bring a new app under Jarvis
+  onboard --app <name> --repo <abs-path> [--monorepo-path <subdir>] [--vault <name>] [--docs <path-or-url>]... [--docs-keep <path-or-url>]... [--move-docs]
+                              Bring a new app under Jarvis (--move-docs deletes local source docs after a successful onboard; URL docs untouched)
 
 Plans:
   plans [filters]             List plans (filters: --app, --status, --type,
