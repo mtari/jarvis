@@ -491,13 +491,13 @@ You can reorder at any time:
 
 **What breaks without it:** Slack slash commands, scheduled jobs, observation samples during off-hours, in-flight plan execution.
 
-**Safety net:** `yarn jarvis doctor` checks daemon liveness, last scan time, last sample time, pending inbox, stale locks (see §7), **and per-vault sync state**: last-commit-at, ahead/behind counts vs remote, unpushed changes, oldest unpushed change. Flags any vault with `>7 days` unpushed as a yellow warning, `>30 days` as red. Auto-invoked by `inbox`/`plans` and prints `⚠️ Daemon not running. Start with 'yarn jarvis daemon'.` if appropriate.
+**Safety net:** `yarn jarvis doctor` checks daemon liveness, last scan time, last sample time, pending inbox, stale locks (see §7), **and `jarvis-data` repo sync state**: last-commit-at, ahead/behind counts vs remote, unpushed changes, oldest unpushed change. Flags `>7 days` unpushed as a yellow warning, `>30 days` as red. Auto-invoked by `inbox`/`plans` and prints `⚠️ Daemon not running. Start with 'yarn jarvis daemon'.` if appropriate.
 
 `doctor` subcommands:
-- `yarn jarvis doctor` — full health check (daemon + locks + vaults).
+- `yarn jarvis doctor` — full health check (daemon + locks + data repo sync).
 - `yarn jarvis doctor --rebuild-brain <app>` — full brain rebuild from events (see §7 update model).
 - `yarn jarvis doctor --clear-stale-lock <app>` — manual fallback if auto-takeover failed.
-- `yarn jarvis doctor --vaults` — vault sync detail only.
+- `yarn jarvis doctor --data` — data-repo sync detail only.
 
 ### Design for future cloud addition
 Agents are invocable standalone via CLI (e.g., `jarvis run analyst --task portfolio-scan`). State lives in git-tracked files and the database, never in-process. This means we can add a cloud runner (GitHub Actions, Railway, etc.) later without rewriting agents — we'll just invoke the same CLI on a schedule.
@@ -616,7 +616,7 @@ Contains:
 ### Schema versioning
 Every brain carries a `schemaVersion`. The user profile also carries a `schemaVersion`. Brain migrations live in `jarvis/migrations/brain/NNN-description.ts`; profile migrations in `jarvis/migrations/profile/`; SQLite migrations in `jarvis/migrations/db/`. Jarvis runs pending migrations in order on daemon start. Migrations ship with the code (not the data) so any fresh install uses the same schema.
 
-**Across vaults:** the brain-migration runner iterates **every vault** (`jarvis-data/vaults/*/brains/*/`) and applies pending migrations to each brain. Vaults that were offline at migration time (e.g., not yet pulled) get migrated on next `vault pull` — the runner is idempotent and re-checks `schemaVersion` on every read. Conflicts (e.g., two machines edited the same brain at different schema versions) escalate to `#jarvis-alerts` for manual resolution rather than auto-merging.
+**Across vaults:** the brain-migration runner iterates **every vault** (`jarvis-data/vaults/*/brains/*/`) and applies pending migrations to each brain. Brains that arrive later via `git pull` on the data repo get migrated on next read — the runner is idempotent and re-checks `schemaVersion` on every read. Conflicts (e.g., two machines edited the same brain at different schema versions) escalate to `#jarvis-alerts` for manual resolution rather than auto-merging.
 
 ### Event log (source of truth)
 Events live in **SQLite** at `jarvis-data/jarvis.db` — one DB, shared across all apps, with an `app_id` column on every row. Primary store for queryable history: signals, plan transitions, metric observations, setup-task completions, agent runs, cost telemetry, suppressions (§8), agent circuit-breaker state (§13), and **scheduled posts** (§5 → Scheduled-post persistence). Cross-app queries (portfolio triage, cost reporting, self-telemetry) run here. Brain JSON is derived from events.
@@ -894,7 +894,7 @@ Setup tasks for the upcoming week collect into a single weekly block. When you w
 ### App onboarding
 New apps enter Jarvis via `yarn jarvis onboard --app <name> --repo <path-or-url> [--monorepo-path apps/<name>] [--vault <vault-name>] [--docs <paths-or-urls>...]`.
 
-The **`--vault`** flag picks which `jarvis-data/vaults/<name>/` the project's brain + plans + research + docs live under. Default is the configured default vault (`personal` out of the box; change via `yarn jarvis vault set-default`). Each vault has its own git remote and represents a single privacy posture — projects sharing a vault share a backup target and an audience. Split when posture diverges (consulting clients with NDAs → `consulting`; Phase 5 public proof → `showcase`). Move a project later via `yarn jarvis vault move --app <name> --to <vault>` if needs change.
+The **`--vault`** flag picks which `jarvis-data/vaults/<name>/` the project's brain + plans + research + docs live under. Default is the configured default vault (`personal` out of the box; change via `yarn jarvis vault set-default`). Vaults are tracked subdirectories of the single `jarvis-data` git repo (see §15) and serve as organizational + audience boundaries — projects sharing a vault share an audience. Phase 5's public `showcase` is the one case where vault privacy diverges from the rest; see §15 → Phase 5 architecture. Move a project later via `yarn jarvis vault move --app <name> --to <vault>` if needs change.
 
 Strategist inspects the repo (package.json, Drizzle config, app directory structure, Vercel deploy URL, existing `.env` keys to detect connections) and drafts a complete brain. If `--docs` is provided, each doc is **absorbed** by default (see §7 → Project docs retention modes): Strategist reads it, extracts project-scoped content into `brain.json`, and keeps a structured summary in `docs.json`. The original is **not retained** — safe to delete from your machine. If a doc contains user-level signal (personal preferences, goals, working style), Strategist queues a **separate proposed user-profile update plan** (subtype `meta`) — surfacing **after** onboarding completes and the initial brain is committed. This keeps onboarding focused on the project and avoids interleaving user-profile decisions with brain review. Add `--docs-keep` instead of `--docs` when you want the full content cached for repeated reference (brand guidelines, pricing sheet). Authenticated sources queue a setup task until OAuth completes. You review the generated `brain.json`, fill in brand voice + initial priorities + alert thresholds, and commit.
 
@@ -1032,7 +1032,7 @@ Each agent's recent outcomes (approved, rejected, dismissed, reworked) are track
 | Data location | **`$JARVIS_DATA_DIR`** env var | Default `../jarvis-data` relative to the Jarvis repo root. Separates user-specific state from shippable code (§15). |
 | User interface (Phase 0) | **CLI** (`yarn jarvis ...`) | Admin and debug surface, retained forever |
 | User interface (Phase 1+) | **Slack** (Socket Mode) | Primary surface; split channels `#jarvis-inbox` + `#jarvis-alerts` |
-| Git hosting | **GitHub** | The Jarvis code repo and each vault each get their own GitHub remote. |
+| Git hosting | **GitHub** | Two GitHub remotes: the Jarvis code repo, and `jarvis-data/` (one repo containing all vaults; shared root state is gitignored). |
 | App deploy | **Vercel** | For onboarded apps; not for Jarvis itself (Phase 1 is local-only — see §6). |
 | Analytics (apps) | **Umami** (self-hosted) | DB on existing Supabase Postgres; app on Vercel free tier; cookieless, GDPR-friendly; programmatic API for Analyst |
 | Scheduled jobs | None Phase 1 | Add later when cloud execution joins |
@@ -1041,7 +1041,7 @@ Each agent's recent outcomes (approved, rejected, dismissed, reworked) are track
 
 ## 15. Repository layout
 
-**Jarvis lives in its own standalone repo — never inside an applications monorepo.** The repo at `~/Projects/jarvis/` IS the code package. Code and data are split into two sibling directories on disk: the Jarvis code repo, and `jarvis-data/` next to it. Each is a separate git history (the data side is actually multiple histories — one per vault, plus an untracked shared layer). Jarvis code reads the data location from `$JARVIS_DATA_DIR` (default: `../jarvis-data` relative to the code repo root).
+**Jarvis lives in its own standalone repo — never inside an applications monorepo.** The repo at `~/Projects/jarvis/` IS the code package. Code and data are split into two sibling directories on disk: the Jarvis code repo, and `jarvis-data/` next to it. Each is a separate git history. `jarvis-data/` is a single git repo: vaults are tracked subdirectories, and the shared root layer (`jarvis.db`, `.env`, `logs/`, `sandbox/`, `ideas/`, `setup-queue.jsonl`, `user-profile.json`, `.daemon.pid`, brain `.lock` files) is gitignored. Jarvis code reads the data location from `$JARVIS_DATA_DIR` (default: `../jarvis-data` relative to the code repo root).
 
 ```
 ~/Projects/
@@ -1084,24 +1084,25 @@ Each agent's recent outcomes (approved, rejected, dismissed, reworked) are track
 │   ├── package.json
 │   └── tsconfig.json
 │
-└── jarvis-data/                     ← DATA — user-specific, NOT a single git repo
-    │  -- shared layer (always private, never inside any vault, untracked) --
+└── jarvis-data/                     ← DATA — single git repo, one remote
+    ├── .git/                        ← parent repo .git — vaults are tracked subdirs
+    │
+    │  -- shared root layer (gitignored: transient state, secrets, binary DB) --
     ├── jarvis.db                    ← single SQLite for cross-portfolio queries (events, signals, telemetry, suppressions, agent_state, feedback, scheduled_posts, vault_state)
     ├── user-profile.json            ← shared global personalization
     ├── setup-queue.jsonl            ← shared
     ├── ideas/                       ← shared global idea pool
-    ├── sandbox/                     ← shared transient (§7) — gitignored; cleared on plan completion + daily sweep
+    ├── sandbox/                     ← shared transient (§7) — cleared on plan completion + daily sweep
     ├── logs/                        ← shared
     │   ├── activity-YYYY-MM.jsonl
     │   ├── daemon-YYYY-MM-DD.log
     │   └── checkpoints/
-    ├── .env                         ← shared secrets (never committed anywhere)
-    ├── .daemon.pid                  ← never committed
+    ├── .env                         ← shared secrets
+    ├── .daemon.pid
     │
-    │  -- vault layer (each vault is its own git repo with its own remote) --
+    │  -- vault layer (tracked subdirectories of the jarvis-data repo) --
     └── vaults/
         ├── personal/                ← DEFAULT vault — your private side projects
-        │   ├── .git/                ← own git remote (private)
         │   ├── brains/
         │   │   ├── jarvis/          ← the system improving itself (Phase 0 first project)
         │   │   │   ├── brain.json
@@ -1109,7 +1110,7 @@ Each agent's recent outcomes (approved, rejected, dismissed, reworked) are track
         │   │   │   │   └── docs.json
         │   │   │   ├── research/    ← Scout's outputs
         │   │   │   ├── events-YYYY-MM.jsonl
-        │   │   │   └── .lock
+        │   │   │   └── .lock        ← gitignored (PID heartbeat, runtime only)
         │   │   ├── erdei-fahazak/
         │   │   ├── kapcsolodjki/
         │   │   ├── wedding-planner/
@@ -1118,45 +1119,50 @@ Each agent's recent outcomes (approved, rejected, dismissed, reworked) are track
         │       ├── jarvis/*.md
         │       ├── erdei-fahazak/*.md
         │       └── ...
-        ├── consulting/              ← separate private remote for client work (NDAs)
-        │   ├── .git/
+        ├── consulting/              ← client work; same repo, same privacy posture as `personal`
         │   ├── brains/
         │   └── plans/
-        └── showcase/                ← Phase 5 — PUBLIC git remote (Track B proof project)
-            ├── .git/
+        └── showcase/                ← Phase 5 — see Phase 5 note below; public showcase requires extraction or a submodule
             ├── brains/
             └── plans/
 ```
 
 **Path convention in this doc:** paths starting `jarvis/…` live under the **code repo root**. Paths starting `jarvis-data/…` live under `$JARVIS_DATA_DIR`. Project-scoped paths shown as `jarvis-data/brains/[app]/...` and `jarvis-data/plans/[app]/...` are **shorthand for** `jarvis-data/vaults/<vault>/brains/[app]/...` and `jarvis-data/vaults/<vault>/plans/[app]/...`. The vault is chosen at onboard time (default `personal`) and recorded in the project's brain.
 
-**Three independent git histories:**
+**Two git histories:**
 1. **Code repo** — the Jarvis source tree itself; one remote (private during Phase 0–4, optionally made public per the Phase 5 Track A choice).
-2. **Each vault** — `jarvis-data/vaults/<name>/.git`, one remote per vault. `personal` and `consulting` are private; `showcase` is public when added in Phase 5.
-3. **Shared layer** at `jarvis-data/` root — `jarvis.db`, `user-profile.json`, `.env`, `logs/`, `sandbox/`, `ideas/`, `setup-queue.jsonl`, `.daemon.pid` — **not git-tracked anywhere**. Backed up via your own mechanism (Time Machine, manual copy) since it contains live DB state and secrets.
+2. **`jarvis-data/` repo** — one git history, one remote. All vaults under `vaults/` are tracked subdirectories. The shared root layer (`jarvis.db`, `user-profile.json`, `.env`, `logs/`, `sandbox/`, `ideas/`, `setup-queue.jsonl`, `.daemon.pid`, brain `.lock` files) is **gitignored** — never committed. The DB and secrets are backed up via your own mechanism (Time Machine, manual copy).
 
-**Vaults & privacy posture:** each vault has its own git remote. Projects sharing a vault share a privacy posture (same audience, same backup, same sharing scope). Use separate vaults when the posture differs — `personal` for your private side projects, `consulting` for client work under NDA, `showcase` for the Phase 5 public proof project. The shared layer sits at the `jarvis-data/` root, **outside any vault** — always private regardless of which vaults you publish.
+**Vaults & privacy posture:** all vaults live in the same `jarvis-data/` repo, so they share one privacy posture (the data repo's remote). Vaults still serve as organizational and audience boundaries — `personal` for your private side projects, `consulting` for client work, etc. Phase 5's `showcase` (public proof project) is the one case where vault-level privacy differs from the rest; see "Phase 5 — public showcase architecture" below for how that gets handled.
 
 **Living documentation.** `MASTER_PLAN.md` and `USE_CASES.md` live inside `jarvis/docs/` — they ship with the code. Updates to either flow through the same plan-review pattern as code changes (improvement plan with `subtype: meta` against the `jarvis` project; Developer's PR includes the doc update).
 
 **Distribution later:** because the code repo is already standalone, packaging Jarvis (npm publish, open-sourcing the repo as Phase 5 Track A) is a remote-and-license change — no extraction step needed.
 
-### Vault commit cadence
+### Data repo commit cadence
 
-Writes to vault-tracked files commit to the vault's local git automatically; pushing to the remote is a separate, scheduleable operation.
+Writes to tracked files in `jarvis-data/` (anything under `vaults/`) commit to the data repo's local git automatically; pushing to the remote is a separate, scheduleable operation.
 
 | Write | Local commit | Default push trigger |
 |-------|--------------|----------------------|
-| Brain field update (incremental, per event) | File write is atomic with the SQLite event-append transaction; the **git commit** for that file change is squashed hourly per vault to avoid commit spam | Daily 03:00 + on plan completion |
+| Brain field update (incremental, per event) | File write is atomic with the SQLite event-append transaction; the **git commit** for that file change is squashed hourly to avoid commit spam | Daily 03:00 + on plan completion |
 | Plan transition (state change, revision, amendment) | On transition | On plan completion |
 | Plan content (Strategist draft, Developer impl plan) | On write | On plan completion |
 | Scheduled-post row writes | Hourly batched | Daily 03:00 |
 | Research outputs (Scout) | On write | Daily 03:00 |
 | Project docs (`docs.json` + cached content) | On write | On change |
 
-`yarn jarvis vault push <name>` triggers a manual push anytime. `yarn jarvis vault config <name>` can override push triggers per vault (e.g., `consulting` pushes hourly to a tighter backup; `showcase` pushes only on plan completion to keep the public history clean).
+`yarn jarvis data push` triggers a manual push anytime (or just use `git -C $JARVIS_DATA_DIR push` directly).
 
-**Push debouncing:** automatic pushes are debounced with a 30-second coalesce window per vault. Multiple plan completions in quick succession produce a single push, not N. Manual `vault push` bypasses debouncing.
+**Push debouncing:** automatic pushes are debounced with a 30-second coalesce window. Multiple plan completions in quick succession produce a single push, not N. Manual `data push` bypasses debouncing.
+
+### Phase 5 — public showcase architecture
+
+`personal`, `consulting`, and any other private vaults all share the data repo's remote. The Phase 5 public showcase (Track B) is the only case where vault-level privacy must differ. When that phase lands, choose one of:
+- **Separate repo** for `vaults/showcase/` (extract at Phase 5 entry; the `showcase` vault becomes its own git repo with a public remote, sibling to the others). Simplest, but `vault move --to showcase` becomes a cross-repo operation.
+- **Git submodule** at `vaults/showcase/` pointing at a public remote. Keeps the addressing the same; adds submodule plumbing to install/clone.
+
+Decision deferred to Phase 5 entry — both are tractable, the choice depends on how often projects move into/out of `showcase`.
 
 **File-write atomicity:** the "atomic with SQLite transaction" guarantee in the table is implemented as tempfile + fsync + atomic rename, sequenced **after** the SQLite transaction commits. On SQLite rollback, the prior file version is preserved (no partial writes ever land on disk). This is the standard pattern; mentioned here so the implementer knows the guarantee isn't free.
 
@@ -1184,13 +1190,13 @@ Once the code-repo structure is in place, write `jarvis/CLAUDE.md` (the repo-lev
 - **Anthropic client wrapper:** context-budget tracking + prompt caching markers + redactor in the outbound path. **Sandbox-pattern helpers (`orchestrator/sandbox.ts`) are deferred to Phase 1+** — Phase 0's only tools are file reads, GitHub API, and git, none of which need bulk-output sandboxing yet. The file is created with a TODO header; tools wired up later.
 - **Plan templates** (`jarvis/plan-templates/`) for improvement, implementation, business, marketing — even though only improvement+implementation are exercised in Phase 0. Plan loader/parser handles front-matter + body sections per §4. Plan-ID format per §4 (`YYYY-MM-DD-<slug>`).
 - **Plan state machine** end-to-end: `draft → awaiting-review → approved → executing → done`, plus `revise`/`reject` transitions and the parent-improvement ↔ implementation-plan two-phase approval flow per §4.
-- **`yarn jarvis install`:** creates `jarvis-data/` (at `$JARVIS_DATA_DIR` or `../jarvis-data`), writes `.env` stub (Anthropic key required, Slack tokens commented out), initializes `jarvis.db`, runs migrations, **creates the default `personal` vault** (`vaults/personal/` with `git init` run; remote optional via `--remote` flag), seeds the `jarvis` brain inside `vaults/personal/brains/jarvis/` (the system itself, `projectType: other`), creates the user-profile template at `jarvis-data/user-profile.json` (identity + preferences fields blank, you fill before first Strategist run), runs the restore smoke-test, and prints next-steps:
+- **`yarn jarvis install`:** creates `jarvis-data/` (at `$JARVIS_DATA_DIR` or `../jarvis-data`), writes `.env` stub (Anthropic key required, Slack tokens commented out), initializes `jarvis.db`, runs migrations, runs `git init` at the `jarvis-data/` root and writes the canonical `.gitignore` (per §15 — shared root layer is gitignored, vaults/ is tracked), **creates the default `personal` vault directory** at `vaults/personal/`, seeds the `jarvis` brain inside `vaults/personal/brains/jarvis/` (the system itself, `projectType: other`), creates the user-profile template at `jarvis-data/user-profile.json` (identity + preferences fields blank, you fill before first Strategist run), runs the restore smoke-test, and prints next-steps:
   ```
-  ✓ Installed. Default vault `personal` created (no remote).
+  ✓ Installed. Default vault `personal` created. jarvis-data git repo initialized (no remote).
   → Fill in API key: edit jarvis-data/.env
   → Fill in profile: yarn jarvis profile edit
-  → Add a remote:    yarn jarvis vault add-remote personal <git-url>
-  → Add more vaults: yarn jarvis vault create <name> [--remote <url>]
+  → Add a remote:    git -C $JARVIS_DATA_DIR remote add origin <git-url>
+  → Add more vaults: yarn jarvis vault create <name>
   → First plan:      yarn jarvis plan --app jarvis "<your first self-improvement>"
   ```
 - **Restore smoke-test details:** `install` seeds one synthetic event (kind `install-marker`, payload `{seed: true}`) into `jarvis.db`, exports it to a temporary JSONL file, rebuilds a scratch DB from the JSONL, asserts row counts and event payload match, then deletes the synthetic event from the live DB. Proves the restore path works on day zero so it's not first-tested during a real incident (§13 backup check).
@@ -1266,17 +1272,17 @@ Two complementary tracks:
 - All `jarvis-data/` (brains, plans, profile, feedback, secrets) stays private per the §15 split — zero business leakage.
 
 **Track B — A purpose-built public showcase project.**
-- Create a `showcase` vault with a public git remote (`yarn jarvis vault create showcase --remote <public-repo-url>`).
+- Promote `vaults/showcase/` to a public-remote home — at Phase 5 entry, pick the architecture per §15 → "Phase 5 — public showcase architecture" (separate repo or git submodule). The other vaults stay in the private `jarvis-data` repo unchanged.
 - Onboard a new project into this vault: `yarn jarvis onboard --app <showcase-name> --vault showcase ...`. E.g., a Hungarian IT community resource: job board, event aggregator, OSS contribution leaderboard, monthly newsletter. Owned by Jarvis from day one.
-- The showcase project's code repo is open-sourced; its brain + plans + research live in the `showcase` vault (also public via that vault's remote — the `showcase` vault is intentionally public, unlike `personal` and `consulting`).
+- The showcase project's code repo is open-sourced; its brain + plans + research live in the `showcase` vault (public via the chosen architecture).
 - Marketing plans for the showcase double as content for the personal-brand project (videos / blog posts: "how Jarvis built X this week"). Hits your "become known in Hungarian IT" goal.
 - Provides external metrics (visits, signups, GitHub stars, newsletter subs) that demonstrate Jarvis-driven outcomes without exposing your apps or consulting clients.
 
 **What stays private regardless of which track:**
-- All non-`showcase` vaults (`personal`, `consulting`, plus any others you create) — pushed only to private remotes you control.
-- The shared layer at `jarvis-data/` root (`jarvis.db`, `user-profile.json`, `setup-queue.jsonl`, `sandbox/`, `ideas/`, `logs/`, `.env`, `.daemon.pid`) — never inside any vault, never published.
-- IT-consulting business details (clients, deliverables, rates) — `consulting` vault, separate private remote.
-- User profile + observed patterns + feedback table + learning-loop history — shared layer, always private.
+- The `jarvis-data` repo (containing `personal`, `consulting`, and any other private vaults) — pushed only to a private remote you control.
+- The gitignored shared root layer (`jarvis.db`, `user-profile.json`, `setup-queue.jsonl`, `sandbox/`, `ideas/`, `logs/`, `.env`, `.daemon.pid`, brain `.lock` files) — never committed, anywhere.
+- IT-consulting business details (clients, deliverables, rates) — `consulting` vault inside the private data repo.
+- User profile + observed patterns + feedback table + learning-loop history — shared root layer, always gitignored.
 
 **Choice of showcase project deferred** — see §19 → Open items.
 
@@ -1303,16 +1309,15 @@ All commands prefixed `yarn jarvis ...`. Grouped by purpose.
 | `doctor --rebuild-brain <app>` | Full brain rebuild from events (see §7 update model). |
 | `doctor --clear-stale-lock <app>` | Manual lock clear if auto-takeover fails. |
 | `onboard --app <name> --repo <path-or-url> [--monorepo-path apps/<name>] [--vault <vault-name>] [--docs <paths-or-urls>...] [--docs-keep <paths-or-urls>...]` | Strategist drafts an initial brain from repo inspection. `--vault` selects the data vault (default `personal`). `--docs` → absorbed. `--docs-keep` → cached. See §7 + §10. |
-| `vault list` | Show all vaults: name, project count, git remote, default flag, last-pushed timestamp. |
-| `vault create <name> [--remote <git-url>]` | Create a new vault. With `--remote`, initializes git in the vault dir and adds the remote. |
+| `vault list` | Show all vaults: name, project count, default flag. (Git remote / push status applies to the whole `jarvis-data` repo — see `data status`.) |
+| `vault create <name>` | Create a new vault subdirectory under `jarvis-data/vaults/`. No per-vault git init — vaults live in the parent `jarvis-data` repo. |
 | `vault set-default <name>` | Set the default vault for new onboards (when `--vault` is omitted). |
-| `vault push <name>` | Commit + push the vault's local changes to its git remote. |
-| `vault pull <name>` | Pull from the vault's git remote. |
-| `vault add-remote <name> <git-url>` | Wire a git remote onto an existing vault (the one created at install starts without a remote). |
-| `vault remove-remote <name>` | Remove a vault's git remote (vault stays local-only thereafter). |
-| `vault rename <old> <new>` | Rename a vault. Renames the **local** vault directory (`vaults/<old>/` → `vaults/<new>/`) and updates `vault_id` everywhere in SQLite. The git remote URL is unchanged — it still points at whatever upstream you configured. Refuses if the new name collides with an existing vault. |
-| `vault delete <name>` | Delete a vault. Refuses if the vault still contains projects — hint emitted: "move projects out first via `vault move --app <name> --to <other-vault>`." Safe-by-default; never silently drops project data. |
-| `vault move --app <app-name> --to <vault-name>` | Move a project across vaults safely: (1) pause any executing plan for the app + checkpoint, (2) relocate `brains/<app>/` + `plans/<app>/` between vault dirs, (3) update `app_id` ↔ `vault_id` mapping in SQLite (events, scheduled_posts, feedback all keep their app_id; the vault attribution updates), (4) commit on both source and destination vaults, (5) resume the plan from checkpoint. Used when sharing posture changes — e.g., promoting an internal project to the public `showcase` vault. |
+| `vault rename <old> <new>` | Rename a vault. Renames the directory (`vaults/<old>/` → `vaults/<new>/`) and updates `vault_id` everywhere in SQLite. Commits the rename to the data repo. Refuses if the new name collides. |
+| `vault delete <name>` | Delete a vault. Refuses if it still contains projects — hint: "move projects out first via `vault move --app <name> --to <other-vault>`." Safe-by-default; never silently drops project data. |
+| `vault move --app <app-name> --to <vault-name>` | Move a project across vaults safely: (1) pause any executing plan for the app + checkpoint, (2) relocate `brains/<app>/` + `plans/<app>/` between vault dirs, (3) update `app_id` ↔ `vault_id` mapping in SQLite, (4) commit the move in the data repo, (5) resume the plan from checkpoint. |
+| `data status` | Show `jarvis-data` git status: branch, ahead/behind vs remote, unpushed-change count, oldest unpushed change. |
+| `data push` | Commit pending writes + push the `jarvis-data` repo to its remote (with the §15 push-debounce window). |
+| `data pull` | Pull the `jarvis-data` repo from its remote. |
 | `docs list --app <name>` | List docs registered for an app (retention, tags, last refresh). |
 | `docs add --app <name> <path-or-url>` | Absorb a new doc. Post-onboarding this drafts a **brain-update plan** for your review; on approval, brain is extended and summary + extracted facts land in `docs.json`. |
 | `docs add --app <name> --keep <path-or-url>` | Cache a new doc; retain full content and refresh on TTL. Does not auto-extend the brain. |
