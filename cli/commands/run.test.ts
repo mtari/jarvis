@@ -1,9 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type Anthropic from "@anthropic-ai/sdk";
 import type {
-  AnthropicClient,
-  ChatResponse,
-} from "../../orchestrator/anthropic-client.ts";
+  RunAgentResult,
+  RunAgentTransport,
+} from "../../orchestrator/agent-sdk-runtime.ts";
 import { parsePlan, type Plan } from "../../orchestrator/plan.ts";
 import {
   dropPlan,
@@ -99,30 +98,28 @@ Revert.
 None.
 </plan>`;
 
-function fixedTextResponse(text: string): ChatResponse {
+function fixedRunResult(text: string): RunAgentResult {
   return {
     text,
-    blocks: [
-      { type: "text", text, citations: null } as Anthropic.TextBlock,
-    ],
-    stopReason: "end_turn",
-    model: "claude-sonnet-4-6",
+    subtype: "success",
+    numTurns: 5,
+    durationMs: 1234,
+    totalCostUsd: 0,
     usage: {
       inputTokens: 0,
       outputTokens: 0,
       cachedInputTokens: 0,
       cacheCreationTokens: 0,
     },
-    redactions: [],
+    permissionDenials: 0,
+    errors: [],
+    model: "claude-sonnet-4-6",
+    stopReason: "end_turn",
   };
 }
 
-function fixedClient(text: string): AnthropicClient {
-  return {
-    async chat() {
-      return fixedTextResponse(text);
-    },
-  };
+function fixedTransport(text: string): RunAgentTransport {
+  return async () => fixedRunResult(text);
 }
 
 describe("detectDeveloperMode", () => {
@@ -238,7 +235,7 @@ describe("runRun", () => {
   it("returns 1 when plan is not found", async () => {
     expect(
       await runRun(["developer", "does-not-exist"], {
-        client: fixedClient("DONE"),
+        transport: fixedTransport("DONE"),
       }),
     ).toBe(1);
   });
@@ -247,7 +244,7 @@ describe("runRun", () => {
     dropPlan(sandbox, "2026-04-27-test", { status: "draft" });
     expect(
       await runRun(["developer", "2026-04-27-test"], {
-        client: fixedClient("DONE"),
+        transport: fixedTransport("DONE"),
       }),
     ).toBe(1);
   });
@@ -259,13 +256,13 @@ describe("runRun", () => {
       implementationReview: "required",
     });
     const code = await runRun(["developer", parentId], {
-      client: fixedClient(VALID_IMPL_PLAN(parentId)),
+      transport: fixedTransport(VALID_IMPL_PLAN(parentId)),
     });
     expect(code).toBe(0);
     // The impl plan should now exist
     expect(
       await runRun(["developer", parentId], {
-        client: fixedClient(VALID_IMPL_PLAN(parentId)),
+        transport: fixedTransport(VALID_IMPL_PLAN(parentId)),
       }),
     ).toBe(1);
   });
@@ -278,7 +275,7 @@ describe("runRun", () => {
       status: "approved",
     });
     const code = await runRun(["developer", planId], {
-      client: fixedClient(
+      transport: fixedTransport(
         [
           "DONE",
           "Branch: feat/2026-04-27-mode-b",
@@ -297,7 +294,7 @@ describe("runRun", () => {
       implementationReview: "skip",
     });
     const code = await runRun(["developer", planId], {
-      client: fixedClient("BLOCKED: cannot fix tests"),
+      transport: fixedTransport("BLOCKED: cannot fix tests"),
     });
     expect(code).toBe(1);
   });
@@ -305,7 +302,7 @@ describe("runRun", () => {
   it("rejects extra positional arguments", async () => {
     expect(
       await runRun(["developer", "some-id", "extra"], {
-        client: fixedClient("DONE"),
+        transport: fixedTransport("DONE"),
       }),
     ).toBe(1);
   });

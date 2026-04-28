@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { AnthropicClient } from "../orchestrator/anthropic-client.ts";
+import {
+  runAgent,
+  type RunAgentTransport,
+} from "../orchestrator/agent-sdk-runtime.ts";
 import {
   brainSchema,
   type BrainInput,
 } from "../orchestrator/brain.ts";
-import { runAgentLoop, type AgentToolCall } from "../orchestrator/tool-loop.ts";
 import { repoRoot as defaultRepoRoot } from "../cli/paths.ts";
-import { createDeveloperTools } from "../tools/developer-tools.ts";
 
 export class OnboardError extends Error {
   constructor(message: string) {
@@ -31,21 +32,24 @@ export interface CachedDocSummary {
 }
 
 export interface OnboardAgentInput {
-  client: AnthropicClient;
   /** Project name from --app. The brain uses this verbatim as projectName. */
   app: string;
   /** Absolute path to the repo (or monorepo subdirectory) Strategist inspects. */
   repoRoot: string;
   absorbedDocs: ReadonlyArray<AbsorbedDoc>;
   cachedDocs: ReadonlyArray<CachedDocSummary>;
-  maxIterations?: number;
-  onToolCall?: (call: AgentToolCall) => void;
+  maxTurns?: number;
+  /** Test injection — overrides the SDK transport. */
+  transport?: RunAgentTransport;
+  model?: string;
 }
 
 export interface OnboardAgentResult {
   brain: BrainInput;
-  iterations: number;
+  numTurns: number;
 }
+
+const DEFAULT_MAX_TURNS = 15;
 
 const PROMPT_PATH = "prompts/strategist-onboard.md";
 
@@ -106,29 +110,30 @@ export async function runOnboardAgent(
     throw new OnboardError(`repoRoot does not exist: ${input.repoRoot}`);
   }
 
-  const tools = createDeveloperTools({ repoRoot: input.repoRoot });
-  const readOnly = {
-    read_file: tools.read_file,
-    list_dir: tools.list_dir,
-  };
-
-  const result = await runAgentLoop({
-    client: input.client,
-    system: loadOnboardPrompt(),
-    cacheSystem: true,
-    initialMessages: [{ role: "user", content: buildOnboardContext(input) }],
-    tools: readOnly,
-    ...(input.maxIterations !== undefined && {
-      maxIterations: input.maxIterations,
-    }),
-    ...(input.onToolCall !== undefined && { onToolCall: input.onToolCall }),
+  // Read-only Claude Code preset: Read + Glob + Grep, no Bash, no Write.
+  // The SDK runs with cwd=repoRoot so Read paths are scoped to the project.
+  const result = await runAgent({
+    systemPrompt: loadOnboardPrompt(),
+    userPrompt: buildOnboardContext(input),
+    cwd: input.repoRoot,
+    maxTurns: input.maxTurns ?? DEFAULT_MAX_TURNS,
+    toolPreset: { kind: "readonly" },
+    ...(input.model !== undefined && { model: input.model }),
+    ...(input.transport !== undefined && { transport: input.transport }),
   });
 
-  const brainMatch = result.finalText.match(/<brain>([\s\S]*?)<\/brain>/);
+  if (result.subtype !== "success") {
+    throw new OnboardError(
+      `Onboard agent failed: ${result.subtype}` +
+        (result.errors.length > 0 ? ` — ${result.errors.join("; ")}` : ""),
+    );
+  }
+
+  const brainMatch = result.text.match(/<brain>([\s\S]*?)<\/brain>/);
   if (!brainMatch || !brainMatch[1]) {
     throw new OnboardError(
       "Strategist's response had no <brain> block. First 200 chars: " +
-        result.finalText.slice(0, 200),
+        result.text.slice(0, 200),
     );
   }
 
@@ -155,5 +160,5 @@ export async function runOnboardAgent(
     );
   }
 
-  return { brain, iterations: result.iterations };
+  return { brain, numTurns: result.numTurns };
 }

@@ -8,9 +8,7 @@ import {
   type AbsorbedDoc,
   type CachedDocSummary,
 } from "../../agents/onboard.ts";
-import { createAgentRuntime } from "../../orchestrator/agent-sdk-runtime.ts";
-import { type AnthropicClient } from "../../orchestrator/anthropic-client.ts";
-import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
+import type { RunAgentTransport } from "../../orchestrator/agent-sdk-runtime.ts";
 import { saveBrain } from "../../orchestrator/brain.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
@@ -26,7 +24,8 @@ import {
 } from "../paths.ts";
 
 export interface OnboardCommandDeps {
-  client?: AnthropicClient;
+  /** Test injection — overrides the SDK transport. */
+  transport?: RunAgentTransport;
   /** For tests: skip the network and return a stub for any URL doc fetch. */
   fetchUrl?: (url: string) => Promise<{ content: string; contentType?: string }>;
 }
@@ -152,32 +151,6 @@ export async function runOnboard(
     return 1;
   }
 
-  let baseClient: AnthropicClient;
-  let mode: "api" | "subscription";
-  if (deps.client) {
-    baseClient = deps.client;
-    mode = "subscription";
-  } else {
-    const runtime = createAgentRuntime();
-    if (
-      runtime.mode === "api" &&
-      !process.env["ANTHROPIC_API_KEY"]
-    ) {
-      console.error(
-        `onboard: JARVIS_AGENT_RUNTIME=api but ANTHROPIC_API_KEY is not set. Edit ${envFile(dataDir)} or unset JARVIS_AGENT_RUNTIME to use the Claude Code subscription.`,
-      );
-      return 1;
-    }
-    baseClient = runtime.client;
-    mode = runtime.mode;
-  }
-  const recorder = buildAgentCallRecorder(baseClient, dbFile(dataDir), {
-    app,
-    vault,
-    agent: "strategist",
-    mode,
-  });
-
   console.log(`Onboarding ${app} from ${repoRoot.path}…`);
   console.log(
     `  Vault: ${vault}  •  Absorbed docs: ${absorbedDocs.length}  •  Cached docs: ${cachedDocs.length}`,
@@ -186,15 +159,13 @@ export async function runOnboard(
   let agentResult;
   try {
     agentResult = await runOnboardAgent({
-      client: recorder.client,
       app,
       repoRoot: repoRoot.path,
       absorbedDocs,
       cachedDocs: cachedDocs.map((c) => c.summary),
+      ...(deps.transport !== undefined && { transport: deps.transport }),
     });
-    recorder.flush();
   } catch (err) {
-    recorder.flush();
     if (err instanceof OnboardError) {
       console.error(`onboard: ${err.message}`);
       return 1;
@@ -263,7 +234,7 @@ export async function runOnboard(
         }),
         absorbedDocsCount: absorbedDocs.length,
         cachedDocsCount: cachedDocs.length,
-        iterations: agentResult.iterations,
+        numTurns: agentResult.numTurns,
       },
     });
   } finally {
@@ -302,7 +273,7 @@ export async function runOnboard(
   console.log(`✓ Onboarded ${app}`);
   console.log(`  Brain: ${targetBrain}`);
   console.log(`  Plans dir: ${planDir(dataDir, vault, app)}`);
-  console.log(`  Iterations: ${agentResult.iterations}`);
+  console.log(`  Turns: ${agentResult.numTurns}`);
   if (moveDocs) {
     if (moveResults.moved.length > 0) {
       console.log(`  Moved ${moveResults.moved.length} source doc(s) into jarvis-data:`);

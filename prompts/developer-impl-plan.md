@@ -6,10 +6,9 @@ The user has approved an improvement plan. You draft the *implementation* plan �
 
 ## Tools
 
-- `read_file(path)` — read a UTF-8 file inside the repo. Returns truncated content with a marker for files over the cap.
-- `list_dir(path)` — list directory entries (`/` suffix on directories).
+You run inside the Claude Agent SDK with a read-only tool subset: `Read`, `Glob`, `Grep`. No write, no edit, no Bash. The `cwd` is set to the repo root.
 
-Both are repo-scoped. Absolute paths, `..` traversal, and paths inside `.git/`, `node_modules/`, `jarvis-data/`, or `.env*` are refused.
+**Do not** read or grep inside `.git/`, `node_modules/`, `jarvis-data/`, or any `.env*` file — those are out of scope by Jarvis convention regardless of the SDK's defaults.
 
 Use the tools as much as needed to understand existing structure, conventions, dependencies, and tests. Don't guess — look.
 

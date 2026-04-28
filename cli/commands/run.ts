@@ -1,20 +1,20 @@
-import Anthropic from "@anthropic-ai/sdk";
 import {
   detectDeveloperMode,
   draftImplementationPlan,
   DeveloperError,
   executePlan,
 } from "../../agents/developer.ts";
-import { createAnthropicClient } from "../../orchestrator/anthropic-client.ts";
-import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
+import { RateLimitedError } from "../../orchestrator/agent-sdk-runtime.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
-import { dbFile, envFile, getDataDir } from "../paths.ts";
+import type { RunAgentTransport } from "../../orchestrator/agent-sdk-runtime.ts";
+import { envFile, getDataDir } from "../paths.ts";
 
 export { detectDeveloperMode };
 
 export interface RunCommandDeps {
-  client?: ReturnType<typeof createAnthropicClient>;
+  /** Test injection — overrides the SDK transport for both draft-impl + execute. */
+  transport?: RunAgentTransport;
 }
 
 export async function runRun(
@@ -63,35 +63,19 @@ export async function runRun(
   }
 
   loadEnvFile(envFile(dataDir));
-  if (!deps.client && !process.env["ANTHROPIC_API_KEY"]) {
-    console.error(
-      `run developer: ANTHROPIC_API_KEY is not set. Edit ${envFile(dataDir)} and try again.`,
-    );
-    return 1;
-  }
-  const baseClient = deps.client ?? createAnthropicClient();
-  const recorder = buildAgentCallRecorder(baseClient, dbFile(dataDir), {
-    app: record.app,
-    vault: record.vault,
-    agent: "developer",
-    planId,
-  });
 
   try {
     if (mode === "draft-impl") {
       const result = await draftImplementationPlan({
-        client: recorder.client,
         parentPlanId: planId,
         app: record.app,
         vault: record.vault,
         dataDir,
+        ...(deps.transport !== undefined && { transport: deps.transport }),
       });
-      // The freshly-drafted impl plan is the more useful planId for telemetry
-      recorder.ctx.planId = result.planId;
-      recorder.flush();
       console.log(`✓ Drafted implementation plan ${result.planId}`);
       console.log(`  Path: ${result.planPath}`);
-      console.log(`  Iterations: ${result.iterations}`);
+      console.log(`  Turns: ${result.numTurns}`);
       console.log(
         `  Review: yarn jarvis plans --pending-review (then approve / revise / reject)`,
       );
@@ -99,28 +83,26 @@ export async function runRun(
     }
 
     const result = await executePlan({
-      client: recorder.client,
       planId,
       app: record.app,
       vault: record.vault,
       dataDir,
+      ...(deps.transport !== undefined && { transport: deps.transport }),
     });
-    recorder.flush();
 
     console.log(result.finalText);
     console.log("");
     if (result.done) {
       console.log(`✓ Executed plan ${planId}`);
-      console.log(`  Iterations: ${result.iterations}`);
-      console.log(`  Tool calls: ${result.toolCallCount}`);
+      console.log(`  Turns: ${result.numTurns}`);
       if (result.branch) console.log(`  Branch: ${result.branch}`);
       if (result.prUrl) console.log(`  PR URL: ${result.prUrl}`);
       return 0;
     }
     if (result.blocked) {
       console.error(`✗ Developer blocked on plan ${planId}`);
-      console.error(`  Iterations: ${result.iterations}`);
-      console.error(`  Tool calls: ${result.toolCallCount}`);
+      console.error(`  Turns: ${result.numTurns}`);
+      console.error(`  Subtype: ${result.subtype}`);
       console.error(`  Inspect with: yarn jarvis plans --status blocked`);
       return 1;
     }
@@ -129,21 +111,17 @@ export async function runRun(
     );
     return 1;
   } catch (err) {
-    recorder.flush();
-    if (err instanceof DeveloperError) {
-      console.error(`run developer: ${err.message}`);
+    if (err instanceof RateLimitedError) {
+      const reset = err.resetsAt
+        ? ` Resets at ${err.resetsAt.toISOString()}.`
+        : "";
+      console.error(
+        `run developer: rate limit hit on Claude Code subscription (${err.rateLimitType ?? "unknown"}).${reset}`,
+      );
       return 1;
     }
-    if (err instanceof Anthropic.APIError) {
-      const status = err.status ?? "?";
-      console.error(
-        `run developer: Anthropic API error (status ${status}): ${err.message}`,
-      );
-      if (err.status === 401 || err.status === 403) {
-        console.error(
-          `run developer: check ANTHROPIC_API_KEY in ${envFile(dataDir)}.`,
-        );
-      }
+    if (err instanceof DeveloperError) {
+      console.error(`run developer: ${err.message}`);
       return 1;
     }
     throw err;

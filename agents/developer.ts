@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
-import type { AnthropicClient } from "../orchestrator/anthropic-client.ts";
+import {
+  runAgent,
+  type RunAgentResult,
+  type RunAgentTransport,
+} from "../orchestrator/agent-sdk-runtime.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
 import { findPlan, savePlan, type PlanRecord } from "../orchestrator/plan-store.ts";
 import type { Plan } from "../orchestrator/plan.ts";
@@ -10,10 +14,49 @@ import {
   transitionPlan,
   type PlanStatus,
 } from "../orchestrator/plan.ts";
-import { runAgentLoop, type AgentToolCall } from "../orchestrator/tool-loop.ts";
 import { dbFile, planDir, repoRoot as defaultRepoRoot } from "../cli/paths.ts";
-import { createDeveloperTools } from "../tools/developer-tools.ts";
 import { dumpFailedDraft } from "./strategist.ts";
+
+/**
+ * Records an `agent-call` event for one runAgent result. Uses the same payload
+ * shape as the API path so `yarn jarvis cost` aggregates both modes. The
+ * `mode` field is always "subscription" here since we're going through the
+ * SDK runtime; pre-pivot rows from the API path keep their original `mode`.
+ */
+function recordAgentCall(
+  dataDir: string,
+  app: string,
+  vault: string,
+  planId: string,
+  result: RunAgentResult,
+): void {
+  const db = new Database(dbFile(dataDir));
+  try {
+    appendEvent(db, {
+      appId: app,
+      vaultId: vault,
+      kind: "agent-call",
+      payload: {
+        agent: "developer",
+        planId,
+        model: result.model,
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+        cachedInputTokens: result.usage.cachedInputTokens,
+        cacheCreationTokens: result.usage.cacheCreationTokens,
+        durationMs: result.durationMs,
+        stopReason: result.stopReason,
+        numTurns: result.numTurns,
+        totalCostUsd: result.totalCostUsd,
+        permissionDenials: result.permissionDenials,
+        subtype: result.subtype,
+        mode: "subscription",
+      },
+    });
+  } finally {
+    db.close();
+  }
+}
 
 export class DeveloperError extends Error {
   constructor(message: string) {
@@ -22,23 +65,27 @@ export class DeveloperError extends Error {
   }
 }
 
+const DEFAULT_MAX_TURNS_DRAFT_IMPL = 15;
+const DEFAULT_MAX_TURNS_EXECUTE = 60;
+
 // ---------- Mode A: draft implementation plan ----------
 
 export interface DraftImplPlanInput {
-  client: AnthropicClient;
   parentPlanId: string;
   app: string;
   vault: string;
   dataDir: string;
   repoRoot?: string;
-  maxIterations?: number;
-  onToolCall?: (call: AgentToolCall) => void;
+  maxTurns?: number;
+  /** Test injection for the SDK transport. */
+  transport?: RunAgentTransport;
+  model?: string;
 }
 
 export interface DraftImplPlanResult {
   planId: string;
   planPath: string;
-  iterations: number;
+  numTurns: number;
 }
 
 export async function draftImplementationPlan(
@@ -47,9 +94,7 @@ export async function draftImplementationPlan(
   const repo = input.repoRoot ?? defaultRepoRoot();
   const parent = findPlan(input.dataDir, input.parentPlanId);
   if (!parent) {
-    throw new DeveloperError(
-      `parent plan ${input.parentPlanId} not found`,
-    );
+    throw new DeveloperError(`parent plan ${input.parentPlanId} not found`);
   }
   if (parent.plan.metadata.status !== "approved") {
     throw new DeveloperError(
@@ -66,38 +111,38 @@ export async function draftImplementationPlan(
     );
   }
 
-  const tools = createDeveloperTools({ repoRoot: repo });
-  const readOnly = {
-    read_file: tools.read_file,
-    list_dir: tools.list_dir,
-  };
-
   const systemPrompt = loadDeveloperPrompt("developer-impl-plan.md");
   const parentMarkdown = fs.readFileSync(parent.path, "utf8");
-  const userContext = [
+  const userPrompt = [
     `Parent improvement plan id: ${input.parentPlanId}`,
     "Parent plan content:",
     "",
     parentMarkdown,
   ].join("\n");
 
-  const result = await runAgentLoop({
-    client: input.client,
-    system: systemPrompt,
-    cacheSystem: true,
-    initialMessages: [{ role: "user", content: userContext }],
-    tools: readOnly,
-    ...(input.maxIterations !== undefined && {
-      maxIterations: input.maxIterations,
-    }),
-    ...(input.onToolCall !== undefined && { onToolCall: input.onToolCall }),
+  const result = await runAgent({
+    systemPrompt,
+    userPrompt,
+    cwd: repo,
+    maxTurns: input.maxTurns ?? DEFAULT_MAX_TURNS_DRAFT_IMPL,
+    toolPreset: { kind: "readonly" }, // Read/Glob/Grep — no Bash, no Write
+    ...(input.model !== undefined && { model: input.model }),
+    ...(input.transport !== undefined && { transport: input.transport }),
   });
 
-  const planMatch = result.finalText.match(/<plan>([\s\S]*?)<\/plan>/);
-  if (!planMatch || !planMatch[1]) {
+  // Record agent-call telemetry regardless of outcome.
+  recordAgentCall(input.dataDir, input.app, input.vault, planId, result);
+
+  if (result.subtype !== "success") {
     throw new DeveloperError(
-      "Developer's final response had no <plan> block",
+      `Developer draft-impl failed: ${result.subtype}` +
+        (result.errors.length > 0 ? ` — ${result.errors.join("; ")}` : ""),
     );
+  }
+
+  const planMatch = result.text.match(/<plan>([\s\S]*?)<\/plan>/);
+  if (!planMatch || !planMatch[1]) {
+    throw new DeveloperError("Developer's final response had no <plan> block");
   }
   let plan: Plan;
   try {
@@ -139,7 +184,7 @@ export async function draftImplementationPlan(
           planId,
           parentPlanId: input.parentPlanId,
           author: "developer",
-          iterations: result.iterations,
+          numTurns: result.numTurns,
         },
       });
     })();
@@ -151,21 +196,22 @@ export async function draftImplementationPlan(
   return {
     planId,
     planPath,
-    iterations: result.iterations,
+    numTurns: result.numTurns,
   };
 }
 
 // ---------- Mode B: execute ----------
 
 export interface ExecutePlanInput {
-  client: AnthropicClient;
   planId: string;
   app: string;
   vault: string;
   dataDir: string;
   repoRoot?: string;
-  maxIterations?: number;
-  onToolCall?: (call: AgentToolCall) => void;
+  maxTurns?: number;
+  /** Test injection for the SDK transport. */
+  transport?: RunAgentTransport;
+  model?: string;
 }
 
 export interface ExecutePlanResult {
@@ -174,8 +220,9 @@ export interface ExecutePlanResult {
   prUrl?: string;
   done: boolean;
   blocked: boolean;
-  iterations: number;
+  numTurns: number;
   toolCallCount: number;
+  subtype: RunAgentResult["subtype"];
 }
 
 export async function executePlan(
@@ -219,24 +266,32 @@ export async function executePlan(
     }
   }
 
-  const tools = createDeveloperTools({ repoRoot: repo });
-  const systemPrompt = loadDeveloperPrompt("developer-execute.md");
+  const developerPromptText = loadDeveloperPrompt("developer-execute.md");
 
-  const loopResult = await runAgentLoop({
-    client: input.client,
-    system: systemPrompt,
-    cacheSystem: true,
-    initialMessages: [{ role: "user", content: contextLines.join("\n") }],
-    tools,
-    ...(input.maxIterations !== undefined && {
-      maxIterations: input.maxIterations,
-    }),
-    ...(input.onToolCall !== undefined && { onToolCall: input.onToolCall }),
+  // Use the claude_code preset's system prompt and append our workflow rules.
+  // The preset gives Claude Code's coding instincts (file-edit conventions,
+  // commit-message style, etc.); developer-execute.md layers on the Jarvis
+  // workflow contract (clean-tree gate, BLOCKED protocol, DONE format).
+  const result = await runAgent({
+    systemPrompt: "", // ignored when presetSystemPrompt: true
+    presetSystemPrompt: true,
+    appendSystemPrompt: developerPromptText,
+    userPrompt: contextLines.join("\n"),
+    cwd: repo,
+    maxTurns: input.maxTurns ?? DEFAULT_MAX_TURNS_EXECUTE,
+    toolPreset: { kind: "claude_code" },
+    ...(input.model !== undefined && { model: input.model }),
+    ...(input.transport !== undefined && { transport: input.transport }),
   });
 
-  const text = loopResult.finalText;
-  const blocked = /^BLOCKED\b/m.test(text);
-  const done = !blocked && /^DONE\b/m.test(text);
+  // Record telemetry before any further plan-state changes — keeps the
+  // event log accurate even if downstream transitions throw.
+  recordAgentCall(input.dataDir, input.app, input.vault, input.planId, result);
+
+  const text = result.text;
+  const blocked =
+    /^BLOCKED\b/m.test(text) || result.subtype === "error_max_turns";
+  const done = !blocked && /^DONE\b/m.test(text) && result.subtype === "success";
   const branchMatch = text.match(/^Branch:\s*(.+)$/m);
   const prMatch = text.match(/^PR URL:\s*(.+)$/m);
 
@@ -254,9 +309,9 @@ export async function executePlan(
     // Otherwise leave at "executing" — caller can inspect and decide.
   }
 
-  // §4: when an implementation plan finishes (done or blocked), mirror
-  // that on the parent improvement plan. Parent stays put if it's not
-  // currently "executing" (e.g., user paused or cancelled it manually).
+  // §4: when an implementation plan finishes (done or blocked), mirror that
+  // on the parent improvement plan. Parent stays put if it's not currently
+  // "executing" (e.g., user paused or cancelled it manually).
   if (
     finalStatus !== null &&
     updatedRecord?.plan.metadata.type === "implementation" &&
@@ -275,18 +330,16 @@ export async function executePlan(
     finalText: text,
     done,
     blocked,
-    iterations: loopResult.iterations,
-    toolCallCount: loopResult.toolCalls.length,
+    numTurns: result.numTurns,
+    toolCallCount: 0, // SDK doesn't expose tool-call count separately; numTurns is the proxy
+    subtype: result.subtype,
   };
   if (branchMatch && branchMatch[1]) {
     out.branch = branchMatch[1].trim();
   }
   if (prMatch && prMatch[1]) {
     const candidate = prMatch[1].trim();
-    if (
-      candidate &&
-      !/^(none|n\/a|not[- ]opened)/i.test(candidate)
-    ) {
+    if (candidate && !/^(none|n\/a|not[- ]opened)/i.test(candidate)) {
       out.prUrl = candidate;
     }
   }

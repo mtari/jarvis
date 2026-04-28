@@ -7,10 +7,9 @@ import {
   executePlan,
 } from "../../agents/developer.ts";
 import {
-  createAnthropicClient,
-  type AnthropicClient,
-} from "../../orchestrator/anthropic-client.ts";
-import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
+  RateLimitedError,
+  type RunAgentTransport,
+} from "../../orchestrator/agent-sdk-runtime.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { listPlans, type PlanRecord } from "../../orchestrator/plan-store.ts";
 import { dbFile } from "../../cli/paths.ts";
@@ -22,12 +21,12 @@ export interface PlanExecutorOptions {
   dataDir: string;
   /** Tick interval for the auto-fire scan. Default 30s. */
   tickMs?: number;
-  /** Lazy client builder; defaults to createAnthropicClient(). */
-  buildAnthropicClient?: () => AnthropicClient;
   /** Apps the executor will fire Developer for. Default: ["jarvis"] until multi-repo lands. */
   enabledApps?: ReadonlyArray<string>;
   /** Override repo root for assertCleanMain (tests inject a fixture repo). */
   repoRoot?: string;
+  /** Test injection — overrides the SDK transport for every Developer fire. */
+  transport?: RunAgentTransport;
   /**
    * Override the tick body for testing. When provided, replaces the default
    * runPlanExecutorTick call so tests can inject timing-controlled stubs
@@ -102,10 +101,10 @@ export function readFiredPlanIds(dbFilePath: string): Set<string> {
 }
 
 interface FireOnce {
-  client: AnthropicClient;
   dataDir: string;
   ctx: DaemonContext;
   repoRoot?: string;
+  transport?: RunAgentTransport;
 }
 
 async function fireDeveloper(
@@ -124,25 +123,16 @@ async function fireDeveloper(
     };
   }
 
-  const recorder = buildAgentCallRecorder(fire.client, dbFile(fire.dataDir), {
-    app,
-    vault: record.vault,
-    agent: "developer",
-    planId,
-  });
-
   const start = Date.now();
   try {
     if (mode === "draft-impl") {
       const result = await draftImplementationPlan({
-        client: recorder.client,
         parentPlanId: planId,
         app,
         vault: record.vault,
         dataDir: fire.dataDir,
+        ...(fire.transport !== undefined && { transport: fire.transport }),
       });
-      recorder.ctx.planId = result.planId;
-      recorder.flush();
       return {
         planId,
         app,
@@ -150,19 +140,18 @@ async function fireDeveloper(
         durationMs: Date.now() - start,
         result: {
           implPlanId: result.planId,
-          iterations: result.iterations,
+          numTurns: result.numTurns,
         },
       };
     }
     const result = await executePlan({
-      client: recorder.client,
       planId,
       app,
       vault: record.vault,
       dataDir: fire.dataDir,
       ...(fire.repoRoot !== undefined && { repoRoot: fire.repoRoot }),
+      ...(fire.transport !== undefined && { transport: fire.transport }),
     });
-    recorder.flush();
     return {
       planId,
       app,
@@ -171,14 +160,33 @@ async function fireDeveloper(
       result: {
         done: result.done,
         blocked: result.blocked,
-        iterations: result.iterations,
-        toolCalls: result.toolCallCount,
+        numTurns: result.numTurns,
+        subtype: result.subtype,
         ...(result.branch !== undefined && { branch: result.branch }),
         ...(result.prUrl !== undefined && { prUrl: result.prUrl }),
       },
     };
   } catch (err) {
-    recorder.flush();
+    if (err instanceof RateLimitedError) {
+      const reset = err.resetsAt ? err.resetsAt.toISOString() : "unknown";
+      fire.ctx.logger.error(
+        "plan-executor: rate limit hit on Claude Code subscription",
+        err,
+        {
+          planId,
+          mode,
+          rateLimitType: err.rateLimitType ?? "unknown",
+          resetsAt: reset,
+        },
+      );
+      return {
+        planId,
+        app,
+        mode,
+        reason: `RATE_LIMITED: ${err.rateLimitType ?? "unknown"} resets at ${reset}`,
+        durationMs: Date.now() - start,
+      };
+    }
     const message =
       err instanceof DeveloperError
         ? err.message
@@ -249,10 +257,11 @@ async function runExecute(
 export interface TickInput {
   dataDir: string;
   enabledApps: ReadonlyArray<string>;
-  client: AnthropicClient;
   ctx: DaemonContext;
   /** Override repo root (tests inject a fixture path). */
   repoRoot?: string;
+  /** Test injection — overrides the SDK transport for every Developer fire. */
+  transport?: RunAgentTransport;
 }
 
 export interface TickResult {
@@ -262,12 +271,14 @@ export interface TickResult {
 
 function buildFireOnce(input: TickInput): FireOnce {
   const base: FireOnce = {
-    client: input.client,
     dataDir: input.dataDir,
     ctx: input.ctx,
   };
   if (input.repoRoot !== undefined) {
     base.repoRoot = input.repoRoot;
+  }
+  if (input.transport !== undefined) {
+    base.transport = input.transport;
   }
   return base;
 }
@@ -368,7 +379,6 @@ export function createPlanExecutorService(
   opts: PlanExecutorOptions,
 ): DaemonService {
   let timer: NodeJS.Timeout | null = null;
-  let lazyClient: AnthropicClient | null = null;
   const enabledApps = opts.enabledApps ?? DEFAULT_ENABLED_APPS;
   const tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
 
@@ -387,30 +397,26 @@ export function createPlanExecutorService(
         }
         tickInFlight = true;
         try {
-          // When a test-only tick body is injected, use it directly and skip
-          // the API-key check and client setup below.
+          // When a test-only tick body is injected, use it directly.
           if (opts._tickBody !== undefined) {
             await opts._tickBody(ctx);
             return;
           }
-          // Lazy-build the Anthropic client so the daemon can boot when the
-          // API key is missing — the auto-fire just won't have anything to do.
-          if (!process.env["ANTHROPIC_API_KEY"]) {
-            return;
-          }
-          if (!lazyClient) {
-            lazyClient = opts.buildAnthropicClient
-              ? opts.buildAnthropicClient()
-              : createAnthropicClient();
-          }
+          // Developer authenticates via the local `claude` CLI (~/.claude),
+          // not via an API key, so the daemon doesn't need to gate on
+          // ANTHROPIC_API_KEY any more. If `claude` isn't installed or
+          // authenticated, the SDK call inside Developer's runAgent will
+          // fail at fire time with a clear error.
           const tickInput: TickInput = {
             dataDir: opts.dataDir,
             enabledApps,
-            client: lazyClient,
             ctx,
           };
           if (opts.repoRoot !== undefined) {
             tickInput.repoRoot = opts.repoRoot;
+          }
+          if (opts.transport !== undefined) {
+            tickInput.transport = opts.transport;
           }
           const result = await runPlanExecutorTick(tickInput);
           if (result.fired.length > 0) {
@@ -443,7 +449,6 @@ export function createPlanExecutorService(
         clearInterval(timer);
         timer = null;
       }
-      lazyClient = null;
     },
   };
 }

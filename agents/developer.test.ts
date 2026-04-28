@@ -2,12 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type Anthropic from "@anthropic-ai/sdk";
 import type {
-  AnthropicClient,
-  ChatRequest,
-  ChatResponse,
-} from "../orchestrator/anthropic-client.ts";
+  RunAgentResolvedOptions,
+  RunAgentResult,
+  RunAgentTransport,
+} from "../orchestrator/agent-sdk-runtime.ts";
 import { dbFile, planDir } from "../cli/paths.ts";
 import {
   dropPlan,
@@ -82,44 +81,46 @@ See parent.
 Pause and amend if scope expands.
 </plan>`;
 
-interface ScriptedClient {
-  client: AnthropicClient;
-  calls: ChatRequest[];
+interface ScriptedTransport {
+  transport: RunAgentTransport;
+  calls: RunAgentResolvedOptions[];
 }
 
-function fixedTextResponse(text: string): ChatResponse {
+function fixedRunResult(
+  text: string,
+  overrides: Partial<RunAgentResult> = {},
+): RunAgentResult {
   return {
     text,
-    blocks: [
-      { type: "text", text, citations: null } as Anthropic.TextBlock,
-    ],
-    stopReason: "end_turn",
-    model: "claude-sonnet-4-6",
+    subtype: "success",
+    numTurns: 5,
+    durationMs: 1234,
+    totalCostUsd: 0,
     usage: {
       inputTokens: 100,
       outputTokens: 50,
       cachedInputTokens: 0,
       cacheCreationTokens: 0,
     },
-    redactions: [],
+    permissionDenials: 0,
+    errors: [],
+    model: "claude-sonnet-4-6",
+    stopReason: "end_turn",
+    ...overrides,
   };
 }
 
-function scriptedClient(responses: ChatResponse[]): ScriptedClient {
-  const calls: ChatRequest[] = [];
+function scriptedTransport(results: RunAgentResult[]): ScriptedTransport {
+  const calls: RunAgentResolvedOptions[] = [];
   let i = 0;
-  return {
-    calls,
-    client: {
-      async chat(req) {
-        calls.push(req);
-        if (i >= responses.length) {
-          throw new Error("Scripted client ran out of responses");
-        }
-        return responses[i++]!;
-      },
-    },
+  const transport: RunAgentTransport = async (resolved) => {
+    calls.push(resolved);
+    if (i >= results.length) {
+      throw new Error("Scripted transport ran out of results");
+    }
+    return results[i++]!;
   };
+  return { calls, transport };
 }
 
 describe("draftImplementationPlan", () => {
@@ -140,12 +141,12 @@ describe("draftImplementationPlan", () => {
     const parentId = "2026-04-27-add-status";
     dropPlan(sandbox, parentId, { status: "approved" });
 
-    const { client } = scriptedClient([
-      fixedTextResponse(VALID_IMPL_PLAN_BLOCK(parentId)),
+    const { transport } = scriptedTransport([
+      fixedRunResult(VALID_IMPL_PLAN_BLOCK(parentId)),
     ]);
 
     const result = await draftImplementationPlan({
-      client,
+      transport,
       parentPlanId: parentId,
       app: "jarvis",
       vault: "personal",
@@ -179,12 +180,12 @@ describe("draftImplementationPlan", () => {
   it("rejects when the parent plan is not approved", async () => {
     const parentId = "2026-04-27-pending";
     dropPlan(sandbox, parentId, { status: "draft" });
-    const { client } = scriptedClient([
-      fixedTextResponse(VALID_IMPL_PLAN_BLOCK(parentId)),
+    const { transport } = scriptedTransport([
+      fixedRunResult(VALID_IMPL_PLAN_BLOCK(parentId)),
     ]);
     await expect(
       draftImplementationPlan({
-        client,
+        transport,
         parentPlanId: parentId,
         app: "jarvis",
         vault: "personal",
@@ -196,10 +197,10 @@ describe("draftImplementationPlan", () => {
   it("rejects when no <plan> block is in the final response", async () => {
     const parentId = "2026-04-27-bad-output";
     dropPlan(sandbox, parentId, { status: "approved" });
-    const { client } = scriptedClient([fixedTextResponse("just chatter")]);
+    const { transport } = scriptedTransport([fixedRunResult("just chatter")]);
     await expect(
       draftImplementationPlan({
-        client,
+        transport,
         parentPlanId: parentId,
         app: "jarvis",
         vault: "personal",
@@ -212,12 +213,12 @@ describe("draftImplementationPlan", () => {
     const parentId = "2026-04-27-mismatch";
     dropPlan(sandbox, parentId, { status: "approved" });
     const wrongParent = "2099-01-01-other";
-    const { client } = scriptedClient([
-      fixedTextResponse(VALID_IMPL_PLAN_BLOCK(wrongParent)),
+    const { transport } = scriptedTransport([
+      fixedRunResult(VALID_IMPL_PLAN_BLOCK(wrongParent)),
     ]);
     await expect(
       draftImplementationPlan({
-        client,
+        transport,
         parentPlanId: parentId,
         app: "jarvis",
         vault: "personal",
@@ -234,12 +235,12 @@ describe("draftImplementationPlan", () => {
       path.join(planFolder, `${parentId}-impl.md`),
       "preexisting",
     );
-    const { client } = scriptedClient([
-      fixedTextResponse(VALID_IMPL_PLAN_BLOCK(parentId)),
+    const { transport } = scriptedTransport([
+      fixedRunResult(VALID_IMPL_PLAN_BLOCK(parentId)),
     ]);
     await expect(
       draftImplementationPlan({
-        client,
+        transport,
         parentPlanId: parentId,
         app: "jarvis",
         vault: "personal",
@@ -267,8 +268,8 @@ describe("executePlan", () => {
     const planId = "2026-04-27-execute";
     dropPlan(sandbox, planId, { status: "approved" });
 
-    const { client } = scriptedClient([
-      fixedTextResponse(
+    const { transport } = scriptedTransport([
+      fixedRunResult(
         [
           "DONE",
           "Branch: feat/2026-04-27-execute",
@@ -280,7 +281,7 @@ describe("executePlan", () => {
     ]);
 
     const result = await executePlan({
-      client,
+      transport,
       planId,
       app: "jarvis",
       vault: "personal",
@@ -314,8 +315,8 @@ describe("executePlan", () => {
   it("transitions to blocked on a BLOCKED final response", async () => {
     const planId = "2026-04-27-blocked";
     dropPlan(sandbox, planId, { status: "approved" });
-    const { client } = scriptedClient([
-      fixedTextResponse(
+    const { transport } = scriptedTransport([
+      fixedRunResult(
         [
           "BLOCKED: tests fail after 3 attempts",
           "Branch: feat/2026-04-27-blocked",
@@ -325,7 +326,7 @@ describe("executePlan", () => {
       ),
     ]);
     const result = await executePlan({
-      client,
+      transport,
       planId,
       app: "jarvis",
       vault: "personal",
@@ -342,10 +343,10 @@ describe("executePlan", () => {
   it("rejects when the plan is not in approved state", async () => {
     const planId = "2026-04-27-not-ready";
     dropPlan(sandbox, planId, { status: "draft" });
-    const { client } = scriptedClient([fixedTextResponse("DONE")]);
+    const { transport } = scriptedTransport([fixedRunResult("DONE")]);
     await expect(
       executePlan({
-        client,
+        transport,
         planId,
         app: "jarvis",
         vault: "personal",
@@ -355,10 +356,10 @@ describe("executePlan", () => {
   });
 
   it("rejects when the plan is not found", async () => {
-    const { client } = scriptedClient([fixedTextResponse("DONE")]);
+    const { transport } = scriptedTransport([fixedRunResult("DONE")]);
     await expect(
       executePlan({
-        client,
+        transport,
         planId: "missing",
         app: "jarvis",
         vault: "personal",
@@ -370,8 +371,8 @@ describe("executePlan", () => {
   it("ignores 'PR URL: not-opened-because-...' as no real URL", async () => {
     const planId = "2026-04-27-no-pr";
     dropPlan(sandbox, planId, { status: "approved" });
-    const { client } = scriptedClient([
-      fixedTextResponse(
+    const { transport } = scriptedTransport([
+      fixedRunResult(
         [
           "DONE",
           "Branch: feat/2026-04-27-no-pr",
@@ -381,7 +382,7 @@ describe("executePlan", () => {
       ),
     ]);
     const result = await executePlan({
-      client,
+      transport,
       planId,
       app: "jarvis",
       vault: "personal",
@@ -400,11 +401,11 @@ describe("executePlan", () => {
       parentPlan: parentId,
       status: "approved",
     });
-    const { client } = scriptedClient([
-      fixedTextResponse("DONE\nBranch: feat/x\nPR URL: https://x\nTests: pass"),
+    const { transport } = scriptedTransport([
+      fixedRunResult("DONE\nBranch: feat/x\nPR URL: https://x\nTests: pass"),
     ]);
     await executePlan({
-      client,
+      transport,
       planId: implId,
       app: "jarvis",
       vault: "personal",
@@ -426,11 +427,11 @@ describe("executePlan", () => {
       parentPlan: parentId,
       status: "approved",
     });
-    const { client } = scriptedClient([
-      fixedTextResponse("BLOCKED: tests fail\nBranch: none\nTests: fail"),
+    const { transport } = scriptedTransport([
+      fixedRunResult("BLOCKED: tests fail\nBranch: none\nTests: fail"),
     ]);
     await executePlan({
-      client,
+      transport,
       planId: implId,
       app: "jarvis",
       vault: "personal",
@@ -450,11 +451,11 @@ describe("executePlan", () => {
       parentPlan: parentId,
       status: "approved",
     });
-    const { client } = scriptedClient([
-      fixedTextResponse("DONE\nBranch: x\nPR URL: y\nTests: pass"),
+    const { transport } = scriptedTransport([
+      fixedRunResult("DONE\nBranch: x\nPR URL: y\nTests: pass"),
     ]);
     await executePlan({
-      client,
+      transport,
       planId: implId,
       app: "jarvis",
       vault: "personal",
