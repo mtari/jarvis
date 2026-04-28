@@ -91,6 +91,7 @@ If genuinely ambiguous, ask in `<clarify>`.
 ## Hard rules
 
 - The plan parses through the Zod schema. Use exactly the keys above; nothing more, nothing less.
+- **Every front-matter line is mandatory** in the order shown: `Type`, `Subtype`, `App`, `Priority`, `Destructive`, `Status`, `Author`, `Confidence`. Skipping any field, including `Confidence`, makes the plan unparseable. `Confidence` MUST be on every plan; format it as `Confidence: 70` or `Confidence: 70 — short rationale`.
 - `Type: marketing` always. `Status: draft` always. `Author: strategist` always.
 - `Destructive: false` always.
 - For `campaign`: write the EXACT post text inside `## Content calendar`. Don't write descriptions like "post about feature X" — write what the post actually says. Marketer publishes whatever's in this section verbatim (after the humanizer pass per §13).

@@ -73,6 +73,7 @@ Limit to **1–3 questions per round, ≤ 3 rounds total**. After round 3 you mu
 ## Hard rules
 
 - The plan parses through the Zod schema in `orchestrator/plan.ts`. Use the exact keys above; nothing more, nothing less.
+- **Every front-matter line is mandatory** in the order shown: `Type`, `Subtype`, `ImplementationReview`, `App`, `Priority`, `Destructive`, `Status`, `Author`, `Confidence`. Skipping any field, including `Confidence`, makes the plan unparseable. `Confidence` MUST be on every plan; format it as `Confidence: 70` or `Confidence: 70 — short rationale`.
 - `Status: draft` always. `Author: strategist` always.
 - Title under `# Plan:` is short (≤ 60 chars), human-readable, and unique-ish for that day. Filename will be derived from it.
 - Subtype must be a valid improvement subtype. Use `new-feature` for additions, `rework` for replacing existing behavior, `meta` for system-level updates (brain/profile/prompt tweaks), `bugfix` for explicit defects.

@@ -79,6 +79,7 @@ Limit to **1–3 questions per round, ≤ 3 rounds total**. After round 3 you mu
 ## Hard rules
 
 - The plan parses through the Zod schema. Use exactly the keys above; nothing more, nothing less.
+- **Every front-matter line is mandatory** in the order shown: `Type`, `App`, `Priority`, `Destructive`, `Status`, `Author`, `Confidence`. Skipping any field, including `Confidence`, makes the plan unparseable. `Confidence` MUST be on every plan; format it as `Confidence: 70` or `Confidence: 70 — short rationale`.
 - `Type: business` always. `Status: draft` always. `Author: strategist` always.
 - `Destructive: false` — business plans don't introduce destructive code ops; they're strategic direction.
 - Title under `# Plan:` is short (≤ 60 chars), human-readable, and business-flavored (e.g., "Q2 2026 — refocus on returning customers").

@@ -13,6 +13,7 @@ import {
 import { runAgentLoop, type AgentToolCall } from "../orchestrator/tool-loop.ts";
 import { dbFile, planDir, repoRoot as defaultRepoRoot } from "../cli/paths.ts";
 import { createDeveloperTools } from "../tools/developer-tools.ts";
+import { dumpFailedDraft } from "./strategist.ts";
 
 export class DeveloperError extends Error {
   constructor(message: string) {
@@ -102,8 +103,10 @@ export async function draftImplementationPlan(
   try {
     plan = parsePlan(planMatch[1].trim());
   } catch (err) {
+    const dumpPath = dumpFailedDraft(input.dataDir, planMatch[1].trim());
     throw new DeveloperError(
-      `implementation plan failed schema validation: ${err instanceof Error ? err.message : String(err)}`,
+      `implementation plan failed schema validation: ${err instanceof Error ? err.message : String(err)}` +
+        (dumpPath ? `\n  Raw draft saved at ${dumpPath}` : ""),
     );
   }
   if (plan.metadata.type !== "implementation") {

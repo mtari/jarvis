@@ -202,8 +202,10 @@ async function persistDraft(
   try {
     plan = parsePlan(args.markdown);
   } catch (err) {
+    const dumpPath = dumpFailedDraft(args.input.dataDir, args.markdown);
     throw new StrategistError(
-      `Strategist's draft failed schema validation: ${err instanceof Error ? err.message : String(err)}`,
+      `Strategist's draft failed schema validation: ${err instanceof Error ? err.message : String(err)}` +
+        (dumpPath ? `\n  Raw draft saved at ${dumpPath}` : ""),
     );
   }
   if (plan.metadata.status !== "draft") {
@@ -355,6 +357,27 @@ export function generatePlanId(
     counter += 1;
   }
   return candidate;
+}
+
+/**
+ * Dumps a Strategist or Developer draft that failed Zod parsing into the
+ * shared sandbox dir so the user (or the next agent) can see what the model
+ * actually emitted. Returns the path on success, null on best-effort failure.
+ */
+export function dumpFailedDraft(
+  dataDir: string,
+  markdown: string,
+): string | null {
+  try {
+    const dir = path.join(dataDir, "sandbox");
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const file = path.join(dir, `strategist-failed-${stamp}.md`);
+    fs.writeFileSync(file, markdown);
+    return file;
+  } catch {
+    return null;
+  }
 }
 
 const cachedPrompts: Partial<Record<StrategistPlanType, string>> = {};
@@ -568,8 +591,10 @@ export async function redraftPlan(
   try {
     plan = parsePlan(action.markdown);
   } catch (err) {
+    const dumpPath = dumpFailedDraft(input.dataDir, action.markdown);
     throw new StrategistError(
-      `redrafted plan failed schema validation: ${err instanceof Error ? err.message : String(err)}`,
+      `redrafted plan failed schema validation: ${err instanceof Error ? err.message : String(err)}` +
+        (dumpPath ? `\n  Raw draft saved at ${dumpPath}` : ""),
     );
   }
   if (plan.metadata.type !== planType) {

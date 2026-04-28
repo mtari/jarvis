@@ -78,6 +78,7 @@ See parent's `## Rollback`. Add implementation-specific revert steps if any.
 ## Hard rules
 
 - The plan parses through the Zod schema. Use exactly the keys above; nothing more, nothing less.
+- **Every front-matter line is mandatory** in the order shown: `Type`, `ParentPlan`, `App`, `Priority`, `Destructive`, `Status`, `Author`, `Confidence`. Skipping any field, including `Confidence`, makes the plan unparseable. `Confidence` MUST be on every plan; format it as `Confidence: 70` or `Confidence: 70 — short rationale`.
 - `Type: implementation` always. `Status: draft` always. `Author: developer` always.
 - `ParentPlan` MUST equal the parent id given in context.
 - `Destructive: true` only if the plan introduces an irreversible op (DB drop, force-push, license change). Otherwise `false`.
