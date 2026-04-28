@@ -1,5 +1,4 @@
 import type { App as BoltApp } from "@slack/bolt";
-import Anthropic from "@anthropic-ai/sdk";
 import {
   redraftPlan,
   runStrategist,
@@ -7,7 +6,7 @@ import {
   isStrategistPlanType,
   type StrategistPlanType,
 } from "../../agents/strategist.ts";
-import type { AnthropicClient } from "../../orchestrator/anthropic-client.ts";
+import type { AgentRuntimeFactoryResult } from "../../orchestrator/agent-sdk-runtime.ts";
 import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import {
   approvePlan,
@@ -22,8 +21,13 @@ import { surfacePlan, updateSurfacedPlan, type SurfaceContext } from "./surface.
 export interface HandlerContext {
   dataDir: string;
   surfaceCtx: SurfaceContext;
-  /** Lazy: returns an Anthropic client when needed (slash commands, revise auto-redraft). */
-  getAnthropicClient: () => AnthropicClient;
+  /**
+   * Lazy: returns the configured agent runtime (client + mode) when needed
+   * for Strategist work (slash commands, revise auto-redraft). The mode is
+   * recorded on `agent-call` events so cost reports can distinguish API vs
+   * subscription-mode rows. See §18.
+   */
+  getAgentRuntime: () => AgentRuntimeFactoryResult;
   log: (message: string, meta?: Record<string, unknown>) => void;
   logError: (message: string, error?: unknown, meta?: Record<string, unknown>) => void;
 }
@@ -124,12 +128,13 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
     }
 
     // Auto-redraft via Strategist
-    const baseClient = ctx.getAnthropicClient();
-    const recorder = buildAgentCallRecorder(baseClient, dbFile(ctx.dataDir), {
+    const runtime = ctx.getAgentRuntime();
+    const recorder = buildAgentCallRecorder(runtime.client, dbFile(ctx.dataDir), {
       app: reviseResult.record.app,
       vault: reviseResult.record.vault,
       agent: "strategist",
       planId,
+      mode: runtime.mode,
     });
     try {
       await redraftPlan({
@@ -153,11 +158,9 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       const message =
         err instanceof StrategistError
           ? err.message
-          : err instanceof Anthropic.APIError
-            ? `Anthropic API error: ${err.message}`
-            : err instanceof Error
-              ? err.message
-              : String(err);
+          : err instanceof Error
+            ? err.message
+            : String(err);
       ctx.logError("redraft via slack failed", err, { planId });
       await postDmOrEphemeral(
         client,
@@ -232,12 +235,13 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       text: `📝 Strategist drafting plan for *${app}*…`,
     });
 
-    const baseClient = ctx.getAnthropicClient();
+    const runtime = ctx.getAgentRuntime();
     // No planId yet — we don't have it until Strategist returns
-    const recorder = buildAgentCallRecorder(baseClient, dbFile(ctx.dataDir), {
+    const recorder = buildAgentCallRecorder(runtime.client, dbFile(ctx.dataDir), {
       app,
       vault: "personal",
       agent: "strategist",
+      mode: runtime.mode,
     });
 
     try {
@@ -266,11 +270,9 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       const message =
         err instanceof StrategistError
           ? err.message
-          : err instanceof Anthropic.APIError
-            ? `Anthropic API error (status ${err.status ?? "?"}): ${err.message}`
-            : err instanceof Error
-              ? err.message
-              : String(err);
+          : err instanceof Error
+            ? err.message
+            : String(err);
       ctx.logError("/jarvis plan failed", err, { app, brief });
       await respond({
         response_type: "ephemeral",

@@ -135,9 +135,11 @@ describe("runPlan", () => {
     expect(code).toBe(1);
   });
 
-  it("returns 1 when ANTHROPIC_API_KEY is missing and no client is injected", async () => {
-    const previous = process.env["ANTHROPIC_API_KEY"];
+  it("returns 1 when JARVIS_AGENT_RUNTIME=api but ANTHROPIC_API_KEY is missing and no client is injected", async () => {
+    const previousKey = process.env["ANTHROPIC_API_KEY"];
+    const previousRuntime = process.env["JARVIS_AGENT_RUNTIME"];
     delete process.env["ANTHROPIC_API_KEY"];
+    process.env["JARVIS_AGENT_RUNTIME"] = "api";
     try {
       const code = await runPlan([
         "--app",
@@ -146,7 +148,12 @@ describe("runPlan", () => {
       ]);
       expect(code).toBe(1);
     } finally {
-      if (previous !== undefined) process.env["ANTHROPIC_API_KEY"] = previous;
+      if (previousKey !== undefined) process.env["ANTHROPIC_API_KEY"] = previousKey;
+      if (previousRuntime !== undefined) {
+        process.env["JARVIS_AGENT_RUNTIME"] = previousRuntime;
+      } else {
+        delete process.env["JARVIS_AGENT_RUNTIME"];
+      }
     }
   });
 
@@ -156,47 +163,6 @@ describe("runPlan", () => {
       { client: makeFixedClient(PLAN_BLOCK), prompter: noopPrompter },
     );
     expect(code).toBe(0);
-  });
-
-  it("returns 1 with a clean message on Anthropic API errors (e.g., billing)", async () => {
-    const failingClient: AnthropicClient = {
-      async chat() {
-        throw new Anthropic.APIError(
-          402,
-          {
-            error: {
-              type: "invalid_request_error",
-              message: "Your credit balance is too low to access the Anthropic API.",
-            },
-          },
-          "Your credit balance is too low to access the Anthropic API.",
-          new Headers(),
-        );
-      },
-    };
-    const code = await runPlan(
-      ["--app", "jarvis", "Add a status command"],
-      { client: failingClient, prompter: noopPrompter },
-    );
-    expect(code).toBe(1);
-  });
-
-  it("returns 1 + auth-error hint on 401/403", async () => {
-    const authFailing: AnthropicClient = {
-      async chat() {
-        throw new Anthropic.APIError(
-          401,
-          { error: { type: "authentication_error", message: "invalid x-api-key" } },
-          "invalid x-api-key",
-          new Headers(),
-        );
-      },
-    };
-    const code = await runPlan(
-      ["--app", "jarvis", "Add a status command"],
-      { client: authFailing, prompter: noopPrompter },
-    );
-    expect(code).toBe(1);
   });
 
   it("re-throws unknown errors so programming bugs aren't swallowed", async () => {

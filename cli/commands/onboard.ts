@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import Anthropic from "@anthropic-ai/sdk";
 import Database from "better-sqlite3";
 import {
   OnboardError,
@@ -9,10 +8,8 @@ import {
   type AbsorbedDoc,
   type CachedDocSummary,
 } from "../../agents/onboard.ts";
-import {
-  createAnthropicClient,
-  type AnthropicClient,
-} from "../../orchestrator/anthropic-client.ts";
+import { createAgentRuntime } from "../../orchestrator/agent-sdk-runtime.ts";
+import { type AnthropicClient } from "../../orchestrator/anthropic-client.ts";
 import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import { saveBrain } from "../../orchestrator/brain.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
@@ -116,12 +113,6 @@ export async function runOnboard(
   }
 
   loadEnvFile(envFile(dataDir));
-  if (!deps.client && !process.env["ANTHROPIC_API_KEY"]) {
-    console.error(
-      `onboard: ANTHROPIC_API_KEY is not set. Edit ${envFile(dataDir)} and try again.`,
-    );
-    return 1;
-  }
 
   // Load docs
   const docsArgs: DocsArgs = {
@@ -161,11 +152,30 @@ export async function runOnboard(
     return 1;
   }
 
-  const baseClient = deps.client ?? createAnthropicClient();
+  let baseClient: AnthropicClient;
+  let mode: "api" | "subscription";
+  if (deps.client) {
+    baseClient = deps.client;
+    mode = "subscription";
+  } else {
+    const runtime = createAgentRuntime();
+    if (
+      runtime.mode === "api" &&
+      !process.env["ANTHROPIC_API_KEY"]
+    ) {
+      console.error(
+        `onboard: JARVIS_AGENT_RUNTIME=api but ANTHROPIC_API_KEY is not set. Edit ${envFile(dataDir)} or unset JARVIS_AGENT_RUNTIME to use the Claude Code subscription.`,
+      );
+      return 1;
+    }
+    baseClient = runtime.client;
+    mode = runtime.mode;
+  }
   const recorder = buildAgentCallRecorder(baseClient, dbFile(dataDir), {
     app,
     vault,
     agent: "strategist",
+    mode,
   });
 
   console.log(`Onboarding ${app} from ${repoRoot.path}…`);
@@ -187,15 +197,6 @@ export async function runOnboard(
     recorder.flush();
     if (err instanceof OnboardError) {
       console.error(`onboard: ${err.message}`);
-      return 1;
-    }
-    if (err instanceof Anthropic.APIError) {
-      console.error(
-        `onboard: Anthropic API error (status ${err.status ?? "?"}): ${err.message}`,
-      );
-      if (err.status === 401 || err.status === 403) {
-        console.error(`onboard: check ANTHROPIC_API_KEY in ${envFile(dataDir)}.`);
-      }
       return 1;
     }
     throw err;

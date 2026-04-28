@@ -1,9 +1,10 @@
 import { App as BoltApp, LogLevel } from "@slack/bolt";
 import { WebClient } from "@slack/web-api";
 import {
-  createAnthropicClient,
-  type AnthropicClient,
-} from "../../orchestrator/anthropic-client.ts";
+  createAgentRuntime,
+  type AgentRuntimeFactoryResult,
+} from "../../orchestrator/agent-sdk-runtime.ts";
+import { type AnthropicClient } from "../../orchestrator/anthropic-client.ts";
 import type { DaemonContext, DaemonService } from "../../cli/commands/daemon.ts";
 import {
   resolveChannels,
@@ -37,7 +38,7 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
   let webClient: WebClient | null = null;
   let channels: ResolvedChannels | null = null;
   let surfaceTimer: NodeJS.Timeout | null = null;
-  let lazyAnthropic: AnthropicClient | null = null;
+  let lazyRuntime: AgentRuntimeFactoryResult | null = null;
 
   const surfaceCtxFor = (): SurfaceContext => {
     if (!channels) throw new Error("Slack channels not resolved yet");
@@ -86,13 +87,20 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
       registerHandlers(app, {
         dataDir: opts.dataDir,
         surfaceCtx: surfaceCtxFor(),
-        getAnthropicClient: () => {
-          if (!lazyAnthropic) {
-            lazyAnthropic = opts.buildAnthropicClient
-              ? opts.buildAnthropicClient()
-              : createAnthropicClient();
+        getAgentRuntime: () => {
+          if (!lazyRuntime) {
+            if (opts.buildAnthropicClient) {
+              // Test injection — caller controls the client; mode defaults
+              // to 'subscription' so new tests don't see legacy 'api' rows.
+              lazyRuntime = {
+                client: opts.buildAnthropicClient(),
+                mode: "subscription",
+              };
+            } else {
+              lazyRuntime = createAgentRuntime();
+            }
           }
-          return lazyAnthropic;
+          return lazyRuntime;
         },
         log: (message, meta) => ctx.logger.info(message, meta),
         logError: (message, error, meta) =>
@@ -141,7 +149,7 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
       }
       webClient = null;
       channels = null;
-      lazyAnthropic = null;
+      lazyRuntime = null;
     },
   };
 }
