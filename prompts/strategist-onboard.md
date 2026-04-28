@@ -59,8 +59,22 @@ That's it — no markdown text outside the tags, no comments inside the JSON, no
   ```
   { "commitStyle": "conventional", "testing": "vitest", "ciProvider": "github-actions" }
   ```
+- `scope`: **what the app does** at the use-case level. Three sub-arrays — leave any out if there's no evidence:
+  ```
+  {
+    "userTypes": ["primary user persona descriptions"],
+    "primaryFlows": ["one-line summaries of the main user journeys / capabilities"],
+    "domainRules": ["constraints, business rules, scope limits, opinionated decisions"]
+  }
+  ```
+  Aim for 3–10 entries per sub-array. Each entry is one short sentence — terse enough that a future plan-drafting prompt can cite it without bloating context.
+- `features`: optional flat list of distinct features / capabilities, e.g.,
+  ```
+  ["advanced filter UI with 16 criteria", "Mapbox map view with cluster markers", "magic-link auth via Postmark"]
+  ```
+  Use this when a flat list is more useful than the structured `scope.primaryFlows` (e.g., a long inventory). When in doubt, prefer `scope` and skip `features`.
 
-Skip any optional field you can't ground in evidence. Better to omit than to invent.
+Skip any optional field you can't ground in evidence. Better to omit than to invent. **If absorbed docs describe what the app does, populate `scope` from them — that's the whole point of the absorption.**
 
 ## Hard rules
 

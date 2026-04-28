@@ -555,6 +555,12 @@ Contains:
   "stack": { ... },
   "brand": { ... },
   "conventions": { ... },
+  "scope": {
+    "userTypes": ["primary user persona descriptions"],
+    "primaryFlows": ["one-line summaries of the main user journeys / capabilities"],
+    "domainRules": ["constraints, business rules, scope limits, opinionated decisions"]
+  },
+  "features": ["distinct feature / capability strings (optional flat list)"],
   "userPreferences": {
     "voiceOverrides": ["Hungarian informal (tegező) for wedding-planner copy"],
     "areasOfInterest": ["bookings", "SEO"],

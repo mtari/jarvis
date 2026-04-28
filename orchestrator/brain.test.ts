@@ -26,6 +26,39 @@ describe("brain schema", () => {
     expect(() => brainSchema.parse({ schemaVersion: 1 })).toThrow();
   });
 
+  it("accepts an optional scope with sub-arrays and a features list", () => {
+    const parsed = brainSchema.parse({
+      ...minimalJarvisBrain,
+      scope: {
+        userTypes: ["solo founders", "operators"],
+        primaryFlows: ["draft a plan", "approve via Slack"],
+        domainRules: ["no destructive ops without confirmation"],
+      },
+      features: ["plan-review Slack surface", "auto-fire Developer"],
+    });
+    expect(parsed.scope?.userTypes).toEqual(["solo founders", "operators"]);
+    expect(parsed.scope?.primaryFlows).toHaveLength(2);
+    expect(parsed.features).toHaveLength(2);
+  });
+
+  it("rejects scope with non-string entries", () => {
+    expect(() =>
+      brainSchema.parse({
+        ...minimalJarvisBrain,
+        scope: { userTypes: [42, "ok"] },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects features with non-string entries", () => {
+    expect(() =>
+      brainSchema.parse({
+        ...minimalJarvisBrain,
+        features: [{ name: "x" }],
+      }),
+    ).toThrow();
+  });
+
   it("rejects an unknown projectType", () => {
     expect(() =>
       brainSchema.parse({ ...minimalJarvisBrain, projectType: "robot" }),

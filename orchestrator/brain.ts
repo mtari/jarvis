@@ -32,6 +32,12 @@ const wipSchema = z.object({
 
 const looseObjectSchema = z.record(z.string(), z.unknown());
 
+const scopeSchema = z.object({
+  userTypes: z.array(z.string()).optional(),
+  primaryFlows: z.array(z.string()).optional(),
+  domainRules: z.array(z.string()).optional(),
+});
+
 export const brainSchema = z.object({
   schemaVersion: z.literal(1),
   projectName: z.string().min(1),
@@ -42,6 +48,8 @@ export const brainSchema = z.object({
   stack: looseObjectSchema.optional(),
   brand: looseObjectSchema.optional(),
   conventions: looseObjectSchema.optional(),
+  scope: scopeSchema.optional(),
+  features: z.array(z.string()).optional(),
   userPreferences: userPreferencesSchema.default({}),
   connections: z.record(z.string(), looseObjectSchema).default({}),
   priorities: z.array(prioritySchema).default([]),
