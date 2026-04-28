@@ -45,6 +45,7 @@ export async function runCost(rawArgs: string[]): Promise<number> {
         cap: { type: "string" },
         "warn-at": { type: "string" },
         format: { type: "string" },
+        "by-day": { type: "boolean" },
       },
       allowPositionals: false,
     });
@@ -71,16 +72,17 @@ export async function runCost(rawArgs: string[]): Promise<number> {
     console.error(`cost: invalid --format "${format}" (expected table or json)`);
     return 1;
   }
+  const byDay = v["by-day"] === true;
 
   const dataDir = getDataDir();
   const calls = readMonthCalls(dbFile(dataDir));
 
   if (format === "json") {
-    console.log(JSON.stringify(buildJsonReport(calls, cap, warnRatio), null, 2));
+    console.log(JSON.stringify(buildJsonReport(calls, cap, warnRatio, byDay), null, 2));
     return 0;
   }
 
-  console.log(formatTableReport(calls, cap, warnRatio));
+  console.log(formatTableReport(calls, cap, warnRatio, byDay));
   return 0;
 }
 
@@ -147,13 +149,41 @@ function aggregateBy(
   return [...map.values()].sort((a, b) => b.totalUsd - a.totalUsd);
 }
 
+interface DayRow {
+  date: string;
+  calls: number;
+  totalUsd: number;
+}
+
+/**
+ * Buckets calls by UTC calendar day (YYYY-MM-DD) derived from the ISO
+ * `createdAt` field, sums cost per bucket, and returns rows sorted ascending
+ * by date. Days with no spend are omitted.
+ */
+function groupByCostDay(calls: AgentCallParsed[]): DayRow[] {
+  const map = new Map<string, DayRow>();
+  for (const c of calls) {
+    const date = c.createdAt.slice(0, 10); // "YYYY-MM-DD" from ISO string
+    const cost = costForCall(c);
+    const existing = map.get(date);
+    if (existing) {
+      existing.calls += 1;
+      existing.totalUsd += cost;
+    } else {
+      map.set(date, { date, calls: 1, totalUsd: cost });
+    }
+  }
+  return [...map.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
 function buildJsonReport(
   calls: AgentCallParsed[],
   cap: number,
   warnRatio: number,
+  byDay: boolean,
 ): Record<string, unknown> {
   const total = calls.reduce((acc, c) => acc + costForCall(c), 0);
-  return {
+  const report: Record<string, unknown> = {
     month: new Date().toISOString().slice(0, 7),
     totalCalls: calls.length,
     totalUsd: round2(total),
@@ -166,6 +196,14 @@ function buildJsonReport(
     byPlan: aggregateBy(calls, (c) => c.planId ?? "<no-plan>").map(toJsonRow),
     byModel: aggregateBy(calls, (c) => c.model).map(toJsonRow),
   };
+  if (byDay) {
+    report["byDay"] = groupByCostDay(calls).map((r) => ({
+      date: r.date,
+      calls: r.calls,
+      totalUsd: round2(r.totalUsd),
+    }));
+  }
+  return report;
 }
 
 function toJsonRow(row: AggregateRow): {
@@ -188,6 +226,7 @@ function formatTableReport(
   calls: AgentCallParsed[],
   cap: number,
   warnRatio: number,
+  byDay: boolean,
 ): string {
   if (calls.length === 0) {
     return "No agent calls recorded this month yet.";
@@ -238,6 +277,14 @@ function formatTableReport(
     );
   }
 
+  if (byDay) {
+    lines.push("");
+    lines.push("By day:");
+    for (const row of groupByCostDay(calls)) {
+      lines.push(formatDayRow(row));
+    }
+  }
+
   return lines.join("\n");
 }
 
@@ -245,6 +292,10 @@ function formatAggRow(row: AggregateRow, total: number): string {
   const sharePct =
     total > 0 ? ` (${((row.totalUsd / total) * 100).toFixed(1)}%)` : "";
   return `  ${row.key.padEnd(36)}  ${row.calls.toString().padStart(4)} calls  ${formatUsd(row.totalUsd).padStart(8)}${sharePct}`;
+}
+
+function formatDayRow(row: DayRow): string {
+  return `  ${row.date}  ${row.calls.toString().padStart(4)} calls  ${formatUsd(row.totalUsd).padStart(8)}`;
 }
 
 function formatMonth(d: Date): string {
