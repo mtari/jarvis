@@ -329,3 +329,29 @@ function loadDeveloperPrompt(filename: string): string {
   promptCache[filename] = fs.readFileSync(promptPath, "utf8");
   return promptCache[filename]!;
 }
+
+// ---------- Mode detection (shared by CLI runRun + daemon plan-executor) ----------
+
+export type DeveloperMode = "draft-impl" | "execute";
+
+/**
+ * Returns the Developer mode for a plan, or null if Developer doesn't apply.
+ * Matches §4: improvement + ImplementationReview required (or auto-resolved-
+ * to-required on new-feature/rework subtypes) → draft impl plan.
+ * implementation type or improvement with skip → execute. Anything else →
+ * null (e.g., business plans, marketing plans, or plans not in approved
+ * state).
+ */
+export function detectDeveloperMode(plan: Plan): DeveloperMode | null {
+  if (plan.metadata.status !== "approved") return null;
+  if (plan.metadata.type === "implementation") return "execute";
+  if (plan.metadata.type !== "improvement") return null;
+
+  const subtype = plan.metadata.subtype;
+  const review = plan.metadata.implementationReview ?? "auto";
+  if (review === "required") return "draft-impl";
+  if (review === "skip") return "execute";
+  // auto
+  if (subtype === "new-feature" || subtype === "rework") return "draft-impl";
+  return "execute";
+}

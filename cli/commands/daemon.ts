@@ -10,6 +10,7 @@ import {
   type PidFileData,
 } from "../../orchestrator/daemon-pid.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
+import { createPlanExecutorService } from "../../integrations/plan-executor/service.ts";
 import {
   createSlackService,
   readSlackEnv,
@@ -186,7 +187,10 @@ export async function runDaemon(rawArgs: string[]): Promise<number> {
  * in jarvis-data/.env.
  */
 function defaultServices(dataDir: string): DaemonService[] {
-  const services: DaemonService[] = [createHeartbeatService()];
+  const services: DaemonService[] = [
+    createHeartbeatService(),
+    createPlanExecutorService({ dataDir }),
+  ];
   const slackConfig = readSlackEnv();
   if (slackConfig) {
     services.push(

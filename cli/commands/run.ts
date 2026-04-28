@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import {
+  detectDeveloperMode,
   draftImplementationPlan,
   DeveloperError,
   executePlan,
@@ -8,29 +9,12 @@ import { createAnthropicClient } from "../../orchestrator/anthropic-client.ts";
 import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
-import type { Plan } from "../../orchestrator/plan.ts";
 import { dbFile, envFile, getDataDir } from "../paths.ts";
+
+export { detectDeveloperMode };
 
 export interface RunCommandDeps {
   client?: ReturnType<typeof createAnthropicClient>;
-}
-
-type DeveloperMode = "draft-impl" | "execute";
-
-export function detectDeveloperMode(plan: Plan): DeveloperMode | null {
-  if (plan.metadata.status !== "approved") return null;
-  if (plan.metadata.type === "implementation") return "execute";
-  if (plan.metadata.type !== "improvement") return null;
-
-  const subtype = plan.metadata.subtype;
-  const review = plan.metadata.implementationReview ?? "auto";
-
-  if (review === "required") return "draft-impl";
-  if (review === "skip") return "execute";
-
-  // auto
-  if (subtype === "new-feature" || subtype === "rework") return "draft-impl";
-  return "execute";
 }
 
 export async function runRun(

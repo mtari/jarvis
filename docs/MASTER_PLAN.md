@@ -1201,7 +1201,7 @@ Once the code-repo structure is in place, write `jarvis/CLAUDE.md` (the repo-lev
 
 **Build order (locked):**
 
-1. **Daemon + checkpointing** (§6). Long-running local process (`yarn jarvis daemon`) Slack Socket Mode needs. Resumes in-flight plans from `jarvis-data/logs/checkpoints/`.
+1. **Daemon + checkpointing** (§6). Long-running local process (`yarn jarvis daemon`) Slack Socket Mode needs. Resumes in-flight plans from `jarvis-data/logs/checkpoints/`. The daemon also runs a **plan-executor** service that auto-fires Developer on approved plans for the `jarvis` app (Mode A drafts the impl plan; Mode B branches/codes/PRs). Mid-execution amendment + escalation still defer to Phase 2.
 2. **Strategist extensions.** Drafts business plans and marketing plans (subtypes `campaign` and `single-post`; format-aware: post / blog / video-script / newsletter). Improvement plan drafting from Phase 0 unchanged.
 3. **Backlog management** (§5). `yarn jarvis backlog --app <name>`, `yarn jarvis reprioritize`, the 3-improvement-plan cap rule + meta-queue split.
 4. **Revision loops** (§4). `revise <id> "<feedback>"` actually re-runs Strategist with the feedback in context — the plan flips awaiting-review → draft → awaiting-review with new content addressing the feedback. Bounded at 3 revisions; the 4th attempt refuses with an escalation message. Amendment flow + escalate-within-plan (§12) defer to Phase 2 — they need daemon-driven background execution to pause/resume plans, which lands alongside Analyst's signal collectors.
@@ -1217,7 +1217,7 @@ Once the code-repo structure is in place, write `jarvis/CLAUDE.md` (the repo-lev
 **Exit:** `erdei-fahazak` is onboarded as the first real app, plans of all three types flow through Slack plan-review, and at least one real-project plan has shipped to main.
 
 ### Phase 2 — Analyst + Scout (Week 5–6)
-- **Daemon-driven plan execution + checkpoint resume.** The Phase 1 daemon foundation (M1) gets the runtime that picks up approved plans, runs Developer/Marketer in the background, and pauses on amendment/escalation. Enables the §12 mid-execution amendment flow + escalate-within-plan that Phase 1 deferred (revision loops shipped in Phase 1).
+- **Mid-execution amendment + escalate-within-plan.** Phase 1 already auto-fires Developer on approved jarvis-app plans (one-shot). Phase 2 adds the §12 amendment flow + escalate-within-plan: executors pause on a trigger, surface a proposal in `#jarvis-inbox`, and resume from the checkpoint after user review. Marketer joins the executor pool here too (alongside Phase 3's Marketer agent build).
 - **Analyst:** signal collectors (metrics, yarn audit, broken links first), event log + filter → trigger logic, post-merge observation
 - **Umami install** (deferred from Phase 1) — deploy Umami to Vercel, schema on Supabase Postgres, script tag on `erdei-fahazak` first, then other onboarded apps. Baseline accrues for 2–4 weeks; Analyst reads via the Umami programmatic API.
 - **Scout:** research tool (search API mock first), idea scoring for Business_Ideas.md, weekly portfolio triage
