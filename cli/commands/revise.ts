@@ -1,17 +1,17 @@
 import { parseArgs } from "node:util";
-import Anthropic from "@anthropic-ai/sdk";
 import {
   redraftPlan,
   StrategistError,
 } from "../../agents/strategist.ts";
-import { createAnthropicClient } from "../../orchestrator/anthropic-client.ts";
+import type { AnthropicClient } from "../../orchestrator/anthropic-client.ts";
+import { createAgentRuntime } from "../../orchestrator/agent-sdk-runtime.ts";
 import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import { revisePlan, REVISE_CAP } from "../../orchestrator/plan-lifecycle.ts";
 import { dbFile, envFile, getDataDir } from "../paths.ts";
 
 export interface ReviseCommandDeps {
-  client?: ReturnType<typeof createAnthropicClient>;
+  client?: AnthropicClient;
 }
 
 export async function runRevise(
@@ -71,26 +71,38 @@ export async function runRevise(
     return 1;
   }
 
-  // Auto-redraft via Strategist. Falls back gracefully when no API key
-  // is configured: the plan stays in 'draft' and the user gets a clear
-  // recovery path.
+  // Auto-redraft via Strategist. Falls back gracefully when the configured
+  // runtime is unavailable: the plan stays in 'draft' and the user gets a
+  // clear recovery path.
   loadEnvFile(envFile(dataDir));
-  if (!deps.client && !process.env["ANTHROPIC_API_KEY"]) {
-    console.log(
-      `✓ Plan ${planId} sent back to draft with feedback (round ${result.priorRevisions + 1}/${REVISE_CAP}).`,
-    );
-    console.log(
-      `⚠ ANTHROPIC_API_KEY not set — auto-redraft skipped. Set it in ${envFile(dataDir)} or edit ${result.record.path} manually.`,
-    );
-    return 0;
+  let baseClient: AnthropicClient;
+  let mode: "api" | "subscription";
+  if (deps.client) {
+    baseClient = deps.client;
+    mode = "subscription";
+  } else {
+    const runtime = createAgentRuntime();
+    if (
+      runtime.mode === "api" &&
+      !process.env["ANTHROPIC_API_KEY"]
+    ) {
+      console.log(
+        `✓ Plan ${planId} sent back to draft with feedback (round ${result.priorRevisions + 1}/${REVISE_CAP}).`,
+      );
+      console.log(
+        `⚠ JARVIS_AGENT_RUNTIME=api but ANTHROPIC_API_KEY not set — auto-redraft skipped. Edit ${envFile(dataDir)}, unset JARVIS_AGENT_RUNTIME, or edit ${result.record.path} manually.`,
+      );
+      return 0;
+    }
+    baseClient = runtime.client;
+    mode = runtime.mode;
   }
-
-  const baseClient = deps.client ?? createAnthropicClient();
   const recorder = buildAgentCallRecorder(baseClient, dbFile(dataDir), {
     app: result.record.app,
     vault: result.record.vault,
     agent: "strategist",
     planId,
+    mode,
   });
   console.log(
     `✓ Plan ${planId} sent back to draft (round ${result.priorRevisions + 1}/${REVISE_CAP}). Strategist redrafting…`,
@@ -113,16 +125,6 @@ export async function runRevise(
       console.error(
         `  Plan stays in 'draft' at ${result.record.path}. Set Status to 'awaiting-review' there and re-run revise to retry, or edit content directly.`,
       );
-      return 1;
-    }
-    if (err instanceof Anthropic.APIError) {
-      const status = err.status ?? "?";
-      console.error(
-        `revise: Anthropic API error during redraft (status ${status}): ${err.message}`,
-      );
-      if (err.status === 401 || err.status === 403) {
-        console.error(`revise: check ANTHROPIC_API_KEY in ${envFile(dataDir)}.`);
-      }
       return 1;
     }
     throw err;

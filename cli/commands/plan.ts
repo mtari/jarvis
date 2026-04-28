@@ -1,5 +1,4 @@
 import { parseArgs } from "node:util";
-import Anthropic from "@anthropic-ai/sdk";
 import {
   createStdinPrompter,
   isStrategistPlanType,
@@ -8,7 +7,8 @@ import {
   type Prompter,
   type StrategistPlanType,
 } from "../../agents/strategist.ts";
-import { createAnthropicClient } from "../../orchestrator/anthropic-client.ts";
+import type { AnthropicClient } from "../../orchestrator/anthropic-client.ts";
+import { createAgentRuntime } from "../../orchestrator/agent-sdk-runtime.ts";
 import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import {
@@ -18,7 +18,7 @@ import {
 import { dbFile, envFile, getDataDir } from "../paths.ts";
 
 export interface PlanCommandDeps {
-  client?: ReturnType<typeof createAnthropicClient>;
+  client?: AnthropicClient;
   prompter?: Prompter;
 }
 
@@ -102,18 +102,30 @@ export async function runPlan(
   const dataDir = getDataDir();
   loadEnvFile(envFile(dataDir));
 
-  if (!deps.client && !process.env["ANTHROPIC_API_KEY"]) {
-    console.error(
-      `plan: ANTHROPIC_API_KEY is not set. Edit ${envFile(dataDir)} and try again.`,
-    );
-    return 1;
+  let baseClient: AnthropicClient;
+  let mode: "api" | "subscription";
+  if (deps.client) {
+    baseClient = deps.client;
+    mode = "subscription";
+  } else {
+    const runtime = createAgentRuntime();
+    if (
+      runtime.mode === "api" &&
+      !process.env["ANTHROPIC_API_KEY"]
+    ) {
+      console.error(
+        `plan: JARVIS_AGENT_RUNTIME=api but ANTHROPIC_API_KEY is not set. Edit ${envFile(dataDir)} or unset JARVIS_AGENT_RUNTIME to use the Claude Code subscription.`,
+      );
+      return 1;
+    }
+    baseClient = runtime.client;
+    mode = runtime.mode;
   }
-
-  const baseClient = deps.client ?? createAnthropicClient();
   const recorder = buildAgentCallRecorder(baseClient, dbFile(dataDir), {
     app: v.app,
     vault: v.vault ?? "personal",
     agent: "strategist",
+    mode,
   });
   const prompter =
     deps.prompter ?? (v["no-challenge"] ? undefined : createStdinPrompter());
@@ -145,14 +157,6 @@ export async function runPlan(
     recorder.flush();
     if (err instanceof StrategistError) {
       console.error(`plan: ${err.message}`);
-      return 1;
-    }
-    if (err instanceof Anthropic.APIError) {
-      const status = err.status ?? "?";
-      console.error(`plan: Anthropic API error (status ${status}): ${err.message}`);
-      if (err.status === 401 || err.status === 403) {
-        console.error(`plan: check ANTHROPIC_API_KEY in ${envFile(dataDir)}.`);
-      }
       return 1;
     }
     throw err;

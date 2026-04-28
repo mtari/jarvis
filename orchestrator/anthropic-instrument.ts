@@ -43,6 +43,13 @@ export interface InstrumentationContext {
   agent: string;
   /** Filled in mid-flight when the agent generates the plan id (e.g., new drafts). */
   planId?: string;
+  /**
+   * Which runtime produced the call: 'api' (legacy Anthropic API, billed per
+   * token) or 'subscription' (Claude Agent SDK driving the local CLI under
+   * the user's Pro/MAX subscription). Recorded on every `agent-call` event so
+   * `yarn jarvis cost` can distinguish pre/post-pivot rows. See §18.
+   */
+  mode?: "api" | "subscription";
 }
 
 /**
@@ -78,6 +85,7 @@ export function buildAgentCallRecorder(
               cacheCreationTokens: info.response.usage.cacheCreationTokens,
               durationMs: info.durationMs,
               stopReason: info.response.stopReason,
+              mode: ctx.mode ?? "api",
             },
           });
         }
