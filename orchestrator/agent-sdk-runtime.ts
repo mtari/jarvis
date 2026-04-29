@@ -1,14 +1,59 @@
-import { createAnthropicClient } from "./anthropic-client.ts";
 import { redact, type RedactionMatch } from "./redactor.ts";
-import type {
-  AnthropicClient,
-  ChatRequest,
-  ChatResponse,
-  ChatUsage,
-} from "./anthropic-client.ts";
 
 const DEFAULT_MODEL = "claude-sonnet-4-6";
 const DEFAULT_MAX_TURNS = 30;
+
+// ---------------------------------------------------------------------------
+// Chat-shape types (used by Strategist via createSdkClient.chat()). Lived in
+// orchestrator/anthropic-client.ts before plan #3 — moved here when the
+// legacy API client was deleted. Strategist + Onboard call createSdkClient,
+// which returns an `AnthropicClient`-shaped object backed by the SDK's
+// query(). The name is kept for continuity with the existing call sites.
+// ---------------------------------------------------------------------------
+
+export interface ChatUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  cacheCreationTokens: number;
+}
+
+export interface ChatRequest {
+  /** Model id; defaults to client.defaultModel. */
+  model?: string;
+  /** System prompt. `cacheSystem` is accepted for back-compat but ignored — the SDK manages caching. */
+  system?: string;
+  cacheSystem?: boolean;
+  messages: Array<{
+    role: "user" | "assistant";
+    content: string | TextBlockParam[];
+  }>;
+  /** Output cap; informational under the SDK runtime. */
+  maxTokens?: number;
+  temperature?: number;
+}
+
+interface TextBlockParam {
+  type: "text";
+  text: string;
+}
+
+export interface ChatResponse {
+  text: string;
+  /** Block representation of the response. Always one text block; consumers that
+   * inspected legacy SDK content blocks now read `text` directly. */
+  blocks: Array<{ type: "text"; text: string }>;
+  /** Stop reason from the SDK; loose typing because the SDK returns free-form strings. */
+  stopReason: string | null;
+  /** Model the SDK actually used. */
+  model: string;
+  usage: ChatUsage;
+  redactions: RedactionMatch[];
+}
+
+export interface AnthropicClient {
+  chat(request: ChatRequest): Promise<ChatResponse>;
+}
 
 /**
  * Result of one SDK turn, normalised to the same shape Strategist already
@@ -100,8 +145,8 @@ export function createSdkClient(opts: SdkClientOptions = {}): AnthropicClient {
         // The SDK's text result is what Strategist actually parses (looks for
         // <plan>/<clarify>). The blocks array stays minimal — one text block —
         // because that's all consumers read.
-        blocks: [{ type: "text", text: result.text, citations: null }],
-        stopReason: mapStopReason(result.stopReason),
+        blocks: [{ type: "text", text: result.text }],
+        stopReason: result.stopReason,
         model: result.model,
         usage: result.usage,
         redactions: allRedactions,
@@ -146,16 +191,6 @@ function blocksToText(
     .filter((b): b is { type: "text"; text: string } => b.type === "text")
     .map((b) => b.text)
     .join("\n");
-}
-
-function mapStopReason(
-  raw: string | null,
-): ChatResponse["stopReason"] {
-  // The SDK's stop_reason is a free-form string. Anthropic's typed enum
-  // ("end_turn" | "max_tokens" | "stop_sequence" | "tool_use" | "pause_turn" | "refusal")
-  // is preserved when the SDK returns one of those — otherwise we pass the
-  // raw string through, which the typed alias accepts as a superset.
-  return raw as ChatResponse["stopReason"];
 }
 
 // ---------------------------------------------------------------------------
@@ -462,31 +497,3 @@ const defaultRunAgentTransport: RunAgentTransport = async (resolved) => {
 
   throw new Error("SDK query stream ended without a result message");
 };
-
-// ---------------------------------------------------------------------------
-// Top-level factory: reads JARVIS_AGENT_RUNTIME and returns the right client.
-// Default: 'sdk' (subscription via local claude CLI, see §18). Override with
-// JARVIS_AGENT_RUNTIME=api to fall back to the legacy Anthropic client. The
-// flag exists for the migration window (plans #1 → #3); it goes away in plan
-// #3 once anthropic-client.ts is removed.
-// ---------------------------------------------------------------------------
-
-export type AgentRuntimeMode = "api" | "subscription";
-
-export interface AgentRuntimeFactoryResult {
-  client: AnthropicClient;
-  mode: AgentRuntimeMode;
-}
-
-/**
- * Returns the configured agent runtime client + which mode it's in (so the
- * instrumenter can record `mode: 'api' | 'subscription'` on `agent-call`
- * events). Reads JARVIS_AGENT_RUNTIME from process.env.
- */
-export function createAgentRuntime(): AgentRuntimeFactoryResult {
-  const flag = (process.env["JARVIS_AGENT_RUNTIME"] ?? "sdk").toLowerCase();
-  if (flag === "api") {
-    return { client: createAnthropicClient(), mode: "api" };
-  }
-  return { client: createSdkClient(), mode: "subscription" };
-}

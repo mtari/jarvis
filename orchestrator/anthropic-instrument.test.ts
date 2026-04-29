@@ -2,7 +2,7 @@ import path from "node:path";
 import type Anthropic from "@anthropic-ai/sdk";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { AnthropicClient, ChatResponse } from "./anthropic-client.ts";
+import type { AnthropicClient, ChatResponse } from "./agent-sdk-runtime.ts";
 import {
   buildAgentCallRecorder,
   instrumentClient,

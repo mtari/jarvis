@@ -6,7 +6,7 @@ import {
   isStrategistPlanType,
   type StrategistPlanType,
 } from "../../agents/strategist.ts";
-import type { AgentRuntimeFactoryResult } from "../../orchestrator/agent-sdk-runtime.ts";
+import type { AnthropicClient } from "../../orchestrator/agent-sdk-runtime.ts";
 import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import {
   approvePlan,
@@ -22,12 +22,11 @@ export interface HandlerContext {
   dataDir: string;
   surfaceCtx: SurfaceContext;
   /**
-   * Lazy: returns the configured agent runtime (client + mode) when needed
-   * for Strategist work (slash commands, revise auto-redraft). The mode is
-   * recorded on `agent-call` events so cost reports can distinguish API vs
-   * subscription-mode rows. See §18.
+   * Lazy: returns the SDK-backed AnthropicClient when needed for Strategist
+   * work (slash commands, revise auto-redraft). All calls record
+   * `mode: "subscription"` on the agent-call event.
    */
-  getAgentRuntime: () => AgentRuntimeFactoryResult;
+  getAnthropicClient: () => AnthropicClient;
   log: (message: string, meta?: Record<string, unknown>) => void;
   logError: (message: string, error?: unknown, meta?: Record<string, unknown>) => void;
 }
@@ -128,13 +127,13 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
     }
 
     // Auto-redraft via Strategist
-    const runtime = ctx.getAgentRuntime();
-    const recorder = buildAgentCallRecorder(runtime.client, dbFile(ctx.dataDir), {
+    const baseClient = ctx.getAnthropicClient();
+    const recorder = buildAgentCallRecorder(baseClient, dbFile(ctx.dataDir), {
       app: reviseResult.record.app,
       vault: reviseResult.record.vault,
       agent: "strategist",
       planId,
-      mode: runtime.mode,
+      mode: "subscription",
     });
     try {
       await redraftPlan({
@@ -235,13 +234,13 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       text: `📝 Strategist drafting plan for *${app}*…`,
     });
 
-    const runtime = ctx.getAgentRuntime();
+    const baseClient = ctx.getAnthropicClient();
     // No planId yet — we don't have it until Strategist returns
-    const recorder = buildAgentCallRecorder(runtime.client, dbFile(ctx.dataDir), {
+    const recorder = buildAgentCallRecorder(baseClient, dbFile(ctx.dataDir), {
       app,
       vault: "personal",
       agent: "strategist",
-      mode: runtime.mode,
+      mode: "subscription",
     });
 
     try {

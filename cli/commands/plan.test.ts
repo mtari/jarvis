@@ -4,7 +4,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import type {
   AnthropicClient,
   ChatResponse,
-} from "../../orchestrator/anthropic-client.ts";
+} from "../../orchestrator/agent-sdk-runtime.ts";
 import type { Prompter } from "../../agents/strategist.ts";
 import {
   makeInstallSandbox,
@@ -133,28 +133,6 @@ describe("runPlan", () => {
       prompter: noopPrompter,
     });
     expect(code).toBe(1);
-  });
-
-  it("returns 1 when JARVIS_AGENT_RUNTIME=api but ANTHROPIC_API_KEY is missing and no client is injected", async () => {
-    const previousKey = process.env["ANTHROPIC_API_KEY"];
-    const previousRuntime = process.env["JARVIS_AGENT_RUNTIME"];
-    delete process.env["ANTHROPIC_API_KEY"];
-    process.env["JARVIS_AGENT_RUNTIME"] = "api";
-    try {
-      const code = await runPlan([
-        "--app",
-        "jarvis",
-        "Add a status command",
-      ]);
-      expect(code).toBe(1);
-    } finally {
-      if (previousKey !== undefined) process.env["ANTHROPIC_API_KEY"] = previousKey;
-      if (previousRuntime !== undefined) {
-        process.env["JARVIS_AGENT_RUNTIME"] = previousRuntime;
-      } else {
-        delete process.env["JARVIS_AGENT_RUNTIME"];
-      }
-    }
   });
 
   it("joins multi-word positional briefs", async () => {

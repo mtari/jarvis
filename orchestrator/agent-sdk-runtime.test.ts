@@ -1,6 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
-  createAgentRuntime,
   createSdkClient,
   RateLimitedError,
   type SdkRunResult,
@@ -130,34 +129,3 @@ describe("createSdkClient", () => {
   });
 });
 
-describe("createAgentRuntime", () => {
-  let prev: string | undefined;
-  beforeEach(() => {
-    prev = process.env["JARVIS_AGENT_RUNTIME"];
-  });
-  afterEach(() => {
-    if (prev !== undefined) {
-      process.env["JARVIS_AGENT_RUNTIME"] = prev;
-    } else {
-      delete process.env["JARVIS_AGENT_RUNTIME"];
-    }
-  });
-
-  it("returns the SDK runtime by default (no env var set)", () => {
-    delete process.env["JARVIS_AGENT_RUNTIME"];
-    const runtime = createAgentRuntime();
-    expect(runtime.mode).toBe("subscription");
-  });
-
-  it("returns the SDK runtime when JARVIS_AGENT_RUNTIME=sdk", () => {
-    process.env["JARVIS_AGENT_RUNTIME"] = "sdk";
-    const runtime = createAgentRuntime();
-    expect(runtime.mode).toBe("subscription");
-  });
-
-  it("returns the legacy API runtime when JARVIS_AGENT_RUNTIME=api", () => {
-    process.env["JARVIS_AGENT_RUNTIME"] = "api";
-    const runtime = createAgentRuntime();
-    expect(runtime.mode).toBe("api");
-  });
-});

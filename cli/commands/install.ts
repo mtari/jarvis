@@ -24,9 +24,10 @@ import {
   vaultDir,
 } from "../paths.ts";
 
-const ENV_TEMPLATE = `# Anthropic API key — required before running Strategist or Developer.
-# Get one at https://console.anthropic.com/.
-ANTHROPIC_API_KEY=
+const ENV_TEMPLATE = `# Jarvis runs every agent under your Claude Code subscription via the
+# @anthropic-ai/claude-agent-sdk — see MASTER_PLAN.md §18. The SDK spawns
+# the local 'claude' CLI subprocess which inherits auth from ~/.claude/,
+# so no Anthropic API key is needed here.
 
 # Slack tokens — Phase 1+. Uncomment when wiring the Slack adapter.
 # SLACK_BOT_TOKEN=
@@ -46,7 +47,19 @@ interface EventRow {
   created_at: string;
 }
 
-export async function runInstall(rawArgs: string[]): Promise<number> {
+export interface InstallOptions {
+  /**
+   * Override the Claude CLI precheck for tests. When set, replaces the
+   * default `claude --version` invocation; return true to proceed, false
+   * to abort with the install error.
+   */
+  checkClaudeCli?: () => boolean;
+}
+
+export async function runInstall(
+  rawArgs: string[],
+  opts: InstallOptions = {},
+): Promise<number> {
   let parsed;
   try {
     parsed = parseArgs({
@@ -64,6 +77,20 @@ export async function runInstall(rawArgs: string[]): Promise<number> {
 
   const dataDir = parsed.values["data-dir"] ?? getDataDir();
   const remote = parsed.values.remote;
+
+  // Per §18, every agent runs through the Claude Agent SDK driving the
+  // local `claude` CLI. If it isn't installed or authenticated, all
+  // agent fires would fail at runtime — fail fast at install time.
+  const claudeOk = opts.checkClaudeCli ? opts.checkClaudeCli() : checkClaudeCli();
+  if (!claudeOk) {
+    console.error(
+      "install: `claude` CLI not found on PATH or fails to run.\n" +
+        "  Jarvis runs every agent under your Claude Code subscription via the SDK\n" +
+        "  (see MASTER_PLAN.md §18). Install Claude Code from https://claude.com/claude-code,\n" +
+        "  authenticate it once, then re-run `yarn jarvis install`.",
+    );
+    return 1;
+  }
 
   if (fs.existsSync(dataDir)) {
     const entries = fs.readdirSync(dataDir);
@@ -223,7 +250,7 @@ function printNextSteps(dataDir: string, remote: string | undefined): void {
     [
       "",
       `✓ Installed. Default vault \`personal\` created${remoteSuffix}.`,
-      `→ Fill in API key: edit ${envFile(dataDir)}`,
+      `✓ Claude Code CLI detected — agents will run under your subscription.`,
       `→ Fill in profile: yarn jarvis profile edit`,
       remoteLine,
       `→ Add more vaults: yarn jarvis vault create <name> [--remote <url>]`,
@@ -231,4 +258,18 @@ function printNextSteps(dataDir: string, remote: string | undefined): void {
       "",
     ].join("\n"),
   );
+}
+
+/**
+ * Returns true when the local `claude` CLI exists on PATH and `--version`
+ * exits 0. Used as the install-time precheck per §18 — Jarvis cannot run
+ * agents without a working Claude Code subprocess.
+ */
+function checkClaudeCli(): boolean {
+  try {
+    execFileSync("claude", ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+    return true;
+  } catch {
+    return false;
+  }
 }

@@ -1,10 +1,9 @@
 import { App as BoltApp, LogLevel } from "@slack/bolt";
 import { WebClient } from "@slack/web-api";
 import {
-  createAgentRuntime,
-  type AgentRuntimeFactoryResult,
+  createSdkClient,
+  type AnthropicClient,
 } from "../../orchestrator/agent-sdk-runtime.ts";
-import { type AnthropicClient } from "../../orchestrator/anthropic-client.ts";
 import type { DaemonContext, DaemonService } from "../../cli/commands/daemon.ts";
 import {
   resolveChannels,
@@ -38,7 +37,7 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
   let webClient: WebClient | null = null;
   let channels: ResolvedChannels | null = null;
   let surfaceTimer: NodeJS.Timeout | null = null;
-  let lazyRuntime: AgentRuntimeFactoryResult | null = null;
+  let lazyClient: AnthropicClient | null = null;
 
   const surfaceCtxFor = (): SurfaceContext => {
     if (!channels) throw new Error("Slack channels not resolved yet");
@@ -87,20 +86,13 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
       registerHandlers(app, {
         dataDir: opts.dataDir,
         surfaceCtx: surfaceCtxFor(),
-        getAgentRuntime: () => {
-          if (!lazyRuntime) {
-            if (opts.buildAnthropicClient) {
-              // Test injection — caller controls the client; mode defaults
-              // to 'subscription' so new tests don't see legacy 'api' rows.
-              lazyRuntime = {
-                client: opts.buildAnthropicClient(),
-                mode: "subscription",
-              };
-            } else {
-              lazyRuntime = createAgentRuntime();
-            }
+        getAnthropicClient: () => {
+          if (!lazyClient) {
+            lazyClient = opts.buildAnthropicClient
+              ? opts.buildAnthropicClient()
+              : createSdkClient();
           }
-          return lazyRuntime;
+          return lazyClient;
         },
         log: (message, meta) => ctx.logger.info(message, meta),
         logError: (message, error, meta) =>
@@ -149,7 +141,7 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
       }
       webClient = null;
       channels = null;
-      lazyRuntime = null;
+      lazyClient = null;
     },
   };
 }

@@ -3,8 +3,10 @@ import {
   redraftPlan,
   StrategistError,
 } from "../../agents/strategist.ts";
-import type { AnthropicClient } from "../../orchestrator/anthropic-client.ts";
-import { createAgentRuntime } from "../../orchestrator/agent-sdk-runtime.ts";
+import {
+  createSdkClient,
+  type AnthropicClient,
+} from "../../orchestrator/agent-sdk-runtime.ts";
 import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import { revisePlan, REVISE_CAP } from "../../orchestrator/plan-lifecycle.ts";
@@ -71,38 +73,15 @@ export async function runRevise(
     return 1;
   }
 
-  // Auto-redraft via Strategist. Falls back gracefully when the configured
-  // runtime is unavailable: the plan stays in 'draft' and the user gets a
-  // clear recovery path.
+  // Auto-redraft via Strategist.
   loadEnvFile(envFile(dataDir));
-  let baseClient: AnthropicClient;
-  let mode: "api" | "subscription";
-  if (deps.client) {
-    baseClient = deps.client;
-    mode = "subscription";
-  } else {
-    const runtime = createAgentRuntime();
-    if (
-      runtime.mode === "api" &&
-      !process.env["ANTHROPIC_API_KEY"]
-    ) {
-      console.log(
-        `✓ Plan ${planId} sent back to draft with feedback (round ${result.priorRevisions + 1}/${REVISE_CAP}).`,
-      );
-      console.log(
-        `⚠ JARVIS_AGENT_RUNTIME=api but ANTHROPIC_API_KEY not set — auto-redraft skipped. Edit ${envFile(dataDir)}, unset JARVIS_AGENT_RUNTIME, or edit ${result.record.path} manually.`,
-      );
-      return 0;
-    }
-    baseClient = runtime.client;
-    mode = runtime.mode;
-  }
+  const baseClient: AnthropicClient = deps.client ?? createSdkClient();
   const recorder = buildAgentCallRecorder(baseClient, dbFile(dataDir), {
     app: result.record.app,
     vault: result.record.vault,
     agent: "strategist",
     planId,
-    mode,
+    mode: "subscription",
   });
   console.log(
     `✓ Plan ${planId} sent back to draft (round ${result.priorRevisions + 1}/${REVISE_CAP}). Strategist redrafting…`,
