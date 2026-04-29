@@ -25,6 +25,13 @@ const silenceLogs = (): void => {
   vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 };
 
+/**
+ * Default install options for tests: skip the real `claude --version`
+ * subprocess and pretend Claude Code is installed. Tests that exercise
+ * the precheck explicitly pass their own checkClaudeCli override.
+ */
+const TEST_INSTALL_OPTS = { checkClaudeCli: () => true };
+
 describe("runInstall", () => {
   let dataDir: string;
 
@@ -40,12 +47,12 @@ describe("runInstall", () => {
   });
 
   it("creates the full data layout and returns 0", async () => {
-    const code = await runInstall(["--data-dir", dataDir]);
+    const code = await runInstall(["--data-dir", dataDir], TEST_INSTALL_OPTS);
     expect(code).toBe(0);
 
     expect(fs.existsSync(envFile(dataDir))).toBe(true);
     const envContent = fs.readFileSync(envFile(dataDir), "utf8");
-    expect(envContent).toContain("ANTHROPIC_API_KEY=");
+    expect(envContent).not.toContain("ANTHROPIC_API_KEY=");
     expect(envContent).toContain("# SLACK_BOT_TOKEN=");
 
     expect(fs.existsSync(dbFile(dataDir))).toBe(true);
@@ -111,7 +118,10 @@ describe("runInstall", () => {
 
   it("records the remote when --remote is provided", async () => {
     const remote = "git@github.com:example/personal-vault.git";
-    const code = await runInstall(["--data-dir", dataDir, "--remote", remote]);
+    const code = await runInstall(
+      ["--data-dir", dataDir, "--remote", remote],
+      TEST_INSTALL_OPTS,
+    );
     expect(code).toBe(0);
 
     const personalVault = vaultDir(dataDir, "personal");
@@ -137,18 +147,30 @@ describe("runInstall", () => {
     fs.mkdirSync(dataDir, { recursive: true });
     fs.writeFileSync(path.join(dataDir, "leftover.txt"), "hi");
 
-    const code = await runInstall(["--data-dir", dataDir]);
+    const code = await runInstall(["--data-dir", dataDir], TEST_INSTALL_OPTS);
     expect(code).toBe(1);
   });
 
   it("rejects an unknown flag", async () => {
-    const code = await runInstall(["--data-dir", dataDir, "--bogus", "x"]);
+    const code = await runInstall(
+      ["--data-dir", dataDir, "--bogus", "x"],
+      TEST_INSTALL_OPTS,
+    );
     expect(code).toBe(1);
   });
 
   it("leaves no .smoke-test.* artifacts behind after the smoke test", async () => {
-    await runInstall(["--data-dir", dataDir]);
+    await runInstall(["--data-dir", dataDir], TEST_INSTALL_OPTS);
     const dataDirEntries = fs.readdirSync(dataDir);
     expect(dataDirEntries.some((e) => e.startsWith(".smoke-test"))).toBe(false);
+  });
+
+  it("returns 1 when claude --version fails", async () => {
+    const code = await runInstall(["--data-dir", dataDir], {
+      checkClaudeCli: () => false,
+    });
+    expect(code).toBe(1);
+    // Data dir should not have been created when the precheck fails
+    expect(fs.existsSync(dataDir)).toBe(false);
   });
 });

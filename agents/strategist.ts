@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import Database from "better-sqlite3";
-import type { AnthropicClient, ChatResponse } from "../orchestrator/anthropic-client.ts";
+import type { AnthropicClient, ChatResponse } from "../orchestrator/agent-sdk-runtime.ts";
 import type { Brain } from "../orchestrator/brain.ts";
 import { loadBrain } from "../orchestrator/brain.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";

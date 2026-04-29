@@ -66,13 +66,6 @@
   dependencies:
     json-schema-to-ts "^3.1.1"
 
-"@anthropic-ai/sdk@^0.91.1":
-  version "0.91.1"
-  resolved "https://registry.yarnpkg.com/@anthropic-ai/sdk/-/sdk-0.91.1.tgz#09eeee4b12b91ba6d827ca249c2ede61e521aa00"
-  integrity sha512-LAmu761tSN9r66ixvmciswUj/ZC+1Q4iAfpedTfSVLeswRwnY3n2Nb6Tsk+cLPP28aLOPWeMgIuTuCcMC6W/iw==
-  dependencies:
-    json-schema-to-ts "^3.1.1"
-
 "@babel/runtime@^7.18.3":
   version "7.29.2"
   resolved "https://registry.yarnpkg.com/@babel/runtime/-/runtime-7.29.2.tgz#9a6e2d05f4b6692e1801cd4fb176ad823930ed5e"

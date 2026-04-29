@@ -6,7 +6,7 @@ import type {
   AnthropicClient,
   ChatRequest,
   ChatResponse,
-} from "../orchestrator/anthropic-client.ts";
+} from "../orchestrator/agent-sdk-runtime.ts";
 import { dbFile, planDir } from "../cli/paths.ts";
 import {
   dropPlan,

@@ -3,7 +3,7 @@ import type {
   AnthropicClient,
   ChatRequest,
   ChatResponse,
-} from "./anthropic-client.ts";
+} from "./agent-sdk-runtime.ts";
 import { appendEvent } from "./event-log.ts";
 
 export interface AgentCallInfo {

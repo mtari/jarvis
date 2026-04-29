@@ -6,7 +6,7 @@ import type {
   AnthropicClient,
   ChatRequest,
   ChatResponse,
-} from "../../orchestrator/anthropic-client.ts";
+} from "../../orchestrator/agent-sdk-runtime.ts";
 import { recordFeedback } from "../../orchestrator/feedback-store.ts";
 import { parsePlan } from "../../orchestrator/plan.ts";
 import { dbFile } from "../paths.ts";
@@ -82,34 +82,15 @@ function fixedClient(text: string): {
 describe("runRevise", () => {
   let sandbox: InstallSandbox;
   let silencer: ConsoleSilencer;
-  let prevRuntime: string | undefined;
-  let prevKey: string | undefined;
 
   beforeEach(async () => {
     sandbox = await makeInstallSandbox();
     silencer = silenceConsole();
-    // Tests that don't supply a client should fall through the
-    // "auto-redraft skipped" path — pin runtime to api + clear the key so
-    // we hit the early-return guard rather than spawning the SDK.
-    prevRuntime = process.env["JARVIS_AGENT_RUNTIME"];
-    prevKey = process.env["ANTHROPIC_API_KEY"];
-    process.env["JARVIS_AGENT_RUNTIME"] = "api";
-    delete process.env["ANTHROPIC_API_KEY"];
   });
 
   afterEach(() => {
     silencer.restore();
     sandbox.cleanup();
-    if (prevRuntime !== undefined) {
-      process.env["JARVIS_AGENT_RUNTIME"] = prevRuntime;
-    } else {
-      delete process.env["JARVIS_AGENT_RUNTIME"];
-    }
-    if (prevKey !== undefined) {
-      process.env["ANTHROPIC_API_KEY"] = prevKey;
-    } else {
-      delete process.env["ANTHROPIC_API_KEY"];
-    }
   });
 
   it("transitions awaiting-review → draft and stores feedback note", async () => {
@@ -117,14 +98,18 @@ describe("runRevise", () => {
       status: "awaiting-review",
     });
 
-    const code = await runRevise([
-      "2026-04-27-test",
-      "scope is too broad",
-    ]);
+    // Inject a stub client so the auto-redraft path goes through cleanly
+    // and the test doesn't try to spawn the SDK subprocess.
+    const { client } = fixedClient(REDRAFT_PLAN);
+    const code = await runRevise(
+      ["2026-04-27-test", "scope is too broad"],
+      { client },
+    );
     expect(code).toBe(0);
 
+    // Plan transitions through draft → awaiting-review (after redraft).
     expect(parsePlan(fs.readFileSync(planPath, "utf8")).metadata.status).toBe(
-      "draft",
+      "awaiting-review",
     );
 
     const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
@@ -141,12 +126,12 @@ describe("runRevise", () => {
 
   it("accepts --note as an alternative to a positional note", async () => {
     dropPlan(sandbox, "2026-04-27-test", { status: "awaiting-review" });
+    const { client } = fixedClient(REDRAFT_PLAN);
     expect(
-      await runRevise([
-        "2026-04-27-test",
-        "--note",
-        "swap the framing",
-      ]),
+      await runRevise(
+        ["2026-04-27-test", "--note", "swap the framing"],
+        { client },
+      ),
     ).toBe(0);
   });
 
@@ -164,25 +149,15 @@ describe("runRevise", () => {
 describe("runRevise — auto-redraft via Strategist", () => {
   let sandbox: InstallSandbox;
   let silencer: ConsoleSilencer;
-  let prevRuntime: string | undefined;
 
   beforeEach(async () => {
     sandbox = await makeInstallSandbox();
     silencer = silenceConsole();
-    // These tests inject a client explicitly OR test the no-key fallback;
-    // pin the runtime to api so the explicit-client path stays deterministic.
-    prevRuntime = process.env["JARVIS_AGENT_RUNTIME"];
-    process.env["JARVIS_AGENT_RUNTIME"] = "api";
   });
 
   afterEach(() => {
     silencer.restore();
     sandbox.cleanup();
-    if (prevRuntime !== undefined) {
-      process.env["JARVIS_AGENT_RUNTIME"] = prevRuntime;
-    } else {
-      delete process.env["JARVIS_AGENT_RUNTIME"];
-    }
   });
 
   it("redrafts the plan back to awaiting-review with new content when a client is wired", async () => {
@@ -280,25 +255,4 @@ describe("runRevise — auto-redraft via Strategist", () => {
     );
   });
 
-  it("falls back gracefully when JARVIS_AGENT_RUNTIME=api but no key + no client is wired", async () => {
-    const planId = "2026-04-27-no-key";
-    const planPath = dropPlan(sandbox, planId, {
-      status: "awaiting-review",
-    });
-    const previousKey = process.env["ANTHROPIC_API_KEY"];
-    delete process.env["ANTHROPIC_API_KEY"];
-    // beforeEach already pinned runtime to api
-    try {
-      const code = await runRevise([planId, "feedback"]);
-      expect(code).toBe(0);
-      // Plan transitioned to draft, feedback recorded, but redraft skipped
-      expect(parsePlan(fs.readFileSync(planPath, "utf8")).metadata.status).toBe(
-        "draft",
-      );
-    } finally {
-      if (previousKey !== undefined) {
-        process.env["ANTHROPIC_API_KEY"] = previousKey;
-      }
-    }
-  });
 });

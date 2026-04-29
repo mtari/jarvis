@@ -12,10 +12,12 @@ import {
 } from "../../orchestrator/agent-sdk-runtime.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { listPlans, type PlanRecord } from "../../orchestrator/plan-store.ts";
+import { readTodayCallCount } from "../../cli/commands/cost.ts";
 import { dbFile } from "../../cli/paths.ts";
 import type { DaemonContext, DaemonService } from "../../cli/commands/daemon.ts";
 
 const DEFAULT_TICK_MS = 30_000;
+const DEFAULT_DAILY_CALL_CAP = 150;
 
 export interface PlanExecutorOptions {
   dataDir: string;
@@ -25,6 +27,12 @@ export interface PlanExecutorOptions {
   enabledApps?: ReadonlyArray<string>;
   /** Override repo root for assertCleanMain (tests inject a fixture repo). */
   repoRoot?: string;
+  /**
+   * Daily UTC cap on `agent-call` events. When today's count >= cap, the
+   * tick body returns early without firing — protects the user's MAX
+   * subscription rate-limit window. Default 150. See §18.
+   */
+  dailyCallCap?: number;
   /** Test injection — overrides the SDK transport for every Developer fire. */
   transport?: RunAgentTransport;
   /**
@@ -260,6 +268,8 @@ export interface TickInput {
   ctx: DaemonContext;
   /** Override repo root (tests inject a fixture path). */
   repoRoot?: string;
+  /** Daily UTC cap on `agent-call` events. Default 150. See §18. */
+  dailyCallCap?: number;
   /** Test injection — overrides the SDK transport for every Developer fire. */
   transport?: RunAgentTransport;
 }
@@ -297,6 +307,18 @@ export async function runPlanExecutorTick(
 ): Promise<TickResult> {
   const fired: FiredPayload[] = [];
   const skipped: Array<{ planId: string; reason: string }> = [];
+
+  // Daily cap gate. If today's UTC call count is at or over the cap,
+  // skip *all* fires for this tick. Resumes automatically at 00:00 UTC.
+  const dailyCap = input.dailyCallCap ?? DEFAULT_DAILY_CALL_CAP;
+  const todayCount = readTodayCallCount(dbFile(input.dataDir));
+  if (todayCount >= dailyCap) {
+    input.ctx.logger.info(
+      "plan-executor: daily cap reached, deferring all fires until 00:00 UTC",
+      { todayCount, cap: dailyCap },
+    );
+    return { fired, skipped };
+  }
 
   const alreadyFired = readFiredPlanIds(dbFile(input.dataDir));
   const candidates = listPlans(input.dataDir).filter(
@@ -417,6 +439,9 @@ export function createPlanExecutorService(
           }
           if (opts.transport !== undefined) {
             tickInput.transport = opts.transport;
+          }
+          if (opts.dailyCallCap !== undefined) {
+            tickInput.dailyCallCap = opts.dailyCallCap;
           }
           const result = await runPlanExecutorTick(tickInput);
           if (result.fired.length > 0) {

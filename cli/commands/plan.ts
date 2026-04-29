@@ -7,8 +7,10 @@ import {
   type Prompter,
   type StrategistPlanType,
 } from "../../agents/strategist.ts";
-import type { AnthropicClient } from "../../orchestrator/anthropic-client.ts";
-import { createAgentRuntime } from "../../orchestrator/agent-sdk-runtime.ts";
+import {
+  createSdkClient,
+  type AnthropicClient,
+} from "../../orchestrator/agent-sdk-runtime.ts";
 import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import {
@@ -102,30 +104,12 @@ export async function runPlan(
   const dataDir = getDataDir();
   loadEnvFile(envFile(dataDir));
 
-  let baseClient: AnthropicClient;
-  let mode: "api" | "subscription";
-  if (deps.client) {
-    baseClient = deps.client;
-    mode = "subscription";
-  } else {
-    const runtime = createAgentRuntime();
-    if (
-      runtime.mode === "api" &&
-      !process.env["ANTHROPIC_API_KEY"]
-    ) {
-      console.error(
-        `plan: JARVIS_AGENT_RUNTIME=api but ANTHROPIC_API_KEY is not set. Edit ${envFile(dataDir)} or unset JARVIS_AGENT_RUNTIME to use the Claude Code subscription.`,
-      );
-      return 1;
-    }
-    baseClient = runtime.client;
-    mode = runtime.mode;
-  }
+  const baseClient: AnthropicClient = deps.client ?? createSdkClient();
   const recorder = buildAgentCallRecorder(baseClient, dbFile(dataDir), {
     app: v.app,
     vault: v.vault ?? "personal",
     agent: "strategist",
-    mode,
+    mode: "subscription",
   });
   const prompter =
     deps.prompter ?? (v["no-challenge"] ? undefined : createStdinPrompter());

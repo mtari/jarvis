@@ -70,7 +70,7 @@ describe("runCost", () => {
   });
 
   it("aggregates spend from agent-call events", async () => {
-    // 1M Sonnet input tokens = $3.00
+    // One Sonnet call: 1 of 150 calls, $3.00 informational
     seedCall(dbFile(sandbox.dataDir), {
       agent: "strategist",
       model: "claude-sonnet-4-6",
@@ -78,22 +78,24 @@ describe("runCost", () => {
     });
     expect(await runCost([])).toBe(0);
     const out = logs.join("\n");
-    expect(out).toContain("$3.00 / $50.00");
+    // Today line: 1 / 150 calls
+    expect(out).toMatch(/Today: 1 \/ 150 calls/);
     expect(out).toContain("strategist");
+    // Informational USD still shown
+    expect(out).toContain("$3.00");
   });
 
-  it("warns when spend crosses the cap-warning threshold", async () => {
-    // 1M Opus input tokens = $15.00; cap default $50; $15/$50 = 30% — under default 80%.
-    // Use a low --cap to force the warning.
+  it("warns when call count crosses the cap-warning threshold", async () => {
+    // Cap to 1 call and warn-at default 0.8 → one call already >= cap.
     seedCall(dbFile(sandbox.dataDir), {
       agent: "developer",
       model: "claude-opus-4-7",
       inputTokens: 1_000_000,
     });
-    await runCost(["--cap", "10"]);
+    await runCost(["--cap", "1"]);
     const out = logs.join("\n");
     expect(out).toContain("⚠");
-    expect(out).toContain("$15.00 / $10.00");
+    expect(out).toMatch(/Today: 1 \/ 1 calls/);
   });
 
   it("breaks down by agent / plan / model", async () => {
@@ -146,9 +148,10 @@ describe("runCost", () => {
     });
     await runCost(["--format", "json"]);
     const json = JSON.parse(logs.join("\n")) as Record<string, unknown>;
-    expect(json["totalUsd"]).toBe(3);
-    expect(json["totalCalls"]).toBe(1);
-    expect(json["capUsd"]).toBe(50);
+    expect(json["callsToday"]).toBe(1);
+    expect(json["callsMonth"]).toBe(1);
+    expect(json["capCallsPerDay"]).toBe(150);
+    expect(json["totalUsdInformational"]).toBe(3);
     expect(json["overWarnThreshold"]).toBe(false);
   });
 

@@ -8,7 +8,13 @@ import {
 } from "../../orchestrator/cost.ts";
 import { dbFile, getDataDir } from "../paths.ts";
 
-const DEFAULT_CAP_USD = 50;
+/**
+ * Default daily call cap. Per §18, agents run under the user's Claude Code
+ * subscription, so the scarce resource is rate-limit headroom shared with
+ * the user's interactive Claude Code use — not dollars. The cap is per-UTC
+ * day; resets at 00:00 UTC.
+ */
+const DEFAULT_CAP_CALLS_PER_DAY = 150;
 const DEFAULT_WARN_RATIO = 0.8;
 
 interface AgentCallEvent {
@@ -29,6 +35,12 @@ interface AgentCallPayload {
   cacheCreationTokens: number;
   durationMs?: number;
   stopReason?: string | null;
+  /**
+   * Set to 'subscription' for events emitted post-pivot (Claude Code
+   * subscription via the SDK). Older events written before the pivot
+   * default to 'api' for back-compat. See §18.
+   */
+  mode?: "api" | "subscription";
 }
 
 interface AgentCallParsed extends AgentCallPayload {
@@ -55,7 +67,7 @@ export async function runCost(rawArgs: string[]): Promise<number> {
   }
 
   const v = parsed.values;
-  const cap = parsePositiveNumber(v.cap, DEFAULT_CAP_USD);
+  const cap = parsePositiveNumber(v.cap, DEFAULT_CAP_CALLS_PER_DAY);
   if (cap === null) {
     console.error(`cost: invalid --cap "${v.cap}"`);
     return 1;
@@ -78,7 +90,9 @@ export async function runCost(rawArgs: string[]): Promise<number> {
   const calls = readMonthCalls(dbFile(dataDir));
 
   if (format === "json") {
-    console.log(JSON.stringify(buildJsonReport(calls, cap, warnRatio, byDay), null, 2));
+    console.log(
+      JSON.stringify(buildJsonReport(calls, cap, warnRatio, byDay), null, 2),
+    );
     return 0;
   }
 
@@ -86,11 +100,49 @@ export async function runCost(rawArgs: string[]): Promise<number> {
   return 0;
 }
 
-function parsePositiveNumber(raw: string | undefined, fallback: number): number | null {
+function parsePositiveNumber(
+  raw: string | undefined,
+  fallback: number,
+): number | null {
   if (raw === undefined) return fallback;
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) return null;
   return n;
+}
+
+/**
+ * Returns the count of `agent-call` events for the current UTC day from the
+ * given DB. Used by the plan-executor to enforce the daily cap and by the
+ * cost command's headline. Pre-pivot events are counted equally with
+ * post-pivot ones — both consume rate-limit headroom.
+ */
+export function readTodayCallCount(dbPath: string): number {
+  const dayStart = startOfTodayIso();
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM events WHERE kind = 'agent-call' AND created_at >= ?",
+      )
+      .get(dayStart) as { n: number };
+    return row.n ?? 0;
+  } finally {
+    db.close();
+  }
+}
+
+function startOfTodayIso(now: Date = new Date()): string {
+  return new Date(
+    Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate(),
+      0,
+      0,
+      0,
+      0,
+    ),
+  ).toISOString();
 }
 
 function readMonthCalls(dbPath: string): AgentCallParsed[] {
@@ -124,6 +176,15 @@ function readMonthCalls(dbPath: string): AgentCallParsed[] {
   }
 }
 
+function callsTodayFromMonth(calls: AgentCallParsed[]): AgentCallParsed[] {
+  const start = startOfTodayIso();
+  return calls.filter((c) => c.createdAt >= start);
+}
+
+function countLegacyApiCalls(calls: AgentCallParsed[]): number {
+  return calls.filter((c) => (c.mode ?? "api") === "api").length;
+}
+
 interface AggregateRow {
   key: string;
   calls: number;
@@ -146,7 +207,7 @@ function aggregateBy(
       map.set(key, { key, calls: 1, totalUsd: cost });
     }
   }
-  return [...map.values()].sort((a, b) => b.totalUsd - a.totalUsd);
+  return [...map.values()].sort((a, b) => b.calls - a.calls);
 }
 
 interface DayRow {
@@ -156,14 +217,14 @@ interface DayRow {
 }
 
 /**
- * Buckets calls by UTC calendar day (YYYY-MM-DD) derived from the ISO
- * `createdAt` field, sums cost per bucket, and returns rows sorted ascending
- * by date. Days with no spend are omitted.
+ * Buckets calls by UTC calendar day (YYYY-MM-DD), counts calls per bucket,
+ * sums the (informational) USD per bucket, and returns rows sorted ascending
+ * by date. Days with no calls are omitted.
  */
 function groupByCostDay(calls: AgentCallParsed[]): DayRow[] {
   const map = new Map<string, DayRow>();
   for (const c of calls) {
-    const date = c.createdAt.slice(0, 10); // "YYYY-MM-DD" from ISO string
+    const date = c.createdAt.slice(0, 10);
     const cost = costForCall(c);
     const existing = map.get(date);
     if (existing) {
@@ -182,16 +243,23 @@ function buildJsonReport(
   warnRatio: number,
   byDay: boolean,
 ): Record<string, unknown> {
-  const total = calls.reduce((acc, c) => acc + costForCall(c), 0);
+  const today = callsTodayFromMonth(calls);
+  const totalUsd = calls.reduce((acc, c) => acc + costForCall(c), 0);
+  const todayCount = today.length;
+  const utilization = cap > 0 ? todayCount / cap : 0;
+
   const report: Record<string, unknown> = {
     month: new Date().toISOString().slice(0, 7),
-    totalCalls: calls.length,
-    totalUsd: round2(total),
-    capUsd: cap,
-    capUtilization: cap > 0 ? round3(total / cap) : 0,
+    today: new Date().toISOString().slice(0, 10),
+    callsToday: todayCount,
+    callsMonth: calls.length,
+    capCallsPerDay: cap,
+    capUtilization: round3(utilization),
     warnAtRatio: warnRatio,
-    overWarnThreshold: cap > 0 && total / cap >= warnRatio,
+    overWarnThreshold: cap > 0 && utilization >= warnRatio,
     cacheHitRate: round3(cacheHitRate(calls)),
+    totalUsdInformational: round2(totalUsd),
+    legacyApiCalls: countLegacyApiCalls(calls),
     byAgent: aggregateBy(calls, (c) => c.agent).map(toJsonRow),
     byPlan: aggregateBy(calls, (c) => c.planId ?? "<no-plan>").map(toJsonRow),
     byModel: aggregateBy(calls, (c) => c.model).map(toJsonRow),
@@ -233,25 +301,37 @@ function formatTableReport(
   }
   const lines: string[] = [];
   const monthLabel = formatMonth(new Date());
-  const total = calls.reduce((acc, c) => acc + costForCall(c), 0);
-  const cacheRate = cacheHitRate(calls);
-  const utilization = cap > 0 ? total / cap : 0;
+  const today = callsTodayFromMonth(calls);
+  const todayCount = today.length;
+  const utilization = cap > 0 ? todayCount / cap : 0;
   const overWarn = cap > 0 && utilization >= warnRatio;
+  const totalUsd = calls.reduce((acc, c) => acc + costForCall(c), 0);
+  const legacyCount = countLegacyApiCalls(calls);
 
-  lines.push(`Jarvis cost — ${monthLabel}`);
+  lines.push(`Jarvis activity — ${monthLabel}`);
   lines.push("");
   const utilPct = (utilization * 100).toFixed(1);
   const flag = overWarn ? "⚠" : "✓";
   lines.push(
-    `${flag} Total: ${formatUsd(total)} / ${formatUsd(cap)} cap (${utilPct}%)`,
+    `${flag} Today: ${todayCount} / ${cap} calls (${utilPct}%)`,
   );
-  lines.push(`  Cache hit rate: ${(cacheRate * 100).toFixed(1)}%`);
-  lines.push(`  Calls: ${calls.length}`);
+  lines.push(`  Month-to-date: ${calls.length} calls`);
+  lines.push(
+    `  Cache hit rate: ${(cacheHitRate(calls) * 100).toFixed(1)}%`,
+  );
+  lines.push(
+    `  Would-have-been API cost (informational): ${formatUsd(totalUsd)}`,
+  );
+  if (legacyCount > 0) {
+    lines.push(
+      `  ${legacyCount} of ${calls.length} events predate the §18 pivot and reflect actual API spend.`,
+    );
+  }
 
   lines.push("");
   lines.push("By agent:");
   for (const row of aggregateBy(calls, (c) => c.agent)) {
-    lines.push(formatAggRow(row, total));
+    lines.push(formatAggRow(row, calls.length));
   }
 
   const byPlan = aggregateBy(calls, (c) => c.planId ?? "<no-plan>");
@@ -259,7 +339,7 @@ function formatTableReport(
     lines.push("");
     lines.push("By plan (top 10):");
     for (const row of byPlan.slice(0, 10)) {
-      lines.push(formatAggRow(row, total));
+      lines.push(formatAggRow(row, calls.length));
     }
   }
 
@@ -267,7 +347,7 @@ function formatTableReport(
   lines.push("By model:");
   const unknownModels: string[] = [];
   for (const row of aggregateBy(calls, (c) => c.model)) {
-    lines.push(formatAggRow(row, total));
+    lines.push(formatAggRow(row, calls.length));
     if (!hasExplicitPricing(row.key)) unknownModels.push(row.key);
   }
   if (unknownModels.length > 0) {
@@ -288,9 +368,11 @@ function formatTableReport(
   return lines.join("\n");
 }
 
-function formatAggRow(row: AggregateRow, total: number): string {
+function formatAggRow(row: AggregateRow, totalCalls: number): string {
   const sharePct =
-    total > 0 ? ` (${((row.totalUsd / total) * 100).toFixed(1)}%)` : "";
+    totalCalls > 0
+      ? ` (${((row.calls / totalCalls) * 100).toFixed(1)}%)`
+      : "";
   return `  ${row.key.padEnd(36)}  ${row.calls.toString().padStart(4)} calls  ${formatUsd(row.totalUsd).padStart(8)}${sharePct}`;
 }
 
