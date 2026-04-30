@@ -70,6 +70,10 @@ describe("runInstall", () => {
     expect(brain.projectName).toBe("jarvis");
     expect(brain.projectType).toBe("other");
     expect(brain.projectStatus).toBe("active");
+    // Multi-repo support: install seeds the jarvis brain with repo.rootPath
+    // so the plan-executor can auto-fire on it.
+    expect(brain.repo?.rootPath).toBeTruthy();
+    expect(brain.repo?.rootPath).toMatch(/jarvis$/);
 
     const docsJson = brainDocsFile(dataDir, "personal", "jarvis");
     expect(fs.readFileSync(docsJson, "utf8")).toBe("[]\n");

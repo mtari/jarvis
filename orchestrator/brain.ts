@@ -38,6 +38,17 @@ const scopeSchema = z.object({
   domainRules: z.array(z.string()).optional(),
 });
 
+/**
+ * Where the app's source code lives on disk. The plan-executor uses this
+ * to set the SDK `cwd` for Developer fires — without it, the daemon can
+ * only auto-fire on the jarvis repo. `monorepoPath` is the repo-relative
+ * subdirectory when the app is one package inside a monorepo.
+ */
+const repoSchema = z.object({
+  rootPath: z.string().min(1),
+  monorepoPath: z.string().optional(),
+});
+
 export const brainSchema = z.object({
   schemaVersion: z.literal(1),
   projectName: z.string().min(1),
@@ -50,6 +61,13 @@ export const brainSchema = z.object({
   conventions: looseObjectSchema.optional(),
   scope: scopeSchema.optional(),
   features: z.array(z.string()).optional(),
+  /**
+   * On-disk location of the app's source code. Optional for back-compat
+   * with brains created before multi-repo support; the brain-migration
+   * runner backfills it from `app-onboarded` events. Apps without `repo`
+   * are excluded from the plan-executor's auto-fire enabled-apps set.
+   */
+  repo: repoSchema.optional(),
   userPreferences: userPreferencesSchema.default({}),
   connections: z.record(z.string(), looseObjectSchema).default({}),
   priorities: z.array(prioritySchema).default([]),

@@ -1,4 +1,5 @@
 import { execSync } from "node:child_process";
+import path from "node:path";
 import Database from "better-sqlite3";
 import {
   detectDeveloperMode,
@@ -11,9 +12,10 @@ import {
   type RunAgentTransport,
 } from "../../orchestrator/agent-sdk-runtime.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
+import { loadBrain } from "../../orchestrator/brain.ts";
 import { listPlans, type PlanRecord } from "../../orchestrator/plan-store.ts";
 import { readTodayCallCount } from "../../cli/commands/cost.ts";
-import { dbFile } from "../../cli/paths.ts";
+import { brainFile, dbFile } from "../../cli/paths.ts";
 import type { DaemonContext, DaemonService } from "../../cli/commands/daemon.ts";
 
 const DEFAULT_TICK_MS = 30_000;
@@ -23,9 +25,11 @@ export interface PlanExecutorOptions {
   dataDir: string;
   /** Tick interval for the auto-fire scan. Default 30s. */
   tickMs?: number;
-  /** Apps the executor will fire Developer for. Default: ["jarvis"] until multi-repo lands. */
-  enabledApps?: ReadonlyArray<string>;
-  /** Override repo root for assertCleanMain (tests inject a fixture repo). */
+  /**
+   * Override repo root for ALL fires — tests inject a fixture repo so
+   * assertCleanMain doesn't run against the real working tree. When set,
+   * brain-based per-app cwd lookup is bypassed.
+   */
   repoRoot?: string;
   /**
    * Daily UTC cap on `agent-call` events. When today's count >= cap, the
@@ -44,8 +48,6 @@ export interface PlanExecutorOptions {
    */
   _tickBody?: (ctx: DaemonContext) => Promise<void>;
 }
-
-const DEFAULT_ENABLED_APPS: ReadonlyArray<string> = ["jarvis"];
 
 interface FiredPayload {
   planId: string;
@@ -111,8 +113,35 @@ export function readFiredPlanIds(dbFilePath: string): Set<string> {
 interface FireOnce {
   dataDir: string;
   ctx: DaemonContext;
-  repoRoot?: string;
+  /**
+   * Working directory passed to the SDK / asserted clean before execute
+   * fires. Derived from the candidate's brain.repo (rootPath joined with
+   * monorepoPath) — or the test override on PlanExecutorOptions.repoRoot.
+   */
+  cwd: string;
   transport?: RunAgentTransport;
+}
+
+/**
+ * Resolve the SDK cwd for a candidate plan from its app's brain. Returns
+ * null when the brain doesn't exist, fails to parse, or has no `repo`
+ * field — those apps are not enabled for auto-fire.
+ */
+export function resolveAppCwd(
+  dataDir: string,
+  vault: string,
+  app: string,
+): string | null {
+  let brain;
+  try {
+    brain = loadBrain(brainFile(dataDir, vault, app));
+  } catch {
+    return null;
+  }
+  if (!brain.repo) return null;
+  const root = brain.repo.rootPath;
+  const sub = brain.repo.monorepoPath;
+  return sub ? path.join(root, sub) : root;
 }
 
 async function fireDeveloper(
@@ -139,6 +168,7 @@ async function fireDeveloper(
         app,
         vault: record.vault,
         dataDir: fire.dataDir,
+        repoRoot: fire.cwd,
         ...(fire.transport !== undefined && { transport: fire.transport }),
       });
       return {
@@ -157,7 +187,7 @@ async function fireDeveloper(
       app,
       vault: record.vault,
       dataDir: fire.dataDir,
-      ...(fire.repoRoot !== undefined && { repoRoot: fire.repoRoot }),
+      repoRoot: fire.cwd,
       ...(fire.transport !== undefined && { transport: fire.transport }),
     });
     return {
@@ -239,7 +269,7 @@ async function runExecute(
   fire: FireOnce,
 ): Promise<FiredPayload> {
   try {
-    assertCleanMain(fire.repoRoot);
+    assertCleanMain(fire.cwd);
   } catch (err) {
     const message =
       err instanceof DeveloperError
@@ -264,9 +294,11 @@ async function runExecute(
 
 export interface TickInput {
   dataDir: string;
-  enabledApps: ReadonlyArray<string>;
   ctx: DaemonContext;
-  /** Override repo root (tests inject a fixture path). */
+  /**
+   * Override repo root for ALL fires this tick (test fixture path). When
+   * unset, each fire's cwd is resolved per-app from the brain.
+   */
   repoRoot?: string;
   /** Daily UTC cap on `agent-call` events. Default 150. See §18. */
   dailyCallCap?: number;
@@ -279,14 +311,12 @@ export interface TickResult {
   skipped: Array<{ planId: string; reason: string }>;
 }
 
-function buildFireOnce(input: TickInput): FireOnce {
+function buildFireOnce(input: TickInput, cwd: string): FireOnce {
   const base: FireOnce = {
     dataDir: input.dataDir,
     ctx: input.ctx,
+    cwd,
   };
-  if (input.repoRoot !== undefined) {
-    base.repoRoot = input.repoRoot;
-  }
   if (input.transport !== undefined) {
     base.transport = input.transport;
   }
@@ -328,13 +358,18 @@ export async function runPlanExecutorTick(
   );
 
   for (const candidate of candidates) {
-    const enabled = input.enabledApps.includes(candidate.app);
-    if (!enabled) {
+    // Resolve the cwd for this app. Test override > brain.repo lookup.
+    // Apps without a populated `brain.repo` are skipped — they were never
+    // onboarded with a code-repo path, so Developer has nowhere to run.
+    const cwd =
+      input.repoRoot ??
+      resolveAppCwd(input.dataDir, candidate.vault, candidate.app);
+    if (cwd === null) {
       const payload: FiredPayload = {
         planId: candidate.id,
         app: candidate.app,
         mode: "skipped",
-        reason: `auto-fire only enabled for ${input.enabledApps.join(", ")} (Phase 1 limitation; multi-repo lands later)`,
+        reason: `no brain.repo configured for app "${candidate.app}" — re-onboard with --repo to enable auto-fire`,
       };
       writeFiredEvent(input.dataDir, candidate, payload);
       skipped.push({ planId: candidate.id, reason: payload.reason ?? "" });
@@ -351,7 +386,7 @@ export async function runPlanExecutorTick(
       reason: "claimed; result pending",
     });
 
-    const fire = buildFireOnce(input);
+    const fire = buildFireOnce(input, cwd);
 
     if (mode === "execute") {
       // Serialise execute fires through the module-level queue so concurrent
@@ -401,7 +436,6 @@ export function createPlanExecutorService(
   opts: PlanExecutorOptions,
 ): DaemonService {
   let timer: NodeJS.Timeout | null = null;
-  const enabledApps = opts.enabledApps ?? DEFAULT_ENABLED_APPS;
   const tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
 
   // Guards against overlapping ticks: if a tick is still running when the
@@ -431,7 +465,6 @@ export function createPlanExecutorService(
           // fail at fire time with a clear error.
           const tickInput: TickInput = {
             dataDir: opts.dataDir,
-            enabledApps,
             ctx,
           };
           if (opts.repoRoot !== undefined) {
