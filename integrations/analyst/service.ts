@@ -1,10 +1,18 @@
 import path from "node:path";
-import { runAnalystScan } from "../../agents/analyst.ts";
+import {
+  autoDraftFromSignals,
+  runAnalystScan,
+} from "../../agents/analyst.ts";
+import {
+  createSdkClient,
+  type AnthropicClient,
+} from "../../orchestrator/agent-sdk-runtime.ts";
 import { listOnboardedApps } from "../../orchestrator/brain.ts";
 import yarnAuditCollector from "../../tools/scanners/yarn-audit.ts";
 import type {
   CollectorContext,
   SignalCollector,
+  SignalSeverity,
 } from "../../tools/scanners/types.ts";
 import type { DaemonContext, DaemonService } from "../../cli/commands/daemon.ts";
 
@@ -24,6 +32,14 @@ export interface AnalystServiceOptions {
   tickMs?: number;
   /** Override the collectors run on each tick (test seam). */
   collectors?: ReadonlyArray<SignalCollector>;
+  /**
+   * Severity threshold for auto-drafting. Default `critical`. Set to
+   * `null` to disable auto-drafting entirely; the sweep will still
+   * record signals but never call Strategist.
+   */
+  autoDraftThreshold?: SignalSeverity | null;
+  /** Override the SDK client used for auto-drafting (test seam). */
+  buildAnthropicClient?: () => AnthropicClient;
   /**
    * Override the tick body for testing — replaces the per-tick scan
    * loop with a custom function.
@@ -52,6 +68,17 @@ export function createAnalystService(
   let timer: NodeJS.Timeout | null = null;
   const tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
   const collectors = opts.collectors ?? DEFAULT_COLLECTORS;
+  const autoDraftThreshold =
+    opts.autoDraftThreshold === undefined ? "critical" : opts.autoDraftThreshold;
+  let lazyClient: AnthropicClient | null = null;
+  const getClient = (): AnthropicClient => {
+    if (!lazyClient) {
+      lazyClient = opts.buildAnthropicClient
+        ? opts.buildAnthropicClient()
+        : createSdkClient();
+    }
+    return lazyClient;
+  };
 
   // Guards against overlapping ticks: if the prior sweep is still in
   // flight when setInterval fires again, the new callback returns
@@ -74,6 +101,12 @@ export function createAnalystService(
             dataDir: opts.dataDir,
             collectors,
             ctx,
+            ...(autoDraftThreshold !== null && {
+              autoDraft: {
+                threshold: autoDraftThreshold,
+                getClient,
+              },
+            }),
           });
         } catch (err) {
           ctx.logger.error("analyst tick errored", err);
@@ -99,17 +132,30 @@ export interface AnalystTickInput {
   dataDir: string;
   collectors: ReadonlyArray<SignalCollector>;
   ctx: DaemonContext;
+  /**
+   * Enable auto-draft hand-off. When set, signals at or above the
+   * threshold get handed to Strategist for a plan draft. Idempotent on
+   * `signal.dedupKey`. Omit to disable auto-drafting (signals are still
+   * recorded in the event log).
+   */
+  autoDraft?: {
+    threshold: SignalSeverity;
+    getClient: () => AnthropicClient;
+  };
 }
 
 export interface AnalystTickResult {
   scannedApps: number;
   skippedApps: number;
   totalSignals: number;
+  /** Plans Analyst auto-drafted on this tick (across all apps). */
+  autoDraftedPlanIds: string[];
   perApp: Array<{
     vault: string;
     app: string;
     cwd?: string;
     signalCount: number;
+    autoDraftedCount?: number;
     error?: string;
   }>;
 }
@@ -126,6 +172,7 @@ export async function runAnalystTick(
     scannedApps: 0,
     skippedApps: 0,
     totalSignals: 0,
+    autoDraftedPlanIds: [],
     perApp: [],
   };
 
@@ -155,11 +202,36 @@ export async function runAnalystTick(
       });
       result.scannedApps += 1;
       result.totalSignals += scan.signals.length;
+
+      let autoDraftedCount = 0;
+      if (input.autoDraft && scan.signals.length > 0) {
+        const draft = await autoDraftFromSignals({
+          signals: scan.signals,
+          app,
+          vault,
+          dataDir: input.dataDir,
+          client: input.autoDraft.getClient(),
+          severityThreshold: input.autoDraft.threshold,
+        });
+        autoDraftedCount = draft.draftedCount;
+        for (const e of draft.entries) {
+          if (e.planId) result.autoDraftedPlanIds.push(e.planId);
+        }
+        if (draft.errorCount > 0) {
+          input.ctx.logger.error(
+            "analyst: auto-draft errors",
+            new Error(`${draft.errorCount} signal(s) failed to draft`),
+            { app, errorCount: draft.errorCount },
+          );
+        }
+      }
+
       result.perApp.push({
         vault,
         app,
         cwd,
         signalCount: scan.signals.length,
+        ...(autoDraftedCount > 0 && { autoDraftedCount }),
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -179,6 +251,7 @@ export async function runAnalystTick(
       scannedApps: result.scannedApps,
       skippedApps: result.skippedApps,
       totalSignals: result.totalSignals,
+      autoDraftedPlans: result.autoDraftedPlanIds.length,
     });
   }
 
