@@ -14,6 +14,7 @@ import { runReject } from "./commands/reject.ts";
 import { runReprioritize } from "./commands/reprioritize.ts";
 import { runRevise } from "./commands/revise.ts";
 import { runRun } from "./commands/run.ts";
+import { runScan } from "./commands/scan.ts";
 import { runStatus } from "./commands/status.ts";
 import { runVersion } from "./commands/version.ts";
 
@@ -57,6 +58,10 @@ Utilities:
                               Current-month token spend, cache hit rate, by agent / plan / model
   logs tail [--file <path>]   Stream today's daemon log (tail -f). Use --file
                               to override the log path.
+  scan --app <name> [--vault <v>]
+                              Run signal collectors against an onboarded app.
+                              Records each finding as a 'signal' event.
+                              Exits non-zero on any high/critical severity.
   status                      Daemon status, plan counts, last agent call
   version                     Print Jarvis version
   help, --help, -h            Show this message
@@ -110,6 +115,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runCost(rest);
     case "logs":
       return runLogs(rest);
+    case "scan":
+      return runScan(rest);
     case "status":
       return runStatus(rest);
     case "version":
