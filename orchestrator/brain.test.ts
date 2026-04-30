@@ -2,7 +2,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { brainExists, brainSchema, loadBrain, saveBrain } from "./brain.ts";
+import {
+  brainExists,
+  brainSchema,
+  listOnboardedApps,
+  loadBrain,
+  saveBrain,
+} from "./brain.ts";
 import type { BrainInput } from "./brain.ts";
 
 const minimalJarvisBrain: BrainInput = {
@@ -167,5 +173,86 @@ describe("brain IO", () => {
   it("loadBrain rejects a malformed brain on disk", () => {
     fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1 }));
     expect(() => loadBrain(file)).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// listOnboardedApps — multi-vault sweep
+// ---------------------------------------------------------------------------
+
+describe("listOnboardedApps", () => {
+  let dataDir: string;
+
+  beforeEach(() => {
+    dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-list-apps-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  function seed(vault: string, app: string, repo?: BrainInput["repo"]): void {
+    const brainsDir = path.join(dataDir, "vaults", vault, "brains", app);
+    fs.mkdirSync(brainsDir, { recursive: true });
+    saveBrain(path.join(brainsDir, "brain.json"), {
+      schemaVersion: 1,
+      projectName: app,
+      projectType: "app",
+      projectStatus: "active",
+      projectPriority: 3,
+      ...(repo !== undefined && { repo }),
+    });
+  }
+
+  it("returns an empty list when the vaults dir is missing", () => {
+    expect(listOnboardedApps(dataDir)).toEqual([]);
+  });
+
+  it("walks every vault and returns each onboarded app", () => {
+    seed("personal", "alpha", { rootPath: "/repo/alpha" });
+    seed("personal", "beta", { rootPath: "/repo/beta" });
+    seed("consulting", "gamma", { rootPath: "/repo/gamma" });
+    const apps = listOnboardedApps(dataDir);
+    expect(apps).toHaveLength(3);
+    const sorted = [...apps].sort((a, b) => a.app.localeCompare(b.app));
+    expect(sorted.map((a) => `${a.vault}/${a.app}`)).toEqual([
+      "personal/alpha",
+      "personal/beta",
+      "consulting/gamma",
+    ]);
+  });
+
+  it("includes apps without brain.repo (caller decides whether to skip)", () => {
+    seed("personal", "with-repo", { rootPath: "/repo/x" });
+    seed("personal", "no-repo");
+    const apps = listOnboardedApps(dataDir);
+    const withRepo = apps.find((a) => a.app === "with-repo");
+    const noRepo = apps.find((a) => a.app === "no-repo");
+    expect(withRepo?.brain.repo?.rootPath).toBe("/repo/x");
+    expect(noRepo?.brain.repo).toBeUndefined();
+  });
+
+  it("silently skips brains that fail to parse", () => {
+    seed("personal", "ok", { rootPath: "/repo/ok" });
+    // Corrupt brain
+    const broken = path.join(
+      dataDir,
+      "vaults",
+      "personal",
+      "brains",
+      "broken",
+    );
+    fs.mkdirSync(broken, { recursive: true });
+    fs.writeFileSync(path.join(broken, "brain.json"), "not valid json");
+    const apps = listOnboardedApps(dataDir);
+    expect(apps).toHaveLength(1);
+    expect(apps[0]?.app).toBe("ok");
+  });
+
+  it("handles vaults with empty brains/ directories", () => {
+    fs.mkdirSync(path.join(dataDir, "vaults", "personal", "brains"), {
+      recursive: true,
+    });
+    expect(listOnboardedApps(dataDir)).toEqual([]);
   });
 });

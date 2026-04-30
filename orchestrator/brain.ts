@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { z } from "zod";
 import { atomicWriteFileSync } from "./atomic-write.ts";
 
@@ -88,6 +89,55 @@ export function loadBrain(filePath: string): Brain {
   const text = fs.readFileSync(filePath, "utf8");
   const data: unknown = JSON.parse(text);
   return brainSchema.parse(data);
+}
+
+export interface OnboardedApp {
+  vault: string;
+  app: string;
+  brain: Brain;
+}
+
+/**
+ * Walks `<dataDir>/vaults/<vault>/brains/<app>/brain.json` for every vault
+ * and every app, returning the parsed brain when it loads cleanly. Brains
+ * that fail to parse (corrupt JSON, schema drift) are skipped silently —
+ * sweep operations like the analyst tick should not crash on one broken
+ * brain. The skipped count surfaces as a separate signal in the future.
+ *
+ * Used by the daemon's analyst-tick service and any other multi-app
+ * sweeper that needs to enumerate everything Jarvis is aware of.
+ */
+export function listOnboardedApps(dataDir: string): OnboardedApp[] {
+  const vaultsRoot = path.join(dataDir, "vaults");
+  if (!fs.existsSync(vaultsRoot)) return [];
+
+  const out: OnboardedApp[] = [];
+  for (const vault of safeReaddir(vaultsRoot)) {
+    const brainsRoot = path.join(vaultsRoot, vault, "brains");
+    if (!fs.existsSync(brainsRoot)) continue;
+    for (const app of safeReaddir(brainsRoot)) {
+      const file = path.join(brainsRoot, app, "brain.json");
+      if (!fs.existsSync(file)) continue;
+      try {
+        const brain = loadBrain(file);
+        out.push({ vault, app, brain });
+      } catch {
+        // Skip brains that fail schema validation.
+      }
+    }
+  }
+  return out;
+}
+
+function safeReaddir(dir: string): string[] {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch {
+    return [];
+  }
 }
 
 export function saveBrain(filePath: string, brain: BrainInput): Brain {

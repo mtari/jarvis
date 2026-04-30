@@ -10,6 +10,7 @@ import {
   type PidFileData,
 } from "../../orchestrator/daemon-pid.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
+import { createAnalystService } from "../../integrations/analyst/service.ts";
 import { createPlanExecutorService } from "../../integrations/plan-executor/service.ts";
 import {
   createSlackService,
@@ -190,6 +191,7 @@ function defaultServices(dataDir: string): DaemonService[] {
   const services: DaemonService[] = [
     createHeartbeatService(),
     createPlanExecutorService({ dataDir }),
+    createAnalystService({ dataDir }),
   ];
   const slackConfig = readSlackEnv();
   if (slackConfig) {
