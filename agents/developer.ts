@@ -65,7 +65,7 @@ export class DeveloperError extends Error {
   }
 }
 
-const DEFAULT_MAX_TURNS_DRAFT_IMPL = 15;
+const DEFAULT_MAX_TURNS_DRAFT_IMPL = 30;
 const DEFAULT_MAX_TURNS_EXECUTE = 60;
 
 // ---------- Mode A: draft implementation plan ----------
