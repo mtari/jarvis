@@ -308,9 +308,12 @@ describe("plan-executor", () => {
     expect(result.skipped[0]?.reason).toContain("erdei-fahazak");
     expect(calls.length).toBe(0);
 
-    // Recorded as fired (skipped) so it doesn't re-trigger next tick
+    // The skip is recorded as a `plan-executor-fired` event but
+    // `readFiredPlanIds` excludes refusal-style skips (per the
+    // refusal-aware filter) so the plan re-evaluates next tick once the
+    // user adds brain.repo via re-onboarding.
     const fired = readFiredPlanIds(dbFile(sandbox.dataDir));
-    expect(fired.has("2026-04-28-other")).toBe(true);
+    expect(fired.has("2026-04-28-other")).toBe(false);
   });
 
   it("skips plans not in approved state", async () => {
@@ -384,6 +387,174 @@ describe("plan-executor", () => {
       rmSync(repoA, { recursive: true, force: true });
       rmSync(repoB, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// readFiredPlanIds — refusal vs. terminal outcome semantics
+//
+// Today's bug: an obsolete `mode: "skipped"` row from a prior version's
+// enabledApps filter shadowed an erdei-fahazak plan permanently. The fix
+// only locks plans whose latest fired event is a TERMINAL outcome (success,
+// errored fire, in-flight claim, not-runnable). Refusals — including
+// arbitrary skip reasons and recoverable BLOCKED/RATE_LIMITED gates — let
+// the plan re-evaluate on the next tick.
+// ---------------------------------------------------------------------------
+
+describe("readFiredPlanIds — refusal-aware filter", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  let db: Database.Database;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    db = new Database(dbFile(sandbox.dataDir));
+  });
+
+  afterEach(() => {
+    db.close();
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function writeFired(payload: Record<string, unknown>): void {
+    db.prepare(
+      "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(
+      payload["app"] ?? "jarvis",
+      "personal",
+      "plan-executor-fired",
+      JSON.stringify(payload),
+      new Date().toISOString(),
+    );
+  }
+
+  it("locks plans with a successful draft-impl fire", () => {
+    writeFired({
+      planId: "p-success",
+      app: "jarvis",
+      mode: "draft-impl",
+      durationMs: 1000,
+      result: { numTurns: 5 },
+    });
+    expect(readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-success")).toBe(true);
+  });
+
+  it("locks plans with a successful execute fire", () => {
+    writeFired({
+      planId: "p-exec",
+      app: "jarvis",
+      mode: "execute",
+      durationMs: 2000,
+      result: { done: true, branch: "feat/x", prUrl: "https://x" },
+    });
+    expect(readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-exec")).toBe(true);
+  });
+
+  it("locks plans with the in-flight 'claimed; result pending' marker", () => {
+    writeFired({
+      planId: "p-claimed",
+      app: "jarvis",
+      mode: "skipped",
+      reason: "claimed; result pending",
+    });
+    expect(readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-claimed")).toBe(true);
+  });
+
+  it("locks plans flagged not-runnable", () => {
+    writeFired({
+      planId: "p-not-runnable",
+      app: "jarvis",
+      mode: "not-runnable",
+      reason: "type=business, status=approved",
+    });
+    expect(
+      readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-not-runnable"),
+    ).toBe(true);
+  });
+
+  it("does NOT lock plans skipped with an obsolete refusal reason", () => {
+    // This is the actual bug from 2026-04-30: the daemon wrote
+    // "auto-fire only enabled for jarvis" 2 days ago, then multi-repo
+    // landed, but the plan stayed shadowed.
+    writeFired({
+      planId: "p-stale-refusal",
+      app: "erdei-fahazak",
+      mode: "skipped",
+      reason: "auto-fire only enabled for jarvis",
+    });
+    expect(
+      readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-stale-refusal"),
+    ).toBe(false);
+  });
+
+  it("does NOT lock plans skipped with 'no brain.repo configured'", () => {
+    writeFired({
+      planId: "p-no-repo",
+      app: "newapp",
+      mode: "skipped",
+      reason: "no brain.repo configured for app \"newapp\"",
+    });
+    expect(
+      readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-no-repo"),
+    ).toBe(false);
+  });
+
+  it("does NOT lock plans whose execute fire returned a BLOCKED:assertCleanMain reason", () => {
+    writeFired({
+      planId: "p-blocked",
+      app: "jarvis",
+      mode: "execute",
+      reason: "BLOCKED: assertCleanMain: working tree is dirty",
+    });
+    expect(
+      readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-blocked"),
+    ).toBe(false);
+  });
+
+  it("does NOT lock plans whose fire returned a RATE_LIMITED reason", () => {
+    writeFired({
+      planId: "p-ratelimited",
+      app: "jarvis",
+      mode: "execute",
+      reason: "RATE_LIMITED: five_hour resets at 2026-04-30T12:00:00Z",
+    });
+    expect(
+      readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-ratelimited"),
+    ).toBe(false);
+  });
+
+  it("locks plans whose fire returned a non-recoverable error", () => {
+    writeFired({
+      planId: "p-errored",
+      app: "jarvis",
+      mode: "execute",
+      reason: "error: Developer execute failed: error_max_turns",
+    });
+    // Non-BLOCKED, non-RATE_LIMITED errors lock — needs human inspection
+    expect(
+      readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-errored"),
+    ).toBe(true);
+  });
+
+  it("locks the plan if ANY of its fired events is terminal", () => {
+    // First an obsolete refusal (doesn't lock on its own), then a
+    // successful fire (does lock). Set semantics: locked.
+    writeFired({
+      planId: "p-mixed",
+      app: "jarvis",
+      mode: "skipped",
+      reason: "auto-fire only enabled for jarvis",
+    });
+    writeFired({
+      planId: "p-mixed",
+      app: "jarvis",
+      mode: "draft-impl",
+      durationMs: 500,
+      result: { numTurns: 3 },
+    });
+    expect(readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-mixed")).toBe(true);
   });
 });
 

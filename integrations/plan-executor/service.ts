@@ -84,8 +84,41 @@ export function assertCleanMain(root?: string): void {
 }
 
 /**
- * Returns the set of plan ids that already have a `plan-executor-fired`
- * event recorded. Used to keep the auto-fire idempotent across ticks.
+ * Returns true when the given fired-event payload represents a *terminal*
+ * outcome — either a successful fire, a fire that errored mid-flight, or
+ * an in-flight claim that another tick must not race against. Refusals
+ * (skip reasons that may become valid later — e.g. obsolete enabledApps
+ * filters from prior versions, "no brain.repo configured", or recoverable
+ * BLOCKED/RATE_LIMITED gates) return false so the next tick can re-evaluate
+ * the plan once the underlying condition resolves.
+ *
+ * Without this filter, any historical refusal silently shadows the plan
+ * forever and the user has to delete events from jarvis.db by hand.
+ */
+function isFinalFiredEvent(p: FiredPayload): boolean {
+  if (p.mode === "skipped") {
+    // The only skipped row that locks is the in-flight claim written
+    // before the fire. Every other "skipped" reason is a refusal whose
+    // condition may change.
+    return p.reason === "claimed; result pending";
+  }
+  if (p.mode === "not-runnable") {
+    // Plan is in the wrong state for Developer; needs human action.
+    return true;
+  }
+  // mode === "draft-impl" | "execute"
+  if (typeof p.reason === "string") {
+    if (p.reason.startsWith("BLOCKED:")) return false;
+    if (p.reason.startsWith("RATE_LIMITED:")) return false;
+  }
+  return true;
+}
+
+/**
+ * Returns the set of plan ids that have a *terminal* `plan-executor-fired`
+ * event recorded. Used to keep the auto-fire idempotent across ticks while
+ * letting plans whose only previous fire was a recoverable refusal re-fire
+ * once the condition resolves. See `isFinalFiredEvent`.
  */
 export function readFiredPlanIds(dbFilePath: string): Set<string> {
   const db = new Database(dbFilePath, { readonly: true });
@@ -99,7 +132,7 @@ export function readFiredPlanIds(dbFilePath: string): Set<string> {
     for (const r of rows) {
       try {
         const p = JSON.parse(r.payload) as FiredPayload;
-        if (p.planId) ids.add(p.planId);
+        if (p.planId && isFinalFiredEvent(p)) ids.add(p.planId);
       } catch {
         // malformed → skip
       }
