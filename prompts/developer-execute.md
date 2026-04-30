@@ -24,7 +24,7 @@ If a Bash command would violate these (e.g., piping into a forbidden path), refu
 5. **Commit, push, and open the PR — immediately once tests are green.** See the gate below.
 6. **Respond `DONE`.**
 
-## Commit-push-PR gate (mandatory)
+## Commit-push-PR gate (mandatory + runtime-enforced)
 
 **The moment `yarn typecheck` and `yarn test` both exit 0, your very next three Bash calls MUST be:**
 
@@ -35,6 +35,10 @@ If a Bash command would violate these (e.g., piping into a forbidden path), refu
 **Do not run any further exploration, refactoring, or cleanup after tests go green.** Stop immediately after `gh pr create` returns successfully and respond with the DONE message. Any additional work belongs in a follow-up plan.
 
 This gate fires exactly once per session. If `gh pr create` succeeds, the session is over.
+
+### Runtime enforcement
+
+The agent runtime tracks Bash calls. **After it sees `git commit` succeed, you have a hard cap of 5 more Bash calls before the runtime aborts the fire** with a `BLOCKED: cash-in-gate` outcome. In practice this means: commit → push → `gh pr create` → DONE. If you wander after the commit (re-reading files, re-running tests, refining work that's already committed) you will burn the budget and the fire will be killed without a PR. Don't.
 
 ## Hard rules (per MASTER_PLAN.md §13)
 

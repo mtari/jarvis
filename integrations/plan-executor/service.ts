@@ -8,6 +8,7 @@ import {
   executePlan,
 } from "../../agents/developer.ts";
 import {
+  CashInGateViolatedError,
   RateLimitedError,
   type RunAgentTransport,
 } from "../../orchestrator/agent-sdk-runtime.ts";
@@ -255,6 +256,25 @@ async function fireDeveloper(
         app,
         mode,
         reason: `RATE_LIMITED: ${err.rateLimitType ?? "unknown"} resets at ${reset}`,
+        durationMs: Date.now() - start,
+      };
+    }
+    if (err instanceof CashInGateViolatedError) {
+      // Developer made a commit but kept running other tools instead of
+      // immediately pushing + opening the PR. The runtime interrupted the
+      // SDK query. Surface as BLOCKED so the refusal-aware filter treats
+      // it as recoverable — the user can manually push + open the PR for
+      // the partial work, then re-fire the plan if needed.
+      fire.ctx.logger.error(
+        "plan-executor: cash-in-commit-early gate violated",
+        err,
+        { planId, mode, postCommitBashCount: err.postCommitBashCount },
+      );
+      return {
+        planId,
+        app,
+        mode,
+        reason: `BLOCKED: cash-in-gate (${err.postCommitBashCount} bash calls after commit without push) — salvage the partial branch by hand`,
         durationMs: Date.now() - start,
       };
     }
