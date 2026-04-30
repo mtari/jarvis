@@ -108,6 +108,27 @@ export class RateLimitedError extends Error {
 }
 
 /**
+ * Thrown when Developer makes a `git commit` Bash call but then continues
+ * running other Bash tools without a `git push` within the cash-in-gate
+ * window. Caught by `fireDeveloper` and surfaced as a `BLOCKED:` payload
+ * so plan-executor's refusal-aware filter treats it as recoverable.
+ *
+ * Today's pre-fix incident: Developer committed at ~06:19 then wandered
+ * for 25+ minutes (re-checking files, re-running tests) without ever
+ * pushing. Salvaged by hand. The gate enforces the prompt rule at the
+ * runtime level so the SDK loop is interrupted instead of running to
+ * the maxTurns ceiling.
+ */
+export class CashInGateViolatedError extends Error {
+  public readonly postCommitBashCount: number;
+  constructor(message: string, postCommitBashCount: number) {
+    super(message);
+    this.name = "CashInGateViolatedError";
+    this.postCommitBashCount = postCommitBashCount;
+  }
+}
+
+/**
  * Drop-in `AnthropicClient` backed by the Claude Agent SDK driving the local
  * `claude` CLI subprocess. Auth comes from `~/.claude/` — no API key.
  *
@@ -421,6 +442,137 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
   return transport(resolved);
 }
 
+/**
+ * Cash-in-commit-early gate threshold. After Developer issues `git commit`,
+ * this many subsequent Bash calls are allowed before the gate fires —
+ * generous enough for `git push` + `gh pr create` + a small recovery (e.g.
+ * one auth retry), strict enough to catch the "wander after commit" pattern
+ * that bit us on 2026-04-30. Tunable via runProcessSdkMessages opts.
+ */
+const POST_COMMIT_BASH_LIMIT = 5;
+
+/** Minimal handle shape for testability — matches the SDK's Query. */
+export interface SdkQueryHandle
+  extends AsyncIterable<unknown> {
+  interrupt(): Promise<void>;
+}
+
+export interface ProcessSdkMessagesOptions {
+  fallbackModel: string;
+  /** Override the cash-in-gate threshold. Default 5. */
+  postCommitBashLimit?: number;
+}
+
+/**
+ * Iterates the SDK message stream, normalises the result into RunAgentResult,
+ * and enforces the cash-in-commit-early gate. Extracted from the default
+ * transport so tests can feed a fake AsyncIterable + interrupt() stub
+ * without importing the SDK.
+ */
+export async function processSdkMessages(
+  handle: SdkQueryHandle,
+  opts: ProcessSdkMessagesOptions,
+): Promise<RunAgentResult> {
+  const limit = opts.postCommitBashLimit ?? POST_COMMIT_BASH_LIMIT;
+
+  // Cash-in-gate state.
+  let committed = false;
+  let pushDetected = false;
+  let postCommitBashCount = 0;
+
+  for await (const raw of handle) {
+    const message = raw as { type: string } & Record<string, unknown>;
+
+    if (message.type === "rate_limit_event") {
+      const info = message["rate_limit_info"] as
+        | {
+            status: string;
+            resetsAt?: number;
+            rateLimitType?: string;
+          }
+        | undefined;
+      if (info && info.status === "rejected") {
+        const resetsAt =
+          info.resetsAt !== undefined ? new Date(info.resetsAt * 1000) : undefined;
+        throw new RateLimitedError(
+          `Claude subscription rate limit (${info.rateLimitType ?? "unknown"})`,
+          resetsAt,
+          info.rateLimitType,
+        );
+      }
+      continue;
+    }
+
+    if (message.type === "assistant") {
+      if (message["error"] === "rate_limit") {
+        throw new RateLimitedError(
+          "Claude subscription rate limit (assistant message)",
+        );
+      }
+      // Cash-in-gate: scan tool_use blocks for Bash calls.
+      const beta = message["message"] as
+        | { content?: Array<Record<string, unknown>> }
+        | undefined;
+      const blocks = beta?.content ?? [];
+      for (const block of blocks) {
+        if (block["type"] !== "tool_use") continue;
+        if (block["name"] !== "Bash") continue;
+        const input = (block["input"] ?? {}) as Record<string, unknown>;
+        const command = typeof input["command"] === "string" ? input["command"] : "";
+        // Detect commit FIRST so the same call isn't counted as post-commit.
+        if (!committed && /\bgit\s+commit\b/.test(command)) {
+          committed = true;
+          continue;
+        }
+        if (committed) {
+          if (/\bgit\s+push\b/.test(command)) {
+            pushDetected = true;
+          }
+          postCommitBashCount += 1;
+          if (!pushDetected && postCommitBashCount > limit) {
+            await handle.interrupt();
+            throw new CashInGateViolatedError(
+              `Cash-in-commit-early gate violated: ${postCommitBashCount} Bash calls after \`git commit\` without \`git push\` (limit ${limit}). Aborting fire so the partial work can be salvaged by hand.`,
+              postCommitBashCount,
+            );
+          }
+        }
+      }
+      continue;
+    }
+
+    if (message.type === "result") {
+      const usage = (message["usage"] as Record<string, number | null | undefined>) ?? {};
+      const errors = Array.isArray(message["errors"]) ? (message["errors"] as string[]) : [];
+      return {
+        text: typeof message["result"] === "string" ? (message["result"] as string) : "",
+        subtype: message["subtype"] as RunAgentResultSubtype,
+        numTurns: (message["num_turns"] as number) ?? 0,
+        durationMs: (message["duration_ms"] as number) ?? 0,
+        totalCostUsd: (message["total_cost_usd"] as number) ?? 0,
+        usage: {
+          inputTokens: (usage["input_tokens"] as number) ?? 0,
+          outputTokens: (usage["output_tokens"] as number) ?? 0,
+          cachedInputTokens: (usage["cache_read_input_tokens"] as number) ?? 0,
+          cacheCreationTokens:
+            (usage["cache_creation_input_tokens"] as number) ?? 0,
+        },
+        permissionDenials: Array.isArray(message["permission_denials"])
+          ? (message["permission_denials"] as unknown[]).length
+          : 0,
+        errors,
+        model: pickModel(
+          message["modelUsage"] as Record<string, unknown> | undefined,
+          opts.fallbackModel,
+        ),
+        stopReason: (message["stop_reason"] as string | null) ?? null,
+      };
+    }
+  }
+
+  throw new Error("SDK query stream ended without a result message");
+}
+
 const defaultRunAgentTransport: RunAgentTransport = async (resolved) => {
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
 
@@ -444,56 +596,7 @@ const defaultRunAgentTransport: RunAgentTransport = async (resolved) => {
     options: sdkOpts as never,
   });
 
-  for await (const message of handle) {
-    if (message.type === "rate_limit_event") {
-      const info = message.rate_limit_info;
-      if (info.status === "rejected") {
-        const resetsAt =
-          info.resetsAt !== undefined ? new Date(info.resetsAt * 1000) : undefined;
-        throw new RateLimitedError(
-          `Claude subscription rate limit (${info.rateLimitType ?? "unknown"})`,
-          resetsAt,
-          info.rateLimitType,
-        );
-      }
-      continue;
-    }
-
-    if (message.type === "assistant" && message.error === "rate_limit") {
-      throw new RateLimitedError(
-        "Claude subscription rate limit (assistant message)",
-      );
-    }
-
-    if (message.type === "result") {
-      const usage = message.usage as unknown as Record<
-        string,
-        number | null | undefined
-      >;
-      const errors = "errors" in message ? message.errors : [];
-      return {
-        text: "result" in message ? message.result : "",
-        subtype: message.subtype as RunAgentResultSubtype,
-        numTurns: message.num_turns,
-        durationMs: message.duration_ms,
-        totalCostUsd: message.total_cost_usd,
-        usage: {
-          inputTokens: (usage["input_tokens"] as number) ?? 0,
-          outputTokens: (usage["output_tokens"] as number) ?? 0,
-          cachedInputTokens: (usage["cache_read_input_tokens"] as number) ?? 0,
-          cacheCreationTokens:
-            (usage["cache_creation_input_tokens"] as number) ?? 0,
-        },
-        permissionDenials: message.permission_denials.length,
-        errors,
-        model: pickModel(
-          message.modelUsage as unknown as Record<string, unknown>,
-          resolved.model,
-        ),
-        stopReason: message.stop_reason,
-      };
-    }
-  }
-
-  throw new Error("SDK query stream ended without a result message");
+  return processSdkMessages(handle as unknown as SdkQueryHandle, {
+    fallbackModel: resolved.model,
+  });
 };
