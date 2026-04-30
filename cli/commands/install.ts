@@ -19,6 +19,7 @@ import {
   migrationsDbDir,
   planDir,
   profileFile,
+  repoRoot,
   sandboxDir,
   setupQueueFile,
   vaultDir,
@@ -152,6 +153,10 @@ export async function runInstall(
       projectType: "other",
       projectStatus: "active",
       projectPriority: 3,
+      // The jarvis brain points at the jarvis code repo itself so the
+      // plan-executor can auto-fire Developer for self-improvement plans
+      // against the right cwd. See multi-repo plan + §15.
+      repo: { rootPath: repoRoot() },
     });
 
     fs.mkdirSync(planDir(dataDir, "personal", "jarvis"), { recursive: true });

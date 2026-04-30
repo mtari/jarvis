@@ -217,7 +217,21 @@ export async function runOnboard(
     JSON.stringify(docsIndex, null, 2) + "\n",
   );
 
-  saveBrain(targetBrain, agentResult.brain);
+  // Force `repo` onto the brain from the user's --repo + --monorepo-path
+  // flags. The agent's prompt doesn't compose this (the SDK isn't told the
+  // repo path), and we want it grounded in the user's intent regardless of
+  // what the agent emits. The plan-executor's resolveAppCwd joins these to
+  // derive the SDK cwd. See multi-repo plan + §15.
+  const onboardedBrain = {
+    ...agentResult.brain,
+    repo: {
+      rootPath: repoArg,
+      ...(v["monorepo-path"] !== undefined && {
+        monorepoPath: v["monorepo-path"],
+      }),
+    },
+  };
+  saveBrain(targetBrain, onboardedBrain);
 
   const db = new Database(dbFile(dataDir));
   try {

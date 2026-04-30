@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -9,7 +9,7 @@ import type {
   RunAgentResult,
   RunAgentTransport,
 } from "../../orchestrator/agent-sdk-runtime.ts";
-import { dbFile } from "../../cli/paths.ts";
+import { brainDir, brainFile, dbFile } from "../../cli/paths.ts";
 import {
   dropPlan,
   makeInstallSandbox,
@@ -17,6 +17,7 @@ import {
   type ConsoleSilencer,
   type InstallSandbox,
 } from "../../cli/commands/_test-helpers.ts";
+import { saveBrain } from "../../orchestrator/brain.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
 import {
   assertCleanMain,
@@ -123,6 +124,22 @@ function scriptedTransport(responses: string[]): ScriptedTransport {
     return fixedRunResult(responses[i++]!);
   };
   return { calls, transport };
+}
+
+function seedBrain(
+  sandbox: InstallSandbox,
+  app: string,
+  overrides: { repo?: { rootPath: string; monorepoPath?: string } } = {},
+): void {
+  mkdirSync(brainDir(sandbox.dataDir, "personal", app), { recursive: true });
+  saveBrain(brainFile(sandbox.dataDir, "personal", app), {
+    schemaVersion: 1,
+    projectName: app,
+    projectType: "app",
+    projectStatus: "active",
+    projectPriority: 3,
+    ...(overrides.repo !== undefined && { repo: overrides.repo }),
+  });
 }
 
 function fakeDaemonCtx(): DaemonContext {
@@ -235,7 +252,6 @@ describe("plan-executor", () => {
     const { transport } = scriptedTransport([VALID_IMPL_PLAN_BLOCK(parentId)]);
     const result = await runPlanExecutorTick({
       dataDir: sandbox.dataDir,
-      enabledApps: ["jarvis"],
       transport,
       ctx: fakeDaemonCtx(),
     });
@@ -258,7 +274,6 @@ describe("plan-executor", () => {
 
     const first = await runPlanExecutorTick({
       dataDir: sandbox.dataDir,
-      enabledApps: ["jarvis"],
       transport,
       ctx: fakeDaemonCtx(),
     });
@@ -267,7 +282,6 @@ describe("plan-executor", () => {
 
     const second = await runPlanExecutorTick({
       dataDir: sandbox.dataDir,
-      enabledApps: ["jarvis"],
       transport,
       ctx: fakeDaemonCtx(),
     });
@@ -275,21 +289,23 @@ describe("plan-executor", () => {
     expect(calls.length).toBe(callsAfterFirst); // no new API call
   });
 
-  it("skips plans whose app isn't in enabledApps", async () => {
+  it("skips plans whose app has no brain.repo configured", async () => {
     dropPlan(sandbox, "2026-04-28-other", {
       status: "approved",
       app: "erdei-fahazak",
     });
+    // Note: no brain for erdei-fahazak in this sandbox → resolveAppCwd
+    // returns null → plan is skipped with the "no brain.repo" reason.
     const { transport, calls } = scriptedTransport([]);
     const result = await runPlanExecutorTick({
       dataDir: sandbox.dataDir,
-      enabledApps: ["jarvis"],
       transport,
       ctx: fakeDaemonCtx(),
     });
     expect(result.fired).toHaveLength(0);
     expect(result.skipped).toHaveLength(1);
-    expect(result.skipped[0]?.reason).toContain("only enabled for jarvis");
+    expect(result.skipped[0]?.reason).toContain("no brain.repo configured");
+    expect(result.skipped[0]?.reason).toContain("erdei-fahazak");
     expect(calls.length).toBe(0);
 
     // Recorded as fired (skipped) so it doesn't re-trigger next tick
@@ -303,7 +319,6 @@ describe("plan-executor", () => {
     const { transport } = scriptedTransport([]);
     const result = await runPlanExecutorTick({
       dataDir: sandbox.dataDir,
-      enabledApps: ["jarvis"],
       transport,
       ctx: fakeDaemonCtx(),
     });
@@ -320,7 +335,6 @@ describe("plan-executor", () => {
     const { transport } = scriptedTransport(["not a plan"]);
     const result = await runPlanExecutorTick({
       dataDir: sandbox.dataDir,
-      enabledApps: ["jarvis"],
       transport,
       ctx: fakeDaemonCtx(),
     });
@@ -328,6 +342,48 @@ describe("plan-executor", () => {
     expect(result.fired[0]?.reason).toMatch(/error/);
     // And it's recorded so we don't auto-retry
     expect(readFiredPlanIds(dbFile(sandbox.dataDir)).has("2026-04-28-fail")).toBe(true);
+  });
+
+  it("threads each app's brain.repo cwd into the Developer fire (multi-repo)", async () => {
+    // Two apps, each with its own brain.repo.rootPath. The transport
+    // captures the resolved options so we can assert cwd was threaded.
+    const repoA = mkdtempSync(join(tmpdir(), "jarvis-repo-a-"));
+    const repoB = mkdtempSync(join(tmpdir(), "jarvis-repo-b-"));
+    try {
+      // Seed a brain for each app pointing at its own fake repo
+      seedBrain(sandbox, "appa", { repo: { rootPath: repoA } });
+      seedBrain(sandbox, "appb", {
+        repo: { rootPath: repoB, monorepoPath: "packages/web" },
+      });
+      dropPlan(sandbox, "2026-04-30-a", {
+        status: "approved",
+        app: "appa",
+        implementationReview: "required",
+      });
+      dropPlan(sandbox, "2026-04-30-b", {
+        status: "approved",
+        app: "appb",
+        implementationReview: "required",
+      });
+
+      const { transport, calls } = scriptedTransport([
+        VALID_IMPL_PLAN_BLOCK("2026-04-30-a"),
+        VALID_IMPL_PLAN_BLOCK("2026-04-30-b"),
+      ]);
+      const result = await runPlanExecutorTick({
+        dataDir: sandbox.dataDir,
+        transport,
+        ctx: fakeDaemonCtx(),
+      });
+      expect(result.fired).toHaveLength(2);
+      // Each fire's resolved options carry the cwd derived from that app's brain
+      expect(calls.map((c) => c.cwd).sort()).toEqual(
+        [repoA, join(repoB, "packages/web")].sort(),
+      );
+    } finally {
+      rmSync(repoA, { recursive: true, force: true });
+      rmSync(repoB, { recursive: true, force: true });
+    }
   });
 });
 
@@ -364,7 +420,6 @@ describe("plan-executor execute-queue", () => {
       const { transport } = scriptedTransport([]);
       const result = await runPlanExecutorTick({
         dataDir: sandbox.dataDir,
-        enabledApps: ["jarvis"],
         transport,
         ctx: fakeDaemonCtx(),
         repoRoot: repo.dir,
@@ -390,7 +445,6 @@ describe("plan-executor execute-queue", () => {
       const { transport } = scriptedTransport([]);
       const result = await runPlanExecutorTick({
         dataDir: sandbox.dataDir,
-        enabledApps: ["jarvis"],
         transport,
         ctx: fakeDaemonCtx(),
         repoRoot: repo.dir,
@@ -418,7 +472,6 @@ describe("plan-executor execute-queue", () => {
       const { transport } = scriptedTransport([VALID_IMPL_PLAN_BLOCK(parentId)]);
       const result = await runPlanExecutorTick({
         dataDir: sandbox.dataDir,
-        enabledApps: ["jarvis"],
         transport,
         ctx: fakeDaemonCtx(),
         repoRoot: repo.dir,
@@ -453,7 +506,6 @@ describe("plan-executor execute-queue", () => {
       const { transport } = scriptedTransport([]);
       const result = await runPlanExecutorTick({
         dataDir: sandbox.dataDir,
-        enabledApps: ["jarvis"],
         transport,
         ctx: fakeDaemonCtx(),
         repoRoot: repo.dir,
@@ -512,7 +564,6 @@ describe("createPlanExecutorService tickInFlight guard", () => {
     const service = createPlanExecutorService({
       dataDir: sandbox.dataDir,
       tickMs,
-      enabledApps: ["jarvis"],
       _tickBody: async () => {
         tickCallCount++;
         // First invocation: block until we explicitly release.
@@ -554,7 +605,6 @@ describe("createPlanExecutorService tickInFlight guard", () => {
     const service = createPlanExecutorService({
       dataDir: sandbox.dataDir,
       tickMs,
-      enabledApps: ["jarvis"],
       _tickBody: async () => {
         tickCallCount++;
         if (tickCallCount === 1) {

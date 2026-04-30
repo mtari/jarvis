@@ -133,6 +133,9 @@ describe("runOnboard", () => {
     const brain = loadBrain(brainFile(sandbox.dataDir, "personal", "demoapp"));
     expect(brain.projectName).toBe("demoapp");
     expect(brain.projectType).toBe("app");
+    // Multi-repo support: onboard writes brain.repo from --repo flag
+    expect(brain.repo?.rootPath).toBe(repoRoot);
+    expect(brain.repo?.monorepoPath).toBeUndefined();
 
     const docsJson = JSON.parse(
       fs.readFileSync(brainDocsFile(sandbox.dataDir, "personal", "demoapp"), "utf8"),
@@ -156,6 +159,27 @@ describe("runOnboard", () => {
     } finally {
       db.close();
     }
+  });
+
+  it("writes brain.repo.monorepoPath when --monorepo-path is provided", async () => {
+    // resolveRepoRoot validates the monorepo path exists, so create the
+    // subdir in the fixture repo first.
+    fs.mkdirSync(path.join(repoRoot, "apps", "demoapp"), { recursive: true });
+    const code = await runOnboard(
+      [
+        "--app",
+        "demoapp",
+        "--repo",
+        repoRoot,
+        "--monorepo-path",
+        "apps/demoapp",
+      ],
+      { transport: fixedTransport(BRAIN_FOR("demoapp")) },
+    );
+    expect(code).toBe(0);
+    const brain = loadBrain(brainFile(sandbox.dataDir, "personal", "demoapp"));
+    expect(brain.repo?.rootPath).toBe(repoRoot);
+    expect(brain.repo?.monorepoPath).toBe("apps/demoapp");
   });
 
   it("absorbs local-file docs into the agent context", async () => {

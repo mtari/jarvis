@@ -50,6 +50,36 @@ describe("brain schema", () => {
     ).toThrow();
   });
 
+  it("accepts an optional repo with rootPath + monorepoPath", () => {
+    const parsed = brainSchema.parse({
+      ...minimalJarvisBrain,
+      repo: {
+        rootPath: "/Users/me/projects/myapp",
+        monorepoPath: "apps/myapp",
+      },
+    });
+    expect(parsed.repo?.rootPath).toBe("/Users/me/projects/myapp");
+    expect(parsed.repo?.monorepoPath).toBe("apps/myapp");
+  });
+
+  it("repo.monorepoPath is optional", () => {
+    const parsed = brainSchema.parse({
+      ...minimalJarvisBrain,
+      repo: { rootPath: "/abs/path" },
+    });
+    expect(parsed.repo?.rootPath).toBe("/abs/path");
+    expect(parsed.repo?.monorepoPath).toBeUndefined();
+  });
+
+  it("rejects repo with empty rootPath", () => {
+    expect(() =>
+      brainSchema.parse({
+        ...minimalJarvisBrain,
+        repo: { rootPath: "" },
+      }),
+    ).toThrow();
+  });
+
   it("rejects features with non-string entries", () => {
     expect(() =>
       brainSchema.parse({
