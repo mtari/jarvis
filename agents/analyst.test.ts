@@ -7,7 +7,12 @@ import {
   type InstallSandbox,
 } from "../cli/commands/_test-helpers.ts";
 import { dbFile } from "../cli/paths.ts";
-import { runAnalystScan } from "./analyst.ts";
+import {
+  autoDraftFromSignals,
+  readAutoDraftedDedupKeys,
+  runAnalystScan,
+} from "./analyst.ts";
+import type { AnthropicClient } from "../orchestrator/agent-sdk-runtime.ts";
 import type {
   Signal,
   SignalCollector,
@@ -185,5 +190,276 @@ describe("runAnalystScan", () => {
     expect(result.byCollector[1]?.signalCount).toBe(1);
     expect(result.signals).toHaveLength(1);
     expect(result.signals[0]?.kind).toBe("ok");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// autoDraftFromSignals — Strategist hand-off
+// ---------------------------------------------------------------------------
+
+const VALID_PLAN_DRAFT = `<plan>
+# Plan: Address auto-detected finding
+Type: improvement
+Subtype: bugfix
+ImplementationReview: skip
+App: demo
+Priority: high
+Destructive: false
+Status: draft
+Author: strategist
+Confidence: 80 — auto-detected by Analyst, narrow surface
+
+## Problem
+
+A signal from the analyst pipeline reported an issue that needs addressing.
+
+## Build plan
+
+- Identify the affected code or dependency.
+- Apply a targeted fix.
+- Verify with the existing test suite.
+
+## Testing strategy
+
+Unit tests for the affected component. Manual verification on the staging deploy.
+
+## Acceptance criteria
+
+- The signal no longer fires on the next analyst sweep.
+- No regression in existing tests.
+</plan>`;
+
+interface FakeStrategistCall {
+  brief: string;
+}
+
+function fakeStrategistClient(
+  responseTexts: string[] = [VALID_PLAN_DRAFT],
+): { client: AnthropicClient; calls: FakeStrategistCall[] } {
+  const calls: FakeStrategistCall[] = [];
+  let i = 0;
+  const client: AnthropicClient = {
+    async chat(req) {
+      const initialUser = req.messages.find((m) => m.role === "user");
+      const brief =
+        typeof initialUser?.content === "string" ? initialUser.content : "";
+      calls.push({ brief });
+      const text =
+        i < responseTexts.length
+          ? responseTexts[i++]!
+          : responseTexts[responseTexts.length - 1]!;
+      return {
+        text,
+        blocks: [{ type: "text", text }],
+        stopReason: "end_turn",
+        model: "claude-sonnet-4-6",
+        usage: {
+          inputTokens: 10,
+          outputTokens: 10,
+          cachedInputTokens: 0,
+          cacheCreationTokens: 0,
+        },
+        redactions: [],
+      };
+    },
+  };
+  return { client, calls };
+}
+
+describe("autoDraftFromSignals", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function severityCriticalSignal(): Signal {
+    return {
+      kind: "yarn-audit",
+      severity: "critical",
+      summary: "critical advisory in lodash",
+      dedupKey: "yarn-audit:CVE-2026-X",
+      details: { module: "lodash" },
+    };
+  }
+
+  it("drafts a plan and records an auto-drafted event for a fresh critical signal", async () => {
+    const { client, calls } = fakeStrategistClient([VALID_PLAN_DRAFT]);
+    const result = await autoDraftFromSignals({
+      signals: [severityCriticalSignal()],
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      client,
+    });
+    expect(result.draftedCount).toBe(1);
+    expect(result.entries[0]?.planId).toBeDefined();
+    expect(calls).toHaveLength(1);
+    // The brief mentions the collector + signal context
+    expect(calls[0]?.brief).toContain("yarn-audit collector");
+    expect(calls[0]?.brief).toContain("critical advisory in lodash");
+
+    // The plan markdown is written to disk and an `auto-drafted` event was recorded
+    const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const events = db
+        .prepare("SELECT payload FROM events WHERE kind = 'auto-drafted'")
+        .all() as Array<{ payload: string }>;
+      expect(events).toHaveLength(1);
+      expect(JSON.parse(events[0]!.payload)).toMatchObject({
+        signalKind: "yarn-audit",
+        signalDedupKey: "yarn-audit:CVE-2026-X",
+        actor: "analyst",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("does NOT redraft on a second call with the same dedupKey", async () => {
+    const signal = severityCriticalSignal();
+    const { client: c1 } = fakeStrategistClient();
+    await autoDraftFromSignals({
+      signals: [signal],
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      client: c1,
+    });
+    // Second call: brand-new client so we can assert no chat() was made
+    const { client: c2, calls: secondCalls } = fakeStrategistClient();
+    const result = await autoDraftFromSignals({
+      signals: [signal],
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      client: c2,
+    });
+    expect(result.draftedCount).toBe(0);
+    expect(result.alreadyDraftedCount).toBe(1);
+    expect(secondCalls).toHaveLength(0);
+    expect(result.entries[0]?.skippedReason).toContain("already auto-drafted");
+  });
+
+  it("does NOT redraft within the same call when two signals share a dedupKey", async () => {
+    const a = severityCriticalSignal();
+    const b: Signal = { ...a, summary: "duplicate" };
+    const { client, calls } = fakeStrategistClient();
+    const result = await autoDraftFromSignals({
+      signals: [a, b],
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      client,
+    });
+    expect(result.draftedCount).toBe(1);
+    expect(result.alreadyDraftedCount).toBe(1);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("skips signals below the severity threshold (default critical)", async () => {
+    const lowSignal: Signal = {
+      kind: "yarn-audit",
+      severity: "low",
+      summary: "low advisory",
+      dedupKey: "yarn-audit:CVE-LOW",
+    };
+    const { client, calls } = fakeStrategistClient();
+    const result = await autoDraftFromSignals({
+      signals: [lowSignal],
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      client,
+    });
+    expect(result.draftedCount).toBe(0);
+    expect(result.belowThresholdCount).toBe(1);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("severityThreshold can be lowered to also draft on high signals", async () => {
+    const highSignal: Signal = {
+      kind: "yarn-audit",
+      severity: "high",
+      summary: "high advisory",
+      dedupKey: "yarn-audit:CVE-HIGH",
+    };
+    const { client } = fakeStrategistClient();
+    const result = await autoDraftFromSignals({
+      signals: [highSignal],
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      client,
+      severityThreshold: "high",
+    });
+    expect(result.draftedCount).toBe(1);
+  });
+
+  it("refuses to auto-draft a signal with no dedupKey", async () => {
+    const signal: Signal = {
+      kind: "yarn-audit",
+      severity: "critical",
+      summary: "critical without dedup",
+      // no dedupKey
+    };
+    const { client, calls } = fakeStrategistClient();
+    const result = await autoDraftFromSignals({
+      signals: [signal],
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      client,
+    });
+    expect(result.draftedCount).toBe(0);
+    expect(result.noDedupKeyCount).toBe(1);
+    expect(result.entries[0]?.skippedReason).toContain("no dedupKey");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("records the strategist error per-entry and continues with the next signal", async () => {
+    const signalA = severityCriticalSignal();
+    const signalB: Signal = {
+      ...signalA,
+      dedupKey: "yarn-audit:CVE-OTHER",
+      summary: "different critical",
+    };
+    // First Strategist response is malformed (no <plan>); second is valid.
+    const { client } = fakeStrategistClient([
+      "no plan tag here",
+      VALID_PLAN_DRAFT,
+    ]);
+    const result = await autoDraftFromSignals({
+      signals: [signalA, signalB],
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      client,
+    });
+    expect(result.errorCount).toBe(1);
+    expect(result.draftedCount).toBe(1);
+    expect(result.entries[0]?.skippedReason).toContain("strategist error");
+    expect(result.entries[1]?.planId).toBeDefined();
+  });
+
+  it("readAutoDraftedDedupKeys returns the set of known dedup keys", async () => {
+    const { client } = fakeStrategistClient();
+    await autoDraftFromSignals({
+      signals: [severityCriticalSignal()],
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      client,
+    });
+    const keys = readAutoDraftedDedupKeys(dbFile(sandbox.dataDir));
+    expect(keys.has("yarn-audit:CVE-2026-X")).toBe(true);
+    expect(keys.size).toBe(1);
   });
 });
