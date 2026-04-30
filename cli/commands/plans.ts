@@ -24,6 +24,7 @@ export async function runPlans(rawArgs: string[]): Promise<number> {
         approved: { type: "boolean" },
         "pending-review": { type: "boolean" },
         format: { type: "string" },
+        limit: { type: "string" },
       },
       allowPositionals: false,
     });
@@ -69,6 +70,15 @@ export async function runPlans(rawArgs: string[]): Promise<number> {
     records = records.filter((r) => r.plan.metadata.subtype === v.subtype);
   if (v.priority)
     records = records.filter((r) => r.plan.metadata.priority === v.priority);
+
+  if (v.limit !== undefined) {
+    const n = parseInt(v.limit, 10);
+    if (isNaN(n) || n <= 0) {
+      console.error(`plans: invalid --limit "${v.limit}"`);
+      return 1;
+    }
+    records = records.slice(-n);
+  }
 
   const format = v.format ?? "table";
   if (format !== "table" && format !== "json") {

@@ -92,4 +92,61 @@ describe("runPlans", () => {
     const code = await runPlans(["--status", "elsewhere"]);
     expect(code).toBe(1);
   });
+
+  it("--limit returns last N plans", async () => {
+    dropPlan(sandbox, "2026-04-27-alpha", { title: "Alpha", status: "draft" });
+    dropPlan(sandbox, "2026-04-27-beta", { title: "Beta", status: "draft" });
+    dropPlan(sandbox, "2026-04-27-gamma", { title: "Gamma", status: "draft" });
+
+    logs = [];
+    const code = await runPlans(["--limit", "2"]);
+    expect(code).toBe(0);
+    const out = logs.join("\n");
+    expect(out).not.toContain("2026-04-27-alpha");
+    expect(out).toContain("2026-04-27-beta");
+    expect(out).toContain("2026-04-27-gamma");
+  });
+
+  it("omitting --limit returns all plans", async () => {
+    dropPlan(sandbox, "2026-04-27-alpha", { title: "Alpha", status: "draft" });
+    dropPlan(sandbox, "2026-04-27-beta", { title: "Beta", status: "draft" });
+    dropPlan(sandbox, "2026-04-27-gamma", { title: "Gamma", status: "draft" });
+
+    logs = [];
+    const code = await runPlans([]);
+    expect(code).toBe(0);
+    const out = logs.join("\n");
+    expect(out).toContain("2026-04-27-alpha");
+    expect(out).toContain("2026-04-27-beta");
+    expect(out).toContain("2026-04-27-gamma");
+  });
+
+  it("rejects --limit 0", async () => {
+    let errors: string[] = [];
+    console.error = (msg?: unknown): void => { errors.push(String(msg)); };
+    const code = await runPlans(["--limit", "0"]);
+    expect(code).toBe(1);
+    expect(errors.join("\n")).toContain('invalid --limit "0"');
+  });
+
+  it("rejects --limit -1", async () => {
+    // parseArgs treats "--limit -1" as ambiguous (interprets -1 as a flag); exit 1 is sufficient
+    const code = await runPlans(["--limit", "-1"]);
+    expect(code).toBe(1);
+  });
+
+  it("rejects --limit abc", async () => {
+    let errors: string[] = [];
+    console.error = (msg?: unknown): void => { errors.push(String(msg)); };
+    const code = await runPlans(["--limit", "abc"]);
+    expect(code).toBe(1);
+    expect(errors.join("\n")).toContain('invalid --limit "abc"');
+  });
+
+  it("rejects --limit with no value (caught by parseArgs)", async () => {
+    let errors: string[] = [];
+    console.error = (msg?: unknown): void => { errors.push(String(msg)); };
+    const code = await runPlans(["--limit"]);
+    expect(code).toBe(1);
+  });
 });

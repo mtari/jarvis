@@ -34,7 +34,7 @@ Setup & lifecycle:
 Plans:
   plans [filters]             List plans (filters: --app, --status, --type,
                               --subtype, --priority, --executing, --approved,
-                              --pending-review, --format table|json)
+                              --pending-review, --format table|json, --limit N)
   plan --app <name> [--type improvement|business|marketing] [--subtype <s>] [--vault <v>] [--no-challenge] "<brief>"
                               Draft a new plan via Strategist
   backlog --app <name> [--meta-only | --no-meta]
