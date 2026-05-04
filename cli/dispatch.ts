@@ -16,6 +16,11 @@ import { runRevise } from "./commands/revise.ts";
 import { runRun } from "./commands/run.ts";
 import { runScan } from "./commands/scan.ts";
 import { runStatus } from "./commands/status.ts";
+import {
+  runSuppress,
+  runSuppressions,
+  runUnsuppress,
+} from "./commands/suppress.ts";
 import { runVersion } from "./commands/version.ts";
 
 const HELP = `jarvis — autonomous agent system
@@ -62,6 +67,10 @@ Utilities:
                               Run signal collectors against an onboarded app.
                               Records each finding as a 'signal' event.
                               Exits non-zero on any high/critical severity.
+  suppress <pattern-id> [--reason "..."] [--expires <iso>]
+                              Mute auto-draft for a signal pattern (e.g. yarn-audit:CVE-2026-X)
+  unsuppress <pattern-id>     Clear an active suppression
+  suppressions [--all]        List active suppressions (--all includes cleared)
   status                      Daemon status, plan counts, last agent call
   version                     Print Jarvis version
   help, --help, -h            Show this message
@@ -119,6 +128,12 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runScan(rest);
     case "status":
       return runStatus(rest);
+    case "suppress":
+      return runSuppress(rest);
+    case "unsuppress":
+      return runUnsuppress(rest);
+    case "suppressions":
+      return runSuppressions(rest);
     case "version":
       return runVersion(rest);
     default:
