@@ -1,5 +1,6 @@
 import { parseArgs } from "node:util";
 import {
+  cleanupSuppressions,
   isSuppressed,
   listSuppressions,
   suppress,
@@ -98,8 +99,17 @@ export async function runUnsuppress(rawArgs: string[]): Promise<number> {
 /**
  * `yarn jarvis suppressions [--all]` — lists active suppressions, or all
  * including soft-deleted ones with --all.
+ *
+ * `yarn jarvis suppressions cleanup [--older-than N]` — hard-deletes
+ * cleared / expired rows beyond the retention window (default 90d).
+ * The daemon also runs this once per analyst tick; the CLI subcommand
+ * is for one-off cleanup or testing.
  */
 export async function runSuppressions(rawArgs: string[]): Promise<number> {
+  if (rawArgs[0] === "cleanup") {
+    return runSuppressionsCleanup(rawArgs.slice(1));
+  }
+
   let parsed;
   try {
     parsed = parseArgs({
@@ -139,5 +149,43 @@ export async function runSuppressions(rawArgs: string[]): Promise<number> {
       console.log(`            ${r.reason}`);
     }
   }
+  return 0;
+}
+
+async function runSuppressionsCleanup(rawArgs: string[]): Promise<number> {
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args: rawArgs,
+      options: {
+        "older-than": { type: "string" },
+      },
+      allowPositionals: false,
+    });
+  } catch (err) {
+    console.error(`suppressions cleanup: ${(err as Error).message}`);
+    return 1;
+  }
+
+  const olderThanRaw = parsed.values["older-than"];
+  let olderThanDays: number | undefined;
+  if (olderThanRaw !== undefined) {
+    const n = Number.parseInt(olderThanRaw, 10);
+    if (!Number.isFinite(n) || n < 0) {
+      console.error(
+        `suppressions cleanup: invalid --older-than "${olderThanRaw}" (expected non-negative integer days)`,
+      );
+      return 1;
+    }
+    olderThanDays = n;
+  }
+
+  const removed = cleanupSuppressions(
+    dbFile(getDataDir()),
+    olderThanDays !== undefined ? { olderThanDays } : {},
+  );
+  console.log(
+    `Cleaned up ${removed} suppression row(s) (cleared/expired beyond retention window).`,
+  );
   return 0;
 }

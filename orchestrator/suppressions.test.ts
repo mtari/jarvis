@@ -7,6 +7,7 @@ import {
 } from "../cli/commands/_test-helpers.ts";
 import { dbFile } from "../cli/paths.ts";
 import {
+  cleanupSuppressions,
   isSuppressed,
   listSuppressions,
   suppress,
@@ -127,6 +128,100 @@ describe("suppressions", () => {
       new Date("2099-01-01T00:00:00Z"),
     );
     expect(active.find((r) => r.patternId === "expired")).toBeUndefined();
+  });
+
+  it("cleanupSuppressions is a no-op when the table is empty", () => {
+    expect(cleanupSuppressions(db())).toBe(0);
+  });
+
+  it("cleanupSuppressions never deletes active rows", () => {
+    suppress(db(), { patternId: "live-no-expiry", pattern: "a" });
+    suppress(db(), {
+      patternId: "live-future-expiry",
+      pattern: "b",
+      expiresAt: "2099-12-31T00:00:00Z",
+    });
+    const removed = cleanupSuppressions(
+      db(),
+      {},
+      new Date("2026-05-01T00:00:00Z"),
+    );
+    expect(removed).toBe(0);
+    const ids = listSuppressions(db(), {}, new Date("2026-05-01T00:00:00Z"))
+      .map((r) => r.patternId)
+      .sort();
+    expect(ids).toEqual(["live-future-expiry", "live-no-expiry"]);
+  });
+
+  it("cleanupSuppressions removes cleared rows older than the retention window", () => {
+    // Suppress + clear both rows; cleared_at = far past
+    suppress(db(), { patternId: "old-cleared", pattern: "x" });
+    unsuppress(db(), "old-cleared", new Date("2025-01-01T00:00:00Z"));
+    suppress(db(), { patternId: "recent-cleared", pattern: "y" });
+    unsuppress(db(), "recent-cleared", new Date("2026-04-15T00:00:00Z"));
+
+    // 90d window from now=2026-05-01 ⇒ cutoff=2026-01-31. old-cleared is
+    // before cutoff → deleted; recent-cleared is after → kept.
+    const removed = cleanupSuppressions(
+      db(),
+      {},
+      new Date("2026-05-01T00:00:00Z"),
+    );
+    expect(removed).toBe(1);
+    const remaining = listSuppressions(db(), { includeCleared: true });
+    expect(remaining.map((r) => r.patternId)).toEqual(["recent-cleared"]);
+  });
+
+  it("cleanupSuppressions removes expired rows older than the retention window", () => {
+    suppress(db(), {
+      patternId: "long-expired",
+      pattern: "x",
+      expiresAt: "2025-01-01T00:00:00Z",
+    });
+    suppress(db(), {
+      patternId: "recently-expired",
+      pattern: "y",
+      expiresAt: "2026-04-15T00:00:00Z",
+    });
+    suppress(db(), {
+      patternId: "future-expiry",
+      pattern: "z",
+      expiresAt: "2099-01-01T00:00:00Z",
+    });
+
+    const removed = cleanupSuppressions(
+      db(),
+      {},
+      new Date("2026-05-01T00:00:00Z"),
+    );
+    expect(removed).toBe(1);
+    const remaining = listSuppressions(
+      db(),
+      { includeCleared: true },
+      new Date("2026-05-01T00:00:00Z"),
+    )
+      .map((r) => r.patternId)
+      .sort();
+    expect(remaining).toEqual(["future-expiry", "recently-expired"]);
+  });
+
+  it("cleanupSuppressions respects a custom olderThanDays", () => {
+    suppress(db(), { patternId: "x", pattern: "x" });
+    unsuppress(db(), "x", new Date("2026-04-25T00:00:00Z"));
+
+    // 90-day window keeps it (cutoff = 2026-01-31)
+    expect(
+      cleanupSuppressions(db(), {}, new Date("2026-05-01T00:00:00Z")),
+    ).toBe(0);
+
+    // 1-day window deletes it (cutoff = 2026-04-30)
+    expect(
+      cleanupSuppressions(
+        db(),
+        { olderThanDays: 1 },
+        new Date("2026-05-01T00:00:00Z"),
+      ),
+    ).toBe(1);
   });
 
   it("suppress is an upsert — calling twice on same id refreshes the row", () => {
