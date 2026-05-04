@@ -8,6 +8,7 @@ import {
   type AnthropicClient,
 } from "../../orchestrator/agent-sdk-runtime.ts";
 import { listOnboardedApps } from "../../orchestrator/brain.ts";
+import brokenLinksCollector from "../../tools/scanners/broken-links.ts";
 import yarnAuditCollector from "../../tools/scanners/yarn-audit.ts";
 import type {
   CollectorContext,
@@ -22,7 +23,10 @@ import type { DaemonContext, DaemonService } from "../../cli/commands/daemon.ts"
  * part of the hourly sweep automatically. Manual invocation still uses
  * the same set via `yarn jarvis scan` (see cli/commands/scan.ts).
  */
-const DEFAULT_COLLECTORS: ReadonlyArray<SignalCollector> = [yarnAuditCollector];
+const DEFAULT_COLLECTORS: ReadonlyArray<SignalCollector> = [
+  yarnAuditCollector,
+  brokenLinksCollector,
+];
 
 const DEFAULT_TICK_MS = 60 * 60 * 1000; // 1 hour
 
