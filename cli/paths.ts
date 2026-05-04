@@ -38,6 +38,10 @@ export function logsDir(dataDir: string): string {
   return path.join(dataDir, "logs");
 }
 
+export function triageDir(dataDir: string): string {
+  return path.join(dataDir, "triage");
+}
+
 export function checkpointsDir(dataDir: string): string {
   return path.join(dataDir, "logs", "checkpoints");
 }
