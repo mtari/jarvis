@@ -67,8 +67,11 @@ Utilities:
                               Run signal collectors against an onboarded app.
                               Records each finding as a 'signal' event.
                               Exits non-zero on any high/critical severity.
-  suppress <pattern-id> [--reason "..."] [--expires <iso>]
-                              Mute auto-draft for a signal pattern (e.g. yarn-audit:CVE-2026-X)
+  suppress <pattern> [--reason "..."] [--expires <iso>]
+                              Mute auto-draft for matching signals. Pattern may use
+                              glob wildcards (* zero+ chars, ? one char). Examples:
+                                yarn-audit:CVE-2026-1234  (exact)
+                                yarn-audit:CVE-2026-*     (CVE family)
   unsuppress <pattern-id>     Clear an active suppression
   suppressions [--all]        List active suppressions (--all includes cleared)
   suppressions cleanup [--older-than N]
