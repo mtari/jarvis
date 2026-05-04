@@ -14,6 +14,7 @@ import { appendEvent } from "../orchestrator/event-log.ts";
 import { listPlans } from "../orchestrator/plan-store.ts";
 import {
   autoDraftFromSignals,
+  findPlansAwaitingImpactObservation,
   observeImpact,
   readAutoDraftedDedupKeys,
   runAnalystScan,
@@ -726,5 +727,120 @@ describe("observeImpact", () => {
         collectors: [fakeCollector("yarn-audit", [])],
       }),
     ).rejects.toThrow(/no brain\.repo configured/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findPlansAwaitingImpactObservation — daemon auto-fire eligibility
+// ---------------------------------------------------------------------------
+
+describe("findPlansAwaitingImpactObservation", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  const NOW = new Date("2026-05-04T12:00:00.000Z");
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    fs.rmSync(brainDir(sandbox.dataDir, "personal", "jarvis"), {
+      recursive: true,
+      force: true,
+    });
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function backdate(planPath: string, hoursAgo: number): void {
+    const t = new Date(NOW.getTime() - hoursAgo * 60 * 60 * 1000);
+    fs.utimesSync(planPath, t, t);
+  }
+
+  function recordImpactObserved(planId: string): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: "demo",
+        vaultId: "personal",
+        kind: "impact-observed",
+        payload: { planId, verdict: "success" },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("includes only plans in shipped-pending-impact status", () => {
+    const aPath = dropPlan(sandbox, "plan-a", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    dropPlan(sandbox, "plan-b", { app: "demo", status: "awaiting-review" });
+    backdate(aPath, 48);
+
+    const pending = findPlansAwaitingImpactObservation({
+      dataDir: sandbox.dataDir,
+      now: NOW,
+      delayHours: 24,
+    });
+    expect(pending.map((p) => p.planId)).toEqual(["plan-a"]);
+  });
+
+  it("excludes plans younger than delayHours", () => {
+    const fresh = dropPlan(sandbox, "plan-fresh", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    const old = dropPlan(sandbox, "plan-old", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    backdate(fresh, 2);
+    backdate(old, 48);
+
+    const pending = findPlansAwaitingImpactObservation({
+      dataDir: sandbox.dataDir,
+      now: NOW,
+      delayHours: 24,
+    });
+    expect(pending.map((p) => p.planId)).toEqual(["plan-old"]);
+  });
+
+  it("excludes plans that already have an impact-observed event", () => {
+    const a = dropPlan(sandbox, "plan-done-a", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    const b = dropPlan(sandbox, "plan-todo-b", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    backdate(a, 48);
+    backdate(b, 48);
+    recordImpactObserved("plan-done-a");
+
+    const pending = findPlansAwaitingImpactObservation({
+      dataDir: sandbox.dataDir,
+      now: NOW,
+      delayHours: 24,
+    });
+    expect(pending.map((p) => p.planId)).toEqual(["plan-todo-b"]);
+  });
+
+  it("returns ageHours that reflects file mtime", () => {
+    const p = dropPlan(sandbox, "plan-aged", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    backdate(p, 30);
+    const [pending] = findPlansAwaitingImpactObservation({
+      dataDir: sandbox.dataDir,
+      now: NOW,
+      delayHours: 24,
+    });
+    expect(pending?.ageHours).toBeGreaterThanOrEqual(29.9);
+    expect(pending?.ageHours).toBeLessThanOrEqual(30.1);
   });
 });

@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { loadBrain } from "../orchestrator/brain.ts";
@@ -492,6 +493,72 @@ function resolvePlan(
   return (
     listPlans(dataDir).find((r) => r.id === planId && r.vault === vault) ?? null
   );
+}
+
+/**
+ * Plans in `shipped-pending-impact` whose mtime is at least `delayHours`
+ * old AND for which no `impact-observed` event has been recorded yet.
+ * Used by the daemon's analyst tick to auto-fire observations.
+ */
+export interface PendingImpactObservation {
+  planId: string;
+  vault: string;
+  app: string;
+  /** Hours since the plan file was last modified — proxy for "shipped how long ago". */
+  ageHours: number;
+}
+
+export interface FindPendingObservationsInput {
+  dataDir: string;
+  now: Date;
+  delayHours: number;
+}
+
+export function findPlansAwaitingImpactObservation(
+  input: FindPendingObservationsInput,
+): PendingImpactObservation[] {
+  const observed = readImpactObservedPlanIds(dbFile(input.dataDir));
+  const out: PendingImpactObservation[] = [];
+  for (const r of listPlans(input.dataDir)) {
+    if (r.plan.metadata.status !== "shipped-pending-impact") continue;
+    if (observed.has(r.id)) continue;
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(r.path);
+    } catch {
+      continue;
+    }
+    const ageHours = (input.now.getTime() - stat.mtimeMs) / (1000 * 60 * 60);
+    if (ageHours < input.delayHours) continue;
+    out.push({
+      planId: r.id,
+      vault: r.vault,
+      app: r.app,
+      ageHours,
+    });
+  }
+  return out;
+}
+
+function readImpactObservedPlanIds(dbFilePath: string): Set<string> {
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    const rows = db
+      .prepare("SELECT payload FROM events WHERE kind = 'impact-observed'")
+      .all() as Array<{ payload: string }>;
+    const out = new Set<string>();
+    for (const r of rows) {
+      try {
+        const p = JSON.parse(r.payload) as { planId?: string };
+        if (typeof p.planId === "string") out.add(p.planId);
+      } catch {
+        // skip malformed
+      }
+    }
+    return out;
+  } finally {
+    db.close();
+  }
 }
 
 function readAutoDraftedDedupKeyForPlan(

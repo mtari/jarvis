@@ -7,8 +7,12 @@ import {
   type ConsoleSilencer,
   type InstallSandbox,
 } from "../../cli/commands/_test-helpers.ts";
+import {
+  dropPlan,
+} from "../../cli/commands/_test-helpers.ts";
 import { brainDir, brainFile, dbFile } from "../../cli/paths.ts";
 import { saveBrain } from "../../orchestrator/brain.ts";
+import { appendEvent } from "../../orchestrator/event-log.ts";
 import type {
   CollectorContext,
   Signal,
@@ -273,5 +277,162 @@ describe("createAnalystService tickInFlight guard", () => {
     // Each interval fire ran (the prior tick threw + finally reset the
     // guard) — count > 1 confirms recovery.
     expect(tickCallCount).toBeGreaterThan(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runAnalystTick — observeImpact auto-fire
+// ---------------------------------------------------------------------------
+
+describe("runAnalystTick observeImpact integration", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  const NOW = new Date("2026-05-04T12:00:00.000Z");
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    fs.rmSync(brainDir(sandbox.dataDir, "personal", "jarvis"), {
+      recursive: true,
+      force: true,
+    });
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function backdate(planPath: string, hoursAgo: number): void {
+    const t = new Date(NOW.getTime() - hoursAgo * 60 * 60 * 1000);
+    fs.utimesSync(planPath, t, t);
+  }
+
+  function seedAutoDrafted(planId: string, dedupKey: string, app: string): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: app,
+        vaultId: "personal",
+        kind: "auto-drafted",
+        payload: {
+          signalKind: "yarn-audit",
+          signalDedupKey: dedupKey,
+          signalSeverity: "critical",
+          planId,
+          actor: "analyst",
+        },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("does NOT fire observation when input.observeImpact is omitted", async () => {
+    seedBrainWithRepo(sandbox, "personal", "demo", "/repo/demo");
+    const planPath = dropPlan(sandbox, "plan-x", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    backdate(planPath, 48);
+    seedAutoDrafted("plan-x", "yarn-audit:CVE-X", "demo");
+
+    const result = await runAnalystTick({
+      dataDir: sandbox.dataDir,
+      collectors: [fakeCollector("noop", [])],
+      ctx: fakeDaemonCtx(),
+      // no observeImpact key
+    });
+    expect(result.impactObservationsRun).toBe(0);
+    expect(result.impactVerdicts).toBeUndefined();
+  });
+
+  it("fires observations on eligible plans and counts the verdicts", async () => {
+    seedBrainWithRepo(sandbox, "personal", "demo", "/repo/demo");
+
+    const fixedPlan = dropPlan(sandbox, "plan-fixed", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    backdate(fixedPlan, 48);
+    seedAutoDrafted("plan-fixed", "yarn-audit:CVE-FIXED", "demo");
+
+    const stuckPlan = dropPlan(sandbox, "plan-stuck", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    backdate(stuckPlan, 48);
+    seedAutoDrafted("plan-stuck", "yarn-audit:CVE-STUCK", "demo");
+
+    // Collector emits CVE-STUCK only (CVE-FIXED is gone).
+    const collector = fakeCollector("yarn-audit", [
+      {
+        kind: "yarn-audit",
+        severity: "critical",
+        summary: "still broken",
+        dedupKey: "yarn-audit:CVE-STUCK",
+      },
+    ]);
+
+    const result = await runAnalystTick({
+      dataDir: sandbox.dataDir,
+      collectors: [collector],
+      ctx: fakeDaemonCtx(),
+      observeImpact: { delayHours: 24, now: NOW },
+    });
+
+    expect(result.impactObservationsRun).toBe(2);
+    expect(result.impactVerdicts).toEqual({
+      success: 1,
+      "null-result": 1,
+      "wrong-status": 0,
+      "no-baseline": 0,
+    });
+  });
+
+  it("skips plans whose mtime is younger than delayHours", async () => {
+    seedBrainWithRepo(sandbox, "personal", "demo", "/repo/demo");
+    const fresh = dropPlan(sandbox, "plan-fresh", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    backdate(fresh, 2); // only 2h old
+    seedAutoDrafted("plan-fresh", "yarn-audit:CVE-X", "demo");
+
+    const result = await runAnalystTick({
+      dataDir: sandbox.dataDir,
+      collectors: [fakeCollector("noop", [])],
+      ctx: fakeDaemonCtx(),
+      observeImpact: { delayHours: 24, now: NOW },
+    });
+    expect(result.impactObservationsRun).toBe(0);
+  });
+
+  it("skips a plan whose impact has already been observed (idempotent)", async () => {
+    seedBrainWithRepo(sandbox, "personal", "demo", "/repo/demo");
+    const planPath = dropPlan(sandbox, "plan-done", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    backdate(planPath, 48);
+    seedAutoDrafted("plan-done", "yarn-audit:CVE-DONE", "demo");
+
+    // First tick fires the observation
+    const r1 = await runAnalystTick({
+      dataDir: sandbox.dataDir,
+      collectors: [fakeCollector("yarn-audit", [])],
+      ctx: fakeDaemonCtx(),
+      observeImpact: { delayHours: 24, now: NOW },
+    });
+    expect(r1.impactObservationsRun).toBe(1);
+
+    // Second tick — no re-fire even though plan still on disk + impact-observed event present
+    const r2 = await runAnalystTick({
+      dataDir: sandbox.dataDir,
+      collectors: [fakeCollector("yarn-audit", [])],
+      ctx: fakeDaemonCtx(),
+      observeImpact: { delayHours: 24, now: NOW },
+    });
+    expect(r2.impactObservationsRun).toBe(0);
   });
 });
