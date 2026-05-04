@@ -15,6 +15,7 @@ import { runReprioritize } from "./commands/reprioritize.ts";
 import { runRevise } from "./commands/revise.ts";
 import { runRun } from "./commands/run.ts";
 import { runScan } from "./commands/scan.ts";
+import { runSignals } from "./commands/signals.ts";
 import { runStatus } from "./commands/status.ts";
 import {
   runSuppress,
@@ -67,6 +68,9 @@ Utilities:
                               Run signal collectors against an onboarded app.
                               Records each finding as a 'signal' event.
                               Exits non-zero on any high/critical severity.
+  signals [filters]           Browse recorded signal events. Filters: --app,
+                              --vault, --kind, --severity, --since <iso>,
+                              --limit N, --format table|json
   suppress <pattern> [--reason "..."] [--expires <iso>]
                               Mute auto-draft for matching signals. Pattern may use
                               glob wildcards (* zero+ chars, ? one char). Examples:
@@ -131,6 +135,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runLogs(rest);
     case "scan":
       return runScan(rest);
+    case "signals":
+      return runSignals(rest);
     case "status":
       return runStatus(rest);
     case "suppress":
