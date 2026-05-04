@@ -17,6 +17,7 @@ import { runRun } from "./commands/run.ts";
 import { runScan } from "./commands/scan.ts";
 import { runSignals } from "./commands/signals.ts";
 import { runStatus } from "./commands/status.ts";
+import { runTriage } from "./commands/triage.ts";
 import {
   runSuppress,
   runSuppressions,
@@ -81,6 +82,10 @@ Utilities:
   suppressions cleanup [--older-than N]
                               Hard-delete cleared/expired rows (default 90d retention)
   status                      Daemon status, plan counts, last agent call
+  triage [--format markdown|json] [--window-days N]
+                              Portfolio summary: critical signals, pending
+                              reviews, stuck plans, quiet apps, expiring
+                              suppressions. Default 7-day window.
   version                     Print Jarvis version
   help, --help, -h            Show this message
 
@@ -139,6 +144,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runSignals(rest);
     case "status":
       return runStatus(rest);
+    case "triage":
+      return runTriage(rest);
     case "suppress":
       return runSuppress(rest);
     case "unsuppress":
