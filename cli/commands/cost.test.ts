@@ -10,6 +10,13 @@ import {
 } from "./_test-helpers.ts";
 import { runCost } from "./cost.ts";
 
+/**
+ * The --by-day tests below seed events with hardcoded April-2026 dates
+ * (the dates the tests were written). Pin runCost's "now" to the same
+ * month so the month/day filters match regardless of when CI runs them.
+ */
+const PINNED_NOW = new Date("2026-04-30T12:00:00.000Z");
+
 interface AgentCallSeed {
   agent: string;
   model: string;
@@ -169,7 +176,7 @@ describe("runCost", () => {
         inputTokens: 1_000_000,
         createdAt: "2026-04-10T08:00:00.000Z",
       });
-      expect(await runCost(["--by-day"])).toBe(0);
+      expect(await runCost(["--by-day"], { now: PINNED_NOW })).toBe(0);
       const out = logs.join("\n");
       expect(out).toContain("By day:");
       expect(out).toContain("2026-04-10");
@@ -191,7 +198,7 @@ describe("runCost", () => {
         inputTokens: 1_000_000,
         createdAt: "2026-04-15T14:00:00.000Z",
       });
-      expect(await runCost(["--by-day"])).toBe(0);
+      expect(await runCost(["--by-day"], { now: PINNED_NOW })).toBe(0);
       const out = logs.join("\n");
       // Only one row for 2026-04-15
       const dayLines = out.split("\n").filter((l) => l.includes("2026-04-15"));
@@ -220,7 +227,7 @@ describe("runCost", () => {
         inputTokens: 1_000_000,
         createdAt: "2026-04-20T18:00:00.000Z",
       });
-      expect(await runCost(["--by-day"])).toBe(0);
+      expect(await runCost(["--by-day"], { now: PINNED_NOW })).toBe(0);
       const out = logs.join("\n");
       const daySection = out.split("By day:")[1] ?? "";
       const pos19 = daySection.indexOf("2026-04-19");
@@ -253,12 +260,12 @@ describe("runCost", () => {
       });
 
       // Capture total from plain run
-      await runCost([]);
+      await runCost([], { now: PINNED_NOW });
       const plainOut = logs.join("\n");
       logs.length = 0;
 
       // Capture total from --by-day run
-      await runCost(["--by-day"]);
+      await runCost(["--by-day"], { now: PINNED_NOW });
       const byDayOut = logs.join("\n");
 
       // Both should show $6.00 total (2 × $3.00)
@@ -280,7 +287,7 @@ describe("runCost", () => {
         inputTokens: 1_000_000,
         createdAt: "2026-04-10T08:00:00.000Z",
       });
-      await runCost([]);
+      await runCost([], { now: PINNED_NOW });
       expect(logs.join("\n")).not.toContain("By day:");
     });
 
@@ -298,7 +305,7 @@ describe("runCost", () => {
         inputTokens: 1_000_000,
         createdAt: "2026-04-02T12:00:00.000Z",
       });
-      await runCost(["--format", "json", "--by-day"]);
+      await runCost(["--format", "json", "--by-day"], { now: PINNED_NOW });
       const json = JSON.parse(logs.join("\n")) as Record<string, unknown>;
       expect(Array.isArray(json["byDay"])).toBe(true);
       const byDay = json["byDay"] as Array<{ date: string; calls: number; totalUsd: number }>;
@@ -317,13 +324,13 @@ describe("runCost", () => {
         inputTokens: 1_000_000,
         createdAt: "2026-04-01T12:00:00.000Z",
       });
-      await runCost(["--format", "json"]);
+      await runCost(["--format", "json"], { now: PINNED_NOW });
       const json = JSON.parse(logs.join("\n")) as Record<string, unknown>;
       expect(json["byDay"]).toBeUndefined();
     });
 
     it("empty month: --by-day still returns the empty-month message", async () => {
-      expect(await runCost(["--by-day"])).toBe(0);
+      expect(await runCost(["--by-day"], { now: PINNED_NOW })).toBe(0);
       expect(logs.join("\n")).toContain("No agent calls recorded this month yet");
     });
   });

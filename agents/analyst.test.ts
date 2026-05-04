@@ -462,4 +462,27 @@ describe("autoDraftFromSignals", () => {
     expect(keys.has("yarn-audit:CVE-2026-X")).toBe(true);
     expect(keys.size).toBe(1);
   });
+
+  it("skips signals whose dedupKey is suppressed", async () => {
+    // Suppress the dedup key first
+    const { suppress } = await import("../orchestrator/suppressions.ts");
+    suppress(dbFile(sandbox.dataDir), {
+      patternId: "yarn-audit:CVE-2026-X",
+      pattern: "lodash advisory — accepted risk",
+    });
+
+    const { client, calls } = fakeStrategistClient();
+    const result = await autoDraftFromSignals({
+      signals: [severityCriticalSignal()],
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      client,
+    });
+
+    expect(result.draftedCount).toBe(0);
+    expect(result.suppressedCount).toBe(1);
+    expect(result.entries[0]?.skippedReason).toContain("suppressed");
+    expect(calls).toHaveLength(0);
+  });
 });

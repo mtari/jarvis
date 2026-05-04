@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { appendEvent } from "../orchestrator/event-log.ts";
+import { isSuppressed } from "../orchestrator/suppressions.ts";
 import { dbFile } from "../cli/paths.ts";
 import type { AnthropicClient } from "../orchestrator/agent-sdk-runtime.ts";
 import { runStrategist, StrategistError } from "./strategist.ts";
@@ -179,6 +180,8 @@ export interface AutoDraftFromSignalsResult {
   belowThresholdCount: number;
   /** Count of signals skipped because they had no dedup key. */
   noDedupKeyCount: number;
+  /** Count of signals skipped because their dedupKey is suppressed. */
+  suppressedCount: number;
   /** Count of signals where the Strategist call failed. */
   errorCount: number;
 }
@@ -205,6 +208,7 @@ export async function autoDraftFromSignals(
     alreadyDraftedCount: 0,
     belowThresholdCount: 0,
     noDedupKeyCount: 0,
+    suppressedCount: 0,
     errorCount: 0,
   };
 
@@ -233,6 +237,14 @@ export async function autoDraftFromSignals(
         skippedReason: `already auto-drafted (dedupKey=${signal.dedupKey})`,
       });
       result.alreadyDraftedCount += 1;
+      continue;
+    }
+    if (isSuppressed(dbFile(input.dataDir), signal.dedupKey)) {
+      result.entries.push({
+        signal,
+        skippedReason: `suppressed (dedupKey=${signal.dedupKey})`,
+      });
+      result.suppressedCount += 1;
       continue;
     }
 

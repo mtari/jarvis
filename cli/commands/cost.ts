@@ -48,7 +48,15 @@ interface AgentCallParsed extends AgentCallPayload {
   createdAt: string;
 }
 
-export async function runCost(rawArgs: string[]): Promise<number> {
+export interface RunCostDeps {
+  /** Override the wall clock — used by tests to pin a deterministic month/day window. */
+  now?: Date;
+}
+
+export async function runCost(
+  rawArgs: string[],
+  deps: RunCostDeps = {},
+): Promise<number> {
   let parsed;
   try {
     parsed = parseArgs({
@@ -87,16 +95,17 @@ export async function runCost(rawArgs: string[]): Promise<number> {
   const byDay = v["by-day"] === true;
 
   const dataDir = getDataDir();
-  const calls = readMonthCalls(dbFile(dataDir));
+  const now = deps.now ?? new Date();
+  const calls = readMonthCalls(dbFile(dataDir), now);
 
   if (format === "json") {
     console.log(
-      JSON.stringify(buildJsonReport(calls, cap, warnRatio, byDay), null, 2),
+      JSON.stringify(buildJsonReport(calls, cap, warnRatio, byDay, now), null, 2),
     );
     return 0;
   }
 
-  console.log(formatTableReport(calls, cap, warnRatio, byDay));
+  console.log(formatTableReport(calls, cap, warnRatio, byDay, now));
   return 0;
 }
 
@@ -145,10 +154,9 @@ function startOfTodayIso(now: Date = new Date()): string {
   ).toISOString();
 }
 
-function readMonthCalls(dbPath: string): AgentCallParsed[] {
+function readMonthCalls(dbPath: string, now: Date): AgentCallParsed[] {
   const db = new Database(dbPath, { readonly: true });
   try {
-    const now = new Date();
     const monthStart = new Date(
       Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
     ).toISOString();
@@ -176,8 +184,11 @@ function readMonthCalls(dbPath: string): AgentCallParsed[] {
   }
 }
 
-function callsTodayFromMonth(calls: AgentCallParsed[]): AgentCallParsed[] {
-  const start = startOfTodayIso();
+function callsTodayFromMonth(
+  calls: AgentCallParsed[],
+  now: Date,
+): AgentCallParsed[] {
+  const start = startOfTodayIso(now);
   return calls.filter((c) => c.createdAt >= start);
 }
 
@@ -242,15 +253,16 @@ function buildJsonReport(
   cap: number,
   warnRatio: number,
   byDay: boolean,
+  now: Date,
 ): Record<string, unknown> {
-  const today = callsTodayFromMonth(calls);
+  const today = callsTodayFromMonth(calls, now);
   const totalUsd = calls.reduce((acc, c) => acc + costForCall(c), 0);
   const todayCount = today.length;
   const utilization = cap > 0 ? todayCount / cap : 0;
 
   const report: Record<string, unknown> = {
-    month: new Date().toISOString().slice(0, 7),
-    today: new Date().toISOString().slice(0, 10),
+    month: now.toISOString().slice(0, 7),
+    today: now.toISOString().slice(0, 10),
     callsToday: todayCount,
     callsMonth: calls.length,
     capCallsPerDay: cap,
@@ -295,13 +307,14 @@ function formatTableReport(
   cap: number,
   warnRatio: number,
   byDay: boolean,
+  now: Date,
 ): string {
   if (calls.length === 0) {
     return "No agent calls recorded this month yet.";
   }
   const lines: string[] = [];
-  const monthLabel = formatMonth(new Date());
-  const today = callsTodayFromMonth(calls);
+  const monthLabel = formatMonth(now);
+  const today = callsTodayFromMonth(calls, now);
   const todayCount = today.length;
   const utilization = cap > 0 ? todayCount / cap : 0;
   const overWarn = cap > 0 && utilization >= warnRatio;
