@@ -1,14 +1,20 @@
+import fs from "node:fs";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  dropPlan,
   makeInstallSandbox,
   silenceConsole,
   type ConsoleSilencer,
   type InstallSandbox,
 } from "../cli/commands/_test-helpers.ts";
-import { dbFile } from "../cli/paths.ts";
+import { brainDir, brainFile, dbFile } from "../cli/paths.ts";
+import { saveBrain } from "../orchestrator/brain.ts";
+import { appendEvent } from "../orchestrator/event-log.ts";
+import { listPlans } from "../orchestrator/plan-store.ts";
 import {
   autoDraftFromSignals,
+  observeImpact,
   readAutoDraftedDedupKeys,
   runAnalystScan,
 } from "./analyst.ts";
@@ -484,5 +490,241 @@ describe("autoDraftFromSignals", () => {
     expect(result.suppressedCount).toBe(1);
     expect(result.entries[0]?.skippedReason).toContain("suppressed");
     expect(calls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// observeImpact — post-merge observation
+// ---------------------------------------------------------------------------
+
+describe("observeImpact", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    fs.rmSync(brainDir(sandbox.dataDir, "personal", "jarvis"), {
+      recursive: true,
+      force: true,
+    });
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function seedAppWithRepo(app: string, rootPath = "/tmp/jarvis-test-repo"): void {
+    fs.mkdirSync(brainDir(sandbox.dataDir, "personal", app), {
+      recursive: true,
+    });
+    saveBrain(brainFile(sandbox.dataDir, "personal", app), {
+      schemaVersion: 1,
+      projectName: app,
+      projectType: "app",
+      projectStatus: "active",
+      projectPriority: 3,
+      repo: { rootPath },
+    });
+  }
+
+  function seedAutoDrafted(planId: string, dedupKey: string, app: string): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: app,
+        vaultId: "personal",
+        kind: "auto-drafted",
+        payload: {
+          signalKind: "yarn-audit",
+          signalDedupKey: dedupKey,
+          signalSeverity: "critical",
+          planId,
+          actor: "analyst",
+        },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  function readImpactEvents(): Array<Record<string, unknown>> {
+    const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const rows = conn
+        .prepare("SELECT payload FROM events WHERE kind = 'impact-observed'")
+        .all() as Array<{ payload: string }>;
+      return rows.map((r) => JSON.parse(r.payload) as Record<string, unknown>);
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("verdict=success when the source dedupKey is no longer produced", async () => {
+    seedAppWithRepo("demo");
+    dropPlan(sandbox, "plan-fixed", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    seedAutoDrafted("plan-fixed", "yarn-audit:CVE-X", "demo");
+
+    // Collector returns NO signals — the fix held.
+    const noSignals = fakeCollector("yarn-audit", []);
+    const result = await observeImpact({
+      dataDir: sandbox.dataDir,
+      planId: "plan-fixed",
+      collectors: [noSignals],
+    });
+
+    expect(result.verdict).toBe("success");
+    expect(result.dedupKeyStillPresent).toBe(false);
+    expect(result.newStatus).toBe("success");
+    expect(result.signalDedupKey).toBe("yarn-audit:CVE-X");
+
+    // Plan transitioned on disk
+    const planRecord = listPlans(sandbox.dataDir).find(
+      (p) => p.id === "plan-fixed",
+    );
+    expect(planRecord?.plan.metadata.status).toBe("success");
+
+    // impact-observed event recorded
+    const events = readImpactEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      planId: "plan-fixed",
+      sourceDedupKey: "yarn-audit:CVE-X",
+      verdict: "success",
+    });
+  });
+
+  it("verdict=null-result when the source dedupKey is still produced", async () => {
+    seedAppWithRepo("demo");
+    dropPlan(sandbox, "plan-stuck", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    seedAutoDrafted("plan-stuck", "yarn-audit:CVE-Y", "demo");
+
+    // Collector still emits the same dedupKey — the fix did not hold.
+    const stillBroken = fakeCollector("yarn-audit", [
+      {
+        kind: "yarn-audit",
+        severity: "critical",
+        summary: "still broken",
+        dedupKey: "yarn-audit:CVE-Y",
+      },
+    ]);
+    const result = await observeImpact({
+      dataDir: sandbox.dataDir,
+      planId: "plan-stuck",
+      collectors: [stillBroken],
+    });
+
+    expect(result.verdict).toBe("null-result");
+    expect(result.dedupKeyStillPresent).toBe(true);
+    expect(result.newStatus).toBe("null-result");
+
+    const planRecord = listPlans(sandbox.dataDir).find(
+      (p) => p.id === "plan-stuck",
+    );
+    expect(planRecord?.plan.metadata.status).toBe("null-result");
+
+    const events = readImpactEvents();
+    expect(events[0]).toMatchObject({ verdict: "null-result" });
+  });
+
+  it("returns wrong-status without acting when the plan isn't in shipped-pending-impact", async () => {
+    seedAppWithRepo("demo");
+    dropPlan(sandbox, "plan-draft", {
+      app: "demo",
+      status: "awaiting-review",
+    });
+    seedAutoDrafted("plan-draft", "yarn-audit:CVE-Z", "demo");
+
+    const collector = fakeCollector("yarn-audit", []);
+    const result = await observeImpact({
+      dataDir: sandbox.dataDir,
+      planId: "plan-draft",
+      collectors: [collector],
+    });
+
+    expect(result.verdict).toBe("wrong-status");
+    expect(result.message).toContain("awaiting-review");
+
+    // Plan unchanged
+    const planRecord = listPlans(sandbox.dataDir).find(
+      (p) => p.id === "plan-draft",
+    );
+    expect(planRecord?.plan.metadata.status).toBe("awaiting-review");
+
+    // Collector NOT invoked
+    expect(collector.calls).toHaveLength(0);
+    // No event recorded
+    expect(readImpactEvents()).toHaveLength(0);
+  });
+
+  it("returns no-baseline when there's no auto-drafted event for this plan", async () => {
+    seedAppWithRepo("demo");
+    dropPlan(sandbox, "plan-orphan", {
+      app: "demo",
+      status: "shipped-pending-impact",
+    });
+    // No seedAutoDrafted call — there's no baseline.
+
+    const collector = fakeCollector("yarn-audit", []);
+    const result = await observeImpact({
+      dataDir: sandbox.dataDir,
+      planId: "plan-orphan",
+      collectors: [collector],
+    });
+
+    expect(result.verdict).toBe("no-baseline");
+    expect(result.message).toContain("no auto-drafted event");
+    expect(collector.calls).toHaveLength(0);
+    expect(readImpactEvents()).toHaveLength(0);
+
+    // Plan unchanged
+    const planRecord = listPlans(sandbox.dataDir).find(
+      (p) => p.id === "plan-orphan",
+    );
+    expect(planRecord?.plan.metadata.status).toBe("shipped-pending-impact");
+  });
+
+  it("throws when the plan id doesn't exist", async () => {
+    await expect(
+      observeImpact({
+        dataDir: sandbox.dataDir,
+        planId: "no-such-plan",
+        collectors: [fakeCollector("x", [])],
+      }),
+    ).rejects.toThrow(/plan not found/);
+  });
+
+  it("throws when the plan's app has no brain.repo configured", async () => {
+    // Seed brain WITHOUT a repo
+    fs.mkdirSync(brainDir(sandbox.dataDir, "personal", "no-repo"), {
+      recursive: true,
+    });
+    saveBrain(brainFile(sandbox.dataDir, "personal", "no-repo"), {
+      schemaVersion: 1,
+      projectName: "no-repo",
+      projectType: "app",
+      projectStatus: "active",
+      projectPriority: 3,
+    });
+    dropPlan(sandbox, "plan-no-repo", {
+      app: "no-repo",
+      status: "shipped-pending-impact",
+    });
+    seedAutoDrafted("plan-no-repo", "yarn-audit:CVE-W", "no-repo");
+
+    await expect(
+      observeImpact({
+        dataDir: sandbox.dataDir,
+        planId: "plan-no-repo",
+        collectors: [fakeCollector("yarn-audit", [])],
+      }),
+    ).rejects.toThrow(/no brain\.repo configured/);
   });
 });

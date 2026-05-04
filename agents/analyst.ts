@@ -1,7 +1,16 @@
+import path from "node:path";
 import Database from "better-sqlite3";
+import { loadBrain } from "../orchestrator/brain.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
+import {
+  findPlan,
+  listPlans,
+  savePlan,
+  type PlanRecord,
+} from "../orchestrator/plan-store.ts";
+import { transitionPlan, type PlanStatus } from "../orchestrator/plan.ts";
 import { isSuppressed } from "../orchestrator/suppressions.ts";
-import { dbFile } from "../cli/paths.ts";
+import { brainFile, dbFile } from "../cli/paths.ts";
 import type { AnthropicClient } from "../orchestrator/agent-sdk-runtime.ts";
 import { runStrategist, StrategistError } from "./strategist.ts";
 import type {
@@ -329,4 +338,190 @@ function composeBriefFromSignal(signal: Signal, app: string): string {
     "Draft an improvement plan that addresses this finding. The plan should identify the affected code or dependency, propose a concrete fix (update, patch, replacement), include rollback steps, and note acceptance criteria for verifying the fix landed correctly.",
   );
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Post-merge observation — Analyst → "did the plan actually move the needle?"
+//
+// Once a plan reaches `shipped-pending-impact`, the user (or a future
+// daemon hook) can call `observeImpact()` to re-run the collectors and
+// see whether the signal that triggered the plan is gone.
+//
+// Verdict logic (Phase 2 MVP — keep simple, refine later):
+//   - source dedupKey absent in current scan → "success"
+//   - source dedupKey still present         → "null-result"
+//   - "regression" requires baseline comparison and isn't computed here;
+//     a future PR can wire that on top of the same hook.
+//
+// On a clean verdict the plan transitions accordingly. Observation is
+// idempotent: a second call re-scans but a plan already past
+// `shipped-pending-impact` returns `wrong-status` instead of acting.
+// ---------------------------------------------------------------------------
+
+export type ImpactVerdict =
+  | "success"
+  | "null-result"
+  | "no-baseline"
+  | "wrong-status";
+
+export interface ObserveImpactInput {
+  dataDir: string;
+  planId: string;
+  /** Disambiguator when the same plan id exists in multiple vaults. */
+  vault?: string;
+  collectors: ReadonlyArray<SignalCollector>;
+}
+
+export interface ObserveImpactResult {
+  verdict: ImpactVerdict;
+  planId: string;
+  vault: string;
+  app: string;
+  /** dedupKey of the signal that triggered the plan (when discoverable). */
+  signalDedupKey?: string;
+  /** True iff the source dedupKey is still produced by the current scan. */
+  dedupKeyStillPresent?: boolean;
+  /** Set when the plan transitioned status as a result of this observation. */
+  newStatus?: PlanStatus;
+  /** Number of signals the rescan produced (any severity). */
+  newSignalCount?: number;
+  /** Human-readable reason for non-acting verdicts. */
+  message?: string;
+}
+
+export async function observeImpact(
+  input: ObserveImpactInput,
+): Promise<ObserveImpactResult> {
+  const dbFilePath = dbFile(input.dataDir);
+
+  const record = resolvePlan(input.dataDir, input.planId, input.vault);
+  if (!record) {
+    throw new Error(`plan not found: ${input.planId}`);
+  }
+  const { vault, app } = record;
+
+  if (record.plan.metadata.status !== "shipped-pending-impact") {
+    return {
+      verdict: "wrong-status",
+      planId: input.planId,
+      vault,
+      app,
+      message: `plan is in status "${record.plan.metadata.status}" — observation only runs on plans in "shipped-pending-impact"`,
+    };
+  }
+
+  const sourceDedupKey = readAutoDraftedDedupKeyForPlan(
+    dbFilePath,
+    input.planId,
+  );
+  if (sourceDedupKey === null) {
+    return {
+      verdict: "no-baseline",
+      planId: input.planId,
+      vault,
+      app,
+      message:
+        "no auto-drafted event found for this plan — observation needs a triggering signal as baseline",
+    };
+  }
+
+  const brain = loadBrain(brainFile(input.dataDir, vault, app));
+  if (!brain.repo) {
+    throw new Error(
+      `app "${app}" has no brain.repo configured — cannot run collectors`,
+    );
+  }
+  const cwd = brain.repo.monorepoPath
+    ? path.join(brain.repo.rootPath, brain.repo.monorepoPath)
+    : brain.repo.rootPath;
+
+  const scan = await runAnalystScan({
+    dataDir: input.dataDir,
+    app,
+    vault,
+    ctx: { cwd, app },
+    collectors: input.collectors,
+  });
+
+  const stillPresent = scan.signals.some((s) => s.dedupKey === sourceDedupKey);
+  const verdict: ImpactVerdict = stillPresent ? "null-result" : "success";
+  const newStatus: PlanStatus = stillPresent ? "null-result" : "success";
+
+  const newPlan = transitionPlan(record.plan, newStatus);
+  savePlan(record.path, newPlan);
+
+  const db = new Database(dbFilePath);
+  try {
+    appendEvent(db, {
+      appId: app,
+      vaultId: vault,
+      kind: "impact-observed",
+      payload: {
+        planId: input.planId,
+        sourceDedupKey,
+        verdict,
+        dedupKeyStillPresent: stillPresent,
+        newStatus,
+        newSignalCount: scan.signals.length,
+      },
+    });
+  } finally {
+    db.close();
+  }
+
+  return {
+    verdict,
+    planId: input.planId,
+    vault,
+    app,
+    signalDedupKey: sourceDedupKey,
+    dedupKeyStillPresent: stillPresent,
+    newStatus,
+    newSignalCount: scan.signals.length,
+  };
+}
+
+function resolvePlan(
+  dataDir: string,
+  planId: string,
+  vault: string | undefined,
+): PlanRecord | null {
+  if (vault === undefined) {
+    return findPlan(dataDir, planId);
+  }
+  return (
+    listPlans(dataDir).find((r) => r.id === planId && r.vault === vault) ?? null
+  );
+}
+
+function readAutoDraftedDedupKeyForPlan(
+  dbFilePath: string,
+  planId: string,
+): string | null {
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    const rows = db
+      .prepare("SELECT payload FROM events WHERE kind = 'auto-drafted'")
+      .all() as Array<{ payload: string }>;
+    for (const r of rows) {
+      try {
+        const p = JSON.parse(r.payload) as {
+          planId?: string;
+          signalDedupKey?: string;
+        };
+        if (
+          p.planId === planId &&
+          typeof p.signalDedupKey === "string" &&
+          p.signalDedupKey.length > 0
+        ) {
+          return p.signalDedupKey;
+        }
+      } catch {
+        // skip malformed
+      }
+    }
+    return null;
+  } finally {
+    db.close();
+  }
 }

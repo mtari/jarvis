@@ -6,6 +6,7 @@ import { runDoctor } from "./commands/doctor.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
 import { runLogs } from "./commands/logs.ts";
+import { runObserveImpact } from "./commands/observe-impact.ts";
 import { runOnboard } from "./commands/onboard.ts";
 import { runPlan } from "./commands/plan.ts";
 import { runPlans } from "./commands/plans.ts";
@@ -72,6 +73,12 @@ Utilities:
   signals [filters]           Browse recorded signal events. Filters: --app,
                               --vault, --kind, --severity, --since <iso>,
                               --limit N, --format table|json
+  observe-impact <plan-id> [--vault <name>]
+                              Post-merge check: re-runs the analyst collectors
+                              against the plan's app and transitions the plan
+                              to success/null-result based on whether the
+                              original signal still fires. Plan must be in
+                              status "shipped-pending-impact".
   suppress <pattern> [--reason "..."] [--expires <iso>]
                               Mute auto-draft for matching signals. Pattern may use
                               glob wildcards (* zero+ chars, ? one char). Examples:
@@ -142,6 +149,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runScan(rest);
     case "signals":
       return runSignals(rest);
+    case "observe-impact":
+      return runObserveImpact(rest);
     case "status":
       return runStatus(rest);
     case "triage":
