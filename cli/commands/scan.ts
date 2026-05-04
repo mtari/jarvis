@@ -2,6 +2,7 @@ import { parseArgs } from "node:util";
 import { runAnalystScan } from "../../agents/analyst.ts";
 import { loadBrain } from "../../orchestrator/brain.ts";
 import brokenLinksCollector from "../../tools/scanners/broken-links.ts";
+import contentFreshnessCollector from "../../tools/scanners/content-freshness.ts";
 import yarnAuditCollector from "../../tools/scanners/yarn-audit.ts";
 import type {
   SignalCollector,
@@ -22,6 +23,7 @@ export interface ScanCommandDeps {
 const DEFAULT_COLLECTORS: ReadonlyArray<SignalCollector> = [
   yarnAuditCollector,
   brokenLinksCollector,
+  contentFreshnessCollector,
 ];
 
 export async function runScan(
