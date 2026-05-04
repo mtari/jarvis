@@ -9,6 +9,7 @@ import {
 } from "../../orchestrator/agent-sdk-runtime.ts";
 import { listOnboardedApps } from "../../orchestrator/brain.ts";
 import brokenLinksCollector from "../../tools/scanners/broken-links.ts";
+import contentFreshnessCollector from "../../tools/scanners/content-freshness.ts";
 import yarnAuditCollector from "../../tools/scanners/yarn-audit.ts";
 import type {
   CollectorContext,
@@ -26,6 +27,7 @@ import type { DaemonContext, DaemonService } from "../../cli/commands/daemon.ts"
 const DEFAULT_COLLECTORS: ReadonlyArray<SignalCollector> = [
   yarnAuditCollector,
   brokenLinksCollector,
+  contentFreshnessCollector,
 ];
 
 const DEFAULT_TICK_MS = 60 * 60 * 1000; // 1 hour
