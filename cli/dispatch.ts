@@ -71,6 +71,8 @@ Utilities:
                               Mute auto-draft for a signal pattern (e.g. yarn-audit:CVE-2026-X)
   unsuppress <pattern-id>     Clear an active suppression
   suppressions [--all]        List active suppressions (--all includes cleared)
+  suppressions cleanup [--older-than N]
+                              Hard-delete cleared/expired rows (default 90d retention)
   status                      Daemon status, plan counts, last agent call
   version                     Print Jarvis version
   help, --help, -h            Show this message

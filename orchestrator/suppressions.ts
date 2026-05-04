@@ -124,6 +124,49 @@ export function unsuppress(
 }
 
 /**
+ * Hard-deletes suppression rows that are no longer load-bearing:
+ *   - Cleared rows older than `olderThanDays` past `cleared_at`
+ *   - Expired rows older than `olderThanDays` past `expires_at`
+ *
+ * Active suppressions (cleared_at IS NULL AND not-yet-expired) are
+ * always kept regardless of age — those still mute auto-draft.
+ *
+ * Returns the number of rows removed. Idempotent. Default retention
+ * is 90 days, which gives us a comfortable audit window before the
+ * row vanishes for good.
+ */
+export interface CleanupSuppressionsOptions {
+  /** Days past cleared_at / expires_at before a row becomes eligible. Default 90. */
+  olderThanDays?: number;
+}
+
+const DEFAULT_RETENTION_DAYS = 90;
+
+export function cleanupSuppressions(
+  dbFilePath: string,
+  opts: CleanupSuppressionsOptions = {},
+  now: Date = new Date(),
+): number {
+  const olderThanDays = opts.olderThanDays ?? DEFAULT_RETENTION_DAYS;
+  const cutoff = new Date(
+    now.getTime() - olderThanDays * 86_400_000,
+  ).toISOString();
+  const db = new Database(dbFilePath);
+  try {
+    const result = db
+      .prepare(
+        `DELETE FROM suppressions
+         WHERE (cleared_at IS NOT NULL AND cleared_at <= ?)
+            OR (cleared_at IS NULL AND expires_at IS NOT NULL AND expires_at <= ?)`,
+      )
+      .run(cutoff, cutoff);
+    return result.changes;
+  } finally {
+    db.close();
+  }
+}
+
+/**
  * Lists every suppression. By default only returns active ones; pass
  * `{includeCleared: true}` to also see soft-deleted history.
  */

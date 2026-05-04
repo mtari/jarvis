@@ -8,6 +8,8 @@ import {
   type AnthropicClient,
 } from "../../orchestrator/agent-sdk-runtime.ts";
 import { listOnboardedApps } from "../../orchestrator/brain.ts";
+import { cleanupSuppressions } from "../../orchestrator/suppressions.ts";
+import { dbFile } from "../../cli/paths.ts";
 import brokenLinksCollector from "../../tools/scanners/broken-links.ts";
 import contentFreshnessCollector from "../../tools/scanners/content-freshness.ts";
 import yarnAuditCollector from "../../tools/scanners/yarn-audit.ts";
@@ -156,6 +158,8 @@ export interface AnalystTickResult {
   totalSignals: number;
   /** Plans Analyst auto-drafted on this tick (across all apps). */
   autoDraftedPlanIds: string[];
+  /** Suppression rows hard-deleted by the per-tick GC pass. */
+  suppressionsCleanedUp: number;
   perApp: Array<{
     vault: string;
     app: string;
@@ -179,6 +183,7 @@ export async function runAnalystTick(
     skippedApps: 0,
     totalSignals: 0,
     autoDraftedPlanIds: [],
+    suppressionsCleanedUp: 0,
     perApp: [],
   };
 
@@ -252,12 +257,24 @@ export async function runAnalystTick(
     }
   }
 
+  // GC: drop suppressions that have been cleared or expired beyond the
+  // retention window. Cheap (one DELETE) so we run it every tick.
+  try {
+    result.suppressionsCleanedUp = cleanupSuppressions(dbFile(input.dataDir));
+  } catch (err) {
+    input.ctx.logger.error(
+      "analyst: suppressions GC failed",
+      err instanceof Error ? err : new Error(String(err)),
+    );
+  }
+
   if (result.scannedApps > 0 || result.skippedApps > 0) {
     input.ctx.logger.info("analyst: sweep complete", {
       scannedApps: result.scannedApps,
       skippedApps: result.skippedApps,
       totalSignals: result.totalSignals,
       autoDraftedPlans: result.autoDraftedPlanIds.length,
+      suppressionsCleanedUp: result.suppressionsCleanedUp,
     });
   }
 
