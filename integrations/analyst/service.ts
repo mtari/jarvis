@@ -1,7 +1,10 @@
 import path from "node:path";
 import {
   autoDraftFromSignals,
+  findPlansAwaitingImpactObservation,
+  observeImpact,
   runAnalystScan,
+  type ImpactVerdict,
 } from "../../agents/analyst.ts";
 import {
   createSdkClient,
@@ -46,6 +49,12 @@ export interface AnalystServiceOptions {
    * record signals but never call Strategist.
    */
   autoDraftThreshold?: SignalSeverity | null;
+  /**
+   * Hours a plan must spend in `shipped-pending-impact` before auto-fire
+   * observation. Default 24. Set to `null` to disable auto-fire entirely
+   * (the manual `yarn jarvis observe-impact` CLI still works).
+   */
+  observeImpactDelayHours?: number | null;
   /** Override the SDK client used for auto-drafting (test seam). */
   buildAnthropicClient?: () => AnthropicClient;
   /**
@@ -78,6 +87,10 @@ export function createAnalystService(
   const collectors = opts.collectors ?? DEFAULT_COLLECTORS;
   const autoDraftThreshold =
     opts.autoDraftThreshold === undefined ? "critical" : opts.autoDraftThreshold;
+  const observeImpactDelayHours =
+    opts.observeImpactDelayHours === undefined
+      ? 24
+      : opts.observeImpactDelayHours;
   let lazyClient: AnthropicClient | null = null;
   const getClient = (): AnthropicClient => {
     if (!lazyClient) {
@@ -115,6 +128,9 @@ export function createAnalystService(
                 getClient,
               },
             }),
+            ...(observeImpactDelayHours !== null && {
+              observeImpact: { delayHours: observeImpactDelayHours },
+            }),
           });
         } catch (err) {
           ctx.logger.error("analyst tick errored", err);
@@ -150,6 +166,18 @@ export interface AnalystTickInput {
     threshold: SignalSeverity;
     getClient: () => AnthropicClient;
   };
+  /**
+   * Enable auto-fire post-merge observation. After the per-app sweep,
+   * find plans in `shipped-pending-impact` whose mtime is at least
+   * `delayHours` old AND have no prior `impact-observed` event, then
+   * call `observeImpact()` on each. Idempotent (the impact-observed
+   * event prevents re-firing).
+   */
+  observeImpact?: {
+    delayHours: number;
+    /** Override "now" — test seam. Production uses real wall clock. */
+    now?: Date;
+  };
 }
 
 export interface AnalystTickResult {
@@ -160,6 +188,10 @@ export interface AnalystTickResult {
   autoDraftedPlanIds: string[];
   /** Suppression rows hard-deleted by the per-tick GC pass. */
   suppressionsCleanedUp: number;
+  /** Number of post-merge observations Analyst auto-fired this tick. */
+  impactObservationsRun: number;
+  /** Verdict counts when at least one observation ran. */
+  impactVerdicts?: Record<ImpactVerdict, number>;
   perApp: Array<{
     vault: string;
     app: string;
@@ -184,6 +216,7 @@ export async function runAnalystTick(
     totalSignals: 0,
     autoDraftedPlanIds: [],
     suppressionsCleanedUp: 0,
+    impactObservationsRun: 0,
     perApp: [],
   };
 
@@ -257,6 +290,46 @@ export async function runAnalystTick(
     }
   }
 
+  // Auto-fire post-merge observation for plans that have been in
+  // `shipped-pending-impact` long enough and don't have a prior
+  // observation event. Each call is idempotent on its own (the recorded
+  // `impact-observed` event prevents re-firing), so a transient error
+  // here just defers observation to the next tick.
+  if (input.observeImpact) {
+    const verdicts: Record<ImpactVerdict, number> = {
+      success: 0,
+      "null-result": 0,
+      "wrong-status": 0,
+      "no-baseline": 0,
+    };
+    const pending = findPlansAwaitingImpactObservation({
+      dataDir: input.dataDir,
+      now: input.observeImpact.now ?? new Date(),
+      delayHours: input.observeImpact.delayHours,
+    });
+    for (const p of pending) {
+      try {
+        const obs = await observeImpact({
+          dataDir: input.dataDir,
+          planId: p.planId,
+          vault: p.vault,
+          collectors: input.collectors,
+        });
+        result.impactObservationsRun += 1;
+        verdicts[obs.verdict] += 1;
+      } catch (err) {
+        input.ctx.logger.error(
+          "analyst: observation errored",
+          err instanceof Error ? err : new Error(String(err)),
+          { planId: p.planId, app: p.app },
+        );
+      }
+    }
+    if (result.impactObservationsRun > 0) {
+      result.impactVerdicts = verdicts;
+    }
+  }
+
   // GC: drop suppressions that have been cleared or expired beyond the
   // retention window. Cheap (one DELETE) so we run it every tick.
   try {
@@ -275,6 +348,7 @@ export async function runAnalystTick(
       totalSignals: result.totalSignals,
       autoDraftedPlans: result.autoDraftedPlanIds.length,
       suppressionsCleanedUp: result.suppressionsCleanedUp,
+      impactObservationsRun: result.impactObservationsRun,
     });
   }
 
