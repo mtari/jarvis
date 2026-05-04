@@ -37,34 +37,63 @@ export interface SuppressInput {
 }
 
 /**
- * Returns true when an active suppression matches `patternId`. Active =
+ * Returns true when an active suppression matches `dedupKey`. Active =
  * `cleared_at IS NULL` AND (`expires_at IS NULL` OR `expires_at > now`).
+ *
+ * Stored `pattern_id`s are matched against `dedupKey` via `matchesPattern`,
+ * which supports glob wildcards (`*` matches any chars, `?` matches one).
+ * Patterns without wildcards reduce to exact string equality, so existing
+ * exact-match suppressions still work unchanged.
+ *
  * Used by `autoDraftFromSignals` to short-circuit suppressed signals
  * before calling Strategist.
  */
 export function isSuppressed(
   dbFilePath: string,
-  patternId: string,
+  dedupKey: string,
   now: Date = new Date(),
 ): boolean {
   const db = new Database(dbFilePath, { readonly: true });
   try {
-    const row = db
+    const rows = db
       .prepare(
-        "SELECT expires_at, cleared_at FROM suppressions WHERE pattern_id = ?",
+        "SELECT pattern_id, expires_at, cleared_at FROM suppressions",
       )
-      .get(patternId) as
-      | { expires_at: string | null; cleared_at: string | null }
-      | undefined;
-    if (!row) return false;
-    if (row.cleared_at !== null) return false;
-    if (row.expires_at !== null && row.expires_at <= now.toISOString()) {
-      return false;
+      .all() as Array<{
+      pattern_id: string;
+      expires_at: string | null;
+      cleared_at: string | null;
+    }>;
+    const nowIso = now.toISOString();
+    for (const r of rows) {
+      if (r.cleared_at !== null) continue;
+      if (r.expires_at !== null && r.expires_at <= nowIso) continue;
+      if (matchesPattern(r.pattern_id, dedupKey)) return true;
     }
-    return true;
+    return false;
   } finally {
     db.close();
   }
+}
+
+/**
+ * Returns true if `pattern` matches `dedupKey`. Wildcards: `*` matches
+ * zero-or-more chars, `?` matches exactly one. Patterns without
+ * wildcards do exact-string equality.
+ *
+ * Match is anchored — `foo-*` matches `foo-bar` but not `prefix-foo-bar`.
+ * All other regex special chars in `pattern` are treated as literals.
+ */
+export function matchesPattern(pattern: string, dedupKey: string): boolean {
+  if (!pattern.includes("*") && !pattern.includes("?")) {
+    return pattern === dedupKey;
+  }
+  // Escape regex specials, then translate glob wildcards.
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(
+    `^${escaped.replace(/\*/g, ".*").replace(/\?/g, ".")}$`,
+  );
+  return re.test(dedupKey);
 }
 
 /**

@@ -10,6 +10,7 @@ import {
   cleanupSuppressions,
   isSuppressed,
   listSuppressions,
+  matchesPattern,
   suppress,
   unsuppress,
 } from "./suppressions.ts";
@@ -239,5 +240,105 @@ describe("suppressions", () => {
     const row = all.find((r) => r.patternId === "yarn-audit:CVE-X");
     expect(row?.pattern).toBe("updated description");
     expect(row?.reason).toBe("updated reason");
+  });
+
+  // -------------------------------------------------------------------------
+  // glob pattern matching
+  // -------------------------------------------------------------------------
+
+  describe("matchesPattern", () => {
+    it("returns true on exact equality with no wildcards", () => {
+      expect(matchesPattern("yarn-audit:CVE-X", "yarn-audit:CVE-X")).toBe(true);
+      expect(matchesPattern("yarn-audit:CVE-X", "yarn-audit:CVE-Y")).toBe(
+        false,
+      );
+    });
+
+    it("treats * as zero-or-more chars", () => {
+      expect(matchesPattern("yarn-audit:*", "yarn-audit:CVE-2026-1")).toBe(
+        true,
+      );
+      expect(matchesPattern("*", "literally-anything")).toBe(true);
+      expect(matchesPattern("foo*", "foo")).toBe(true); // zero match
+      expect(matchesPattern("*-link", "broken-link")).toBe(true);
+    });
+
+    it("treats ? as exactly one char", () => {
+      expect(matchesPattern("CVE-?", "CVE-1")).toBe(true);
+      expect(matchesPattern("CVE-?", "CVE-12")).toBe(false);
+      expect(matchesPattern("CVE-?", "CVE-")).toBe(false);
+    });
+
+    it("anchors the match — partial doesn't match", () => {
+      expect(matchesPattern("foo-*", "prefix-foo-bar")).toBe(false);
+      expect(matchesPattern("*-foo", "foo-bar")).toBe(false);
+    });
+
+    it("treats other regex specials as literals", () => {
+      // dots, parens, plus, etc. should not be regex-active
+      expect(matchesPattern("foo.bar", "fooXbar")).toBe(false);
+      expect(matchesPattern("foo.bar", "foo.bar")).toBe(true);
+      expect(matchesPattern("a+b", "a+b")).toBe(true);
+      expect(matchesPattern("a+b", "ab")).toBe(false);
+      expect(matchesPattern("(group)", "(group)")).toBe(true);
+    });
+
+    it("handles realistic CVE family patterns", () => {
+      expect(
+        matchesPattern("yarn-audit:CVE-2026-*", "yarn-audit:CVE-2026-1234"),
+      ).toBe(true);
+      expect(
+        matchesPattern("yarn-audit:CVE-2026-*", "yarn-audit:CVE-2025-9999"),
+      ).toBe(false);
+    });
+  });
+
+  describe("isSuppressed with glob patterns", () => {
+    it("matches a signal whose dedupKey is covered by a glob pattern", () => {
+      suppress(db(), {
+        patternId: "yarn-audit:CVE-2026-*",
+        pattern: "all 2026 advisories — under review",
+      });
+      expect(isSuppressed(db(), "yarn-audit:CVE-2026-1234")).toBe(true);
+      expect(isSuppressed(db(), "yarn-audit:CVE-2026-9999")).toBe(true);
+    });
+
+    it("does NOT match dedupKeys outside the glob", () => {
+      suppress(db(), {
+        patternId: "yarn-audit:CVE-2026-*",
+        pattern: "x",
+      });
+      expect(isSuppressed(db(), "yarn-audit:CVE-2025-1")).toBe(false);
+      expect(isSuppressed(db(), "broken-links:https://x.example")).toBe(false);
+    });
+
+    it("ignores cleared globs", () => {
+      suppress(db(), { patternId: "yarn-audit:*", pattern: "x" });
+      unsuppress(db(), "yarn-audit:*");
+      expect(isSuppressed(db(), "yarn-audit:CVE-X")).toBe(false);
+    });
+
+    it("ignores expired globs", () => {
+      suppress(db(), {
+        patternId: "yarn-audit:*",
+        pattern: "x",
+        expiresAt: "2026-01-01T00:00:00Z",
+      });
+      expect(
+        isSuppressed(
+          db(),
+          "yarn-audit:CVE-X",
+          new Date("2099-01-01T00:00:00Z"),
+        ),
+      ).toBe(false);
+    });
+
+    it("falls through to other patterns if one doesn't match", () => {
+      suppress(db(), { patternId: "broken-links:*", pattern: "noisy URLs" });
+      suppress(db(), { patternId: "yarn-audit:CVE-X", pattern: "specific" });
+      expect(isSuppressed(db(), "yarn-audit:CVE-X")).toBe(true);
+      expect(isSuppressed(db(), "broken-links:https://x.example")).toBe(true);
+      expect(isSuppressed(db(), "content-freshness:blog/old.md")).toBe(false);
+    });
   });
 });

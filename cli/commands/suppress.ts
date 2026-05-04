@@ -1,7 +1,6 @@
 import { parseArgs } from "node:util";
 import {
   cleanupSuppressions,
-  isSuppressed,
   listSuppressions,
   suppress,
   unsuppress,
@@ -9,11 +8,13 @@ import {
 import { dbFile, getDataDir } from "../paths.ts";
 
 /**
- * `yarn jarvis suppress <pattern-id> [--reason "..."] [--expires <iso>]`
+ * `yarn jarvis suppress <pattern> [--reason "..."] [--expires <iso>]`
  *
- * Mutes auto-drafting for a signal pattern. The pattern-id is what shows
- * up as `dedupKey` on signal events (e.g. `yarn-audit:CVE-2026-X`).
- * Existing rows are refreshed (the soft-delete is reset).
+ * Mutes auto-drafting for any signal whose `dedupKey` matches `pattern`.
+ * Patterns may use glob wildcards (`*` zero+ chars, `?` one char) — e.g.
+ * `yarn-audit:CVE-2026-*` mutes the entire 2026 advisory family. Patterns
+ * without wildcards reduce to exact-match. Existing rows are refreshed
+ * (the soft-delete is reset).
  */
 export async function runSuppress(rawArgs: string[]): Promise<number> {
   let parsed;
@@ -65,8 +66,10 @@ export async function runSuppress(rawArgs: string[]): Promise<number> {
 }
 
 /**
- * `yarn jarvis unsuppress <pattern-id>` — clears an active suppression.
- * Soft-delete; the row stays for audit. Re-suppress to re-mute.
+ * `yarn jarvis unsuppress <pattern>` — clears an active suppression.
+ * Soft-delete; the row stays for audit. Re-suppress to re-mute. Match
+ * is exact on the stored pattern string — pass the same string used
+ * when calling `suppress`, including any wildcards.
  */
 export async function runUnsuppress(rawArgs: string[]): Promise<number> {
   const [patternId, ...rest] = rawArgs;
@@ -83,10 +86,6 @@ export async function runUnsuppress(rawArgs: string[]): Promise<number> {
     return 1;
   }
   const dataDir = getDataDir();
-  if (!isSuppressed(dbFile(dataDir), patternId)) {
-    console.error(`unsuppress: no active suppression for "${patternId}"`);
-    return 1;
-  }
   const cleared = unsuppress(dbFile(dataDir), patternId);
   if (!cleared) {
     console.error(`unsuppress: no active suppression for "${patternId}"`);
