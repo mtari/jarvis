@@ -4,8 +4,10 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { businessIdeasFile } from "../cli/paths.ts";
 import {
+  formatBusinessIdeas,
   loadBusinessIdeas,
   parseBusinessIdeas,
+  saveBusinessIdeas,
 } from "./business-ideas.ts";
 
 // ---------------------------------------------------------------------------
@@ -14,12 +16,20 @@ import {
 
 describe("parseBusinessIdeas", () => {
   it("returns empty result for empty input", () => {
-    expect(parseBusinessIdeas("")).toEqual({ ideas: [], unparseable: [] });
+    expect(parseBusinessIdeas("")).toEqual({
+      ideas: [],
+      unparseable: [],
+      preamble: "",
+    });
   });
 
   it("returns empty when only a preamble is present (no `## ` sections)", () => {
     const md = `# Business Ideas\n\nA running list. Add ideas below.\n`;
-    expect(parseBusinessIdeas(md)).toEqual({ ideas: [], unparseable: [] });
+    const result = parseBusinessIdeas(md);
+    expect(result.ideas).toEqual([]);
+    expect(result.unparseable).toEqual([]);
+    // preamble preserved
+    expect(result.preamble).toContain("A running list");
   });
 
   it("parses a single idea with the required fields", () => {
@@ -226,7 +236,11 @@ describe("loadBusinessIdeas", () => {
   });
 
   it("returns empty when Business_Ideas.md doesn't exist", () => {
-    expect(loadBusinessIdeas(dataDir)).toEqual({ ideas: [], unparseable: [] });
+    expect(loadBusinessIdeas(dataDir)).toEqual({
+      ideas: [],
+      unparseable: [],
+      preamble: "",
+    });
   });
 
   it("reads + parses the file when present", () => {
@@ -237,5 +251,176 @@ describe("loadBusinessIdeas", () => {
     const result = loadBusinessIdeas(dataDir);
     expect(result.ideas).toHaveLength(1);
     expect(result.ideas[0]?.app).toBe("x");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatBusinessIdeas / saveBusinessIdeas — writer + round-trip
+// ---------------------------------------------------------------------------
+
+describe("formatBusinessIdeas", () => {
+  it("emits the meta block in the canonical order", () => {
+    const md = formatBusinessIdeas({
+      preamble: "",
+      unparseable: [],
+      ideas: [
+        {
+          id: "x",
+          title: "X",
+          app: "demo",
+          brief: "do the thing",
+          tags: ["a", "b"],
+          score: 50,
+          scoredAt: "2026-05-05T00:00:00Z",
+          rationale: "because reasons",
+          body: "",
+        },
+      ],
+    });
+    expect(md).toBe(
+      [
+        "## X",
+        "App: demo",
+        "Brief: do the thing",
+        "Tags: a, b",
+        "Score: 50",
+        "ScoredAt: 2026-05-05T00:00:00Z",
+        "Rationale: because reasons",
+        "",
+      ].join("\n") + "\n",
+    );
+  });
+
+  it("omits optional fields cleanly", () => {
+    const md = formatBusinessIdeas({
+      preamble: "",
+      unparseable: [],
+      ideas: [
+        {
+          id: "min",
+          title: "Min",
+          app: "demo",
+          brief: "tiny",
+          tags: [],
+          body: "",
+        },
+      ],
+    });
+    expect(md).not.toContain("Tags:");
+    expect(md).not.toContain("Score:");
+    expect(md).not.toContain("Rationale:");
+    expect(md).toContain("App: demo");
+    expect(md).toContain("Brief: tiny");
+  });
+
+  it("preserves the body section", () => {
+    const md = formatBusinessIdeas({
+      preamble: "",
+      unparseable: [],
+      ideas: [
+        {
+          id: "x",
+          title: "X",
+          app: "demo",
+          brief: "y",
+          tags: [],
+          body: "Multi-line\nbody prose here.",
+        },
+      ],
+    });
+    expect(md).toContain("Brief: y\n\nMulti-line\nbody prose here.\n");
+  });
+
+  it("preserves the preamble verbatim", () => {
+    const md = formatBusinessIdeas({
+      preamble:
+        "# Business Ideas\n\nA running list of unbuilt ideas. Add yours below.",
+      unparseable: [],
+      ideas: [],
+    });
+    expect(md.startsWith("# Business Ideas\n\nA running list")).toBe(true);
+  });
+
+  it("round-trips a parsed file (parse -> format -> parse) without losing data", () => {
+    const original = `# Business Ideas
+
+Some preamble text.
+
+## Shorten checkout funnel
+App: demo
+Brief: address-step drop-off
+Tags: conversion, frontend
+Score: 72
+ScoredAt: 2026-04-30T09:00:00Z
+Rationale: high signal; quick to ship
+
+The address step has been the #1 drop-off for two months running.
+Hypothesis: users abandon when validation errors appear after submit.
+
+## Newsletter
+App: new
+Brief: weekly portfolio digest
+`;
+    const parsed = parseBusinessIdeas(original);
+    const reformatted = formatBusinessIdeas(parsed);
+    const reparsed = parseBusinessIdeas(reformatted);
+    expect(reparsed.ideas).toEqual(parsed.ideas);
+    expect(reparsed.preamble).toBe(parsed.preamble);
+  });
+});
+
+describe("saveBusinessIdeas", () => {
+  let dataDir: string;
+
+  beforeEach(() => {
+    dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-bi-write-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("creates the file and writes the formatted content", () => {
+    saveBusinessIdeas(dataDir, {
+      preamble: "# Business Ideas\n",
+      unparseable: [],
+      ideas: [
+        {
+          id: "x",
+          title: "X",
+          app: "demo",
+          brief: "y",
+          tags: [],
+          body: "",
+        },
+      ],
+    });
+    const reloaded = loadBusinessIdeas(dataDir);
+    expect(reloaded.ideas).toHaveLength(1);
+    expect(reloaded.ideas[0]?.title).toBe("X");
+    expect(reloaded.preamble).toContain("# Business Ideas");
+  });
+
+  it("supports merge-then-save: read, mutate one idea, write back", () => {
+    const initial = `# Business Ideas
+
+## Shorten checkout funnel
+App: demo
+Brief: y
+`;
+    fs.writeFileSync(`${dataDir}/Business_Ideas.md`, initial);
+    const file = loadBusinessIdeas(dataDir);
+    const idea = file.ideas[0]!;
+    file.ideas[0] = {
+      ...idea,
+      score: 88,
+      scoredAt: "2026-05-05T08:00:00Z",
+      rationale: "high impact, low effort",
+    };
+    saveBusinessIdeas(dataDir, file);
+
+    const reloaded = loadBusinessIdeas(dataDir);
+    expect(reloaded.ideas[0]?.score).toBe(88);
+    expect(reloaded.ideas[0]?.rationale).toBe("high impact, low effort");
   });
 });

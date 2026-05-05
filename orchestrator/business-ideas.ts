@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { businessIdeasFile } from "../cli/paths.ts";
+import { atomicWriteFileSync } from "./atomic-write.ts";
 
 /**
  * `Business_Ideas.md` — user-authored input for Scout. A markdown file
@@ -63,6 +64,11 @@ export interface UnparseableIdea {
 export interface BusinessIdeasFile {
   ideas: BusinessIdea[];
   unparseable: UnparseableIdea[];
+  /**
+   * Text before the first `## ` heading. Captured on parse so we can
+   * round-trip user-authored intro / instructions / docs.
+   */
+  preamble: string;
 }
 
 /**
@@ -72,10 +78,59 @@ export interface BusinessIdeasFile {
 export function loadBusinessIdeas(dataDir: string): BusinessIdeasFile {
   const filePath = businessIdeasFile(dataDir);
   if (!fs.existsSync(filePath)) {
-    return { ideas: [], unparseable: [] };
+    return { ideas: [], unparseable: [], preamble: "" };
   }
   const text = fs.readFileSync(filePath, "utf8");
   return parseBusinessIdeas(text);
+}
+
+/**
+ * Atomic-writes the file back, preserving the original preamble.
+ * Drops `unparseable` entries — those came from sections we couldn't
+ * parse, and re-emitting their headings without context would be
+ * worse than leaving them out. The user sees them via the load result.
+ */
+export function saveBusinessIdeas(
+  dataDir: string,
+  file: BusinessIdeasFile,
+): void {
+  atomicWriteFileSync(businessIdeasFile(dataDir), formatBusinessIdeas(file));
+}
+
+export function formatBusinessIdeas(file: BusinessIdeasFile): string {
+  let out = "";
+  if (file.preamble.length > 0) {
+    out += file.preamble.replace(/\n+$/, "") + "\n\n";
+  }
+  for (const idea of file.ideas) {
+    out += formatIdea(idea);
+  }
+  return out;
+}
+
+/** Renders one section, including its trailing blank-line separator. */
+function formatIdea(idea: BusinessIdea): string {
+  const lines: string[] = [];
+  lines.push(`## ${idea.title}`);
+  lines.push(`App: ${idea.app}`);
+  lines.push(`Brief: ${idea.brief}`);
+  if (idea.tags.length > 0) {
+    lines.push(`Tags: ${idea.tags.join(", ")}`);
+  }
+  if (idea.score !== undefined) {
+    lines.push(`Score: ${idea.score}`);
+  }
+  if (idea.scoredAt !== undefined) {
+    lines.push(`ScoredAt: ${idea.scoredAt}`);
+  }
+  if (idea.rationale !== undefined) {
+    lines.push(`Rationale: ${idea.rationale}`);
+  }
+  if (idea.body.length > 0) {
+    lines.push("");
+    lines.push(idea.body);
+  }
+  return lines.join("\n") + "\n\n";
 }
 
 /**
@@ -83,7 +138,7 @@ export function loadBusinessIdeas(dataDir: string): BusinessIdeasFile {
  * don't need a temp file for every assertion.
  */
 export function parseBusinessIdeas(text: string): BusinessIdeasFile {
-  const sections = splitSections(text);
+  const { preamble, sections } = splitSections(text);
   const ideas: BusinessIdea[] = [];
   const unparseable: UnparseableIdea[] = [];
   const seenIds = new Set<string>();
@@ -106,7 +161,7 @@ export function parseBusinessIdeas(text: string): BusinessIdeasFile {
     ideas.push({ ...result.idea, id });
   }
 
-  return { ideas, unparseable };
+  return { ideas, unparseable, preamble };
 }
 
 interface RawSection {
@@ -115,16 +170,22 @@ interface RawSection {
 }
 
 /**
- * Splits the document on `^## ` headings. Anything before the first
- * `## ` is the preamble and is dropped.
+ * Splits the document on `^## ` headings. Lines before the first
+ * `## ` become the preamble (preserved verbatim for round-tripping).
  */
-function splitSections(text: string): RawSection[] {
+function splitSections(text: string): {
+  preamble: string;
+  sections: RawSection[];
+} {
   const lines = text.split(/\r?\n/);
+  const preambleLines: string[] = [];
   const sections: RawSection[] = [];
   let current: { heading: string; lines: string[] } | null = null;
+  let inPreamble = true;
   for (const line of lines) {
     const match = line.match(/^##\s+(.*)$/);
     if (match) {
+      inPreamble = false;
       if (current) {
         sections.push({
           heading: current.heading,
@@ -134,6 +195,8 @@ function splitSections(text: string): RawSection[] {
       current = { heading: match[1]!.trim(), lines: [] };
     } else if (current) {
       current.lines.push(line);
+    } else if (inPreamble) {
+      preambleLines.push(line);
     }
   }
   if (current) {
@@ -142,7 +205,7 @@ function splitSections(text: string): RawSection[] {
       body: current.lines.join("\n"),
     });
   }
-  return sections;
+  return { preamble: preambleLines.join("\n"), sections };
 }
 
 type ParseSectionResult =

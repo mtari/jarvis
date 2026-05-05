@@ -16,6 +16,7 @@ import { runReprioritize } from "./commands/reprioritize.ts";
 import { runRevise } from "./commands/revise.ts";
 import { runRun } from "./commands/run.ts";
 import { runScan } from "./commands/scan.ts";
+import { runScout } from "./commands/scout.ts";
 import { runSignals } from "./commands/signals.ts";
 import { runStatus } from "./commands/status.ts";
 import { runTriage } from "./commands/triage.ts";
@@ -73,6 +74,9 @@ Utilities:
   signals [filters]           Browse recorded signal events. Filters: --app,
                               --vault, --kind, --severity, --since <iso>,
                               --limit N, --format table|json
+  scout score [--vault <v>]   Score unscored ideas in Business_Ideas.md. Writes
+                              score, scoredAt, rationale back to the file and
+                              records an idea-scored event per idea.
   observe-impact <plan-id> [--vault <name>]
                               Post-merge check: re-runs the analyst collectors
                               against the plan's app and transitions the plan
@@ -149,6 +153,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runScan(rest);
     case "signals":
       return runSignals(rest);
+    case "scout":
+      return runScout(rest);
     case "observe-impact":
       return runObserveImpact(rest);
     case "status":
