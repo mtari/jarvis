@@ -13,6 +13,7 @@ import { brainExists, loadBrain } from "../orchestrator/brain.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
 import type { Profile } from "../orchestrator/profile.ts";
 import { loadProfile } from "../orchestrator/profile.ts";
+import { runStrategist, StrategistError } from "./strategist.ts";
 import {
   brainFile,
   dbFile,
@@ -335,3 +336,206 @@ export function parseScoreResponse(response: ChatResponse): ScoutScoreResult {
 }
 
 export type { BusinessIdeasFile };
+
+// ---------------------------------------------------------------------------
+// Auto-draft hand-off — Scout → Strategist
+//
+// When an idea scores at or above `scoreThreshold` and hasn't been
+// drafted yet, hand it to Strategist as the brief for an improvement
+// plan. The plan goes through the normal review flow (`awaiting-review`
+// → user approves → daemon fires Developer). Idempotent on `ideaId`:
+// if a prior `idea-drafted` event exists for that idea, future calls
+// skip it. Reject the resulting plan to clear it from the queue;
+// re-running `scout draft` won't re-spam.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SCORE_THRESHOLD = 80;
+
+export interface AutoDraftFromIdeasInput {
+  dataDir: string;
+  vault: string;
+  client: AnthropicClient;
+  /**
+   * Minimum score for auto-draft. Default 80. Below this, the idea is
+   * skipped and surfaced in the result with a `below-threshold` reason.
+   */
+  scoreThreshold?: number;
+}
+
+export interface AutoDraftFromIdeasResult {
+  draftedCount: number;
+  errorCount: number;
+  entries: Array<{
+    ideaId: string;
+    planId?: string;
+    /** Reason why this idea was not drafted (idempotent skip, threshold, etc.). */
+    skippedReason?: string;
+    error?: string;
+  }>;
+}
+
+/**
+ * Drafts plans for every idea in `Business_Ideas.md` that:
+ *   - has `score >= scoreThreshold`
+ *   - has no prior `idea-drafted` event (idempotent)
+ *   - targets an existing onboarded app (skips `App: new` for now —
+ *     a new-app idea needs `yarn jarvis onboard` first; a future PR
+ *     can wire that flow)
+ *
+ * Per-idea Strategist errors are isolated and surfaced in `entries`.
+ * Records one `idea-drafted` event per drafted plan with `ideaId`,
+ * `planId`, `score`, `actor: "scout"`.
+ */
+export async function autoDraftFromIdeas(
+  input: AutoDraftFromIdeasInput,
+): Promise<AutoDraftFromIdeasResult> {
+  const threshold = input.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD;
+  const file = loadBusinessIdeas(input.dataDir);
+  const alreadyDrafted = readDraftedFromIdeaIds(dbFile(input.dataDir));
+
+  const result: AutoDraftFromIdeasResult = {
+    draftedCount: 0,
+    errorCount: 0,
+    entries: [],
+  };
+
+  for (const idea of file.ideas) {
+    if (idea.score === undefined) {
+      result.entries.push({
+        ideaId: idea.id,
+        skippedReason: "unscored",
+      });
+      continue;
+    }
+    if (idea.score < threshold) {
+      result.entries.push({
+        ideaId: idea.id,
+        skippedReason: `below threshold (score ${idea.score} < ${threshold})`,
+      });
+      continue;
+    }
+    if (alreadyDrafted.has(idea.id)) {
+      result.entries.push({
+        ideaId: idea.id,
+        skippedReason: "already drafted",
+      });
+      continue;
+    }
+    if (idea.app === "new") {
+      result.entries.push({
+        ideaId: idea.id,
+        skippedReason: "new-app idea — onboard the app first, then re-run",
+      });
+      continue;
+    }
+    if (!brainExists(brainFile(input.dataDir, input.vault, idea.app))) {
+      result.entries.push({
+        ideaId: idea.id,
+        skippedReason: `no brain for app "${idea.app}" in vault "${input.vault}"`,
+      });
+      continue;
+    }
+
+    const brief = composeBriefFromIdea(idea);
+    let planId: string | undefined;
+    try {
+      const draft = await runStrategist({
+        client: input.client,
+        brief,
+        app: idea.app,
+        vault: input.vault,
+        dataDir: input.dataDir,
+        type: "improvement",
+        challenge: false,
+      });
+      planId = draft.planId;
+    } catch (err) {
+      const msg =
+        err instanceof StrategistError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      result.entries.push({
+        ideaId: idea.id,
+        error: `strategist error: ${msg}`,
+      });
+      result.errorCount += 1;
+      continue;
+    }
+
+    const db = new Database(dbFile(input.dataDir));
+    try {
+      appendEvent(db, {
+        appId: idea.app,
+        vaultId: input.vault,
+        kind: "idea-drafted",
+        payload: {
+          ideaId: idea.id,
+          planId,
+          score: idea.score,
+          actor: "scout",
+        },
+      });
+    } finally {
+      db.close();
+    }
+
+    alreadyDrafted.add(idea.id);
+    result.draftedCount += 1;
+    result.entries.push({ ideaId: idea.id, planId });
+  }
+
+  return result;
+}
+
+/** Returns the set of ideaIds that already have an `idea-drafted` event. */
+export function readDraftedFromIdeaIds(dbFilePath: string): Set<string> {
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    const rows = db
+      .prepare("SELECT payload FROM events WHERE kind = 'idea-drafted'")
+      .all() as Array<{ payload: string }>;
+    const out = new Set<string>();
+    for (const r of rows) {
+      try {
+        const p = JSON.parse(r.payload) as { ideaId?: string };
+        if (typeof p.ideaId === "string" && p.ideaId.length > 0) {
+          out.add(p.ideaId);
+        }
+      } catch {
+        // skip malformed
+      }
+    }
+    return out;
+  } finally {
+    db.close();
+  }
+}
+
+export function composeBriefFromIdea(idea: BusinessIdea): string {
+  const lines: string[] = [];
+  lines.push(
+    `Idea from Business_Ideas.md (Scout score: ${idea.score ?? "n/a"}/100).`,
+  );
+  lines.push("");
+  lines.push(`Title: ${idea.title}`);
+  lines.push(`App: ${idea.app}`);
+  if (idea.tags.length > 0) {
+    lines.push(`Tags: ${idea.tags.join(", ")}`);
+  }
+  lines.push(`Brief: ${idea.brief}`);
+  if (idea.rationale) {
+    lines.push(`Scout's rationale: ${idea.rationale}`);
+  }
+  if (idea.body.length > 0) {
+    lines.push("");
+    lines.push("Notes from the user:");
+    lines.push(idea.body);
+  }
+  lines.push("");
+  lines.push(
+    "Draft an improvement plan that delivers on this idea. Identify the affected code, propose a concrete first step, include rollback steps, and note acceptance criteria for verifying the change landed correctly.",
+  );
+  return lines.join("\n");
+}
