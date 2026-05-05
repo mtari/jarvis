@@ -15,6 +15,9 @@ import { appendSetupTask } from "../../orchestrator/setup-tasks.ts";
 import {
   buildInboxSummaryText,
   buildOnDemandTriageBlocks,
+  formatDraftResults,
+  formatScoreResults,
+  parseScoutFlags,
 } from "./slash-commands.ts";
 
 describe("buildInboxSummaryText", () => {
@@ -195,5 +198,108 @@ describe("buildOnDemandTriageBlocks", () => {
     const header = result.blocks[0];
     if (!header || header.type !== "header") throw new Error("no header");
     expect(header.text.text).toContain("2026-05-05");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /jarvis scout score|draft helpers
+// ---------------------------------------------------------------------------
+
+describe("parseScoutFlags", () => {
+  it("returns defaults when no flags are present", () => {
+    expect(parseScoutFlags([])).toEqual({ vault: "personal" });
+  });
+
+  it("reads --vault", () => {
+    expect(parseScoutFlags(["--vault", "work"])).toEqual({ vault: "work" });
+  });
+
+  it("reads --threshold as an integer in [0, 100]", () => {
+    expect(parseScoutFlags(["--threshold", "75"])).toEqual({
+      vault: "personal",
+      threshold: 75,
+    });
+  });
+
+  it("ignores out-of-range or non-numeric thresholds", () => {
+    expect(parseScoutFlags(["--threshold", "150"])).toEqual({
+      vault: "personal",
+    });
+    expect(parseScoutFlags(["--threshold", "x"])).toEqual({
+      vault: "personal",
+    });
+  });
+
+  it("reads both flags together in either order", () => {
+    expect(
+      parseScoutFlags(["--threshold", "60", "--vault", "work"]),
+    ).toEqual({ vault: "work", threshold: 60 });
+    expect(
+      parseScoutFlags(["--vault", "work", "--threshold", "60"]),
+    ).toEqual({ vault: "work", threshold: 60 });
+  });
+
+  it("ignores unknown flags", () => {
+    expect(parseScoutFlags(["--garbage", "x", "--vault", "y"])).toEqual({
+      vault: "y",
+    });
+  });
+});
+
+describe("formatScoreResults", () => {
+  it("returns the no-op message when there's nothing to score", () => {
+    expect(
+      formatScoreResults({ scoredCount: 0, errorCount: 0, entries: [] }),
+    ).toContain("No unscored ideas");
+  });
+
+  it("formats one bullet per entry + a summary footer", () => {
+    const out = formatScoreResults({
+      scoredCount: 2,
+      errorCount: 1,
+      entries: [
+        {
+          ideaId: "first",
+          score: 80,
+          suggestedPriority: "high",
+        },
+        {
+          ideaId: "second",
+          score: 35,
+          suggestedPriority: "low",
+        },
+        { ideaId: "boom", error: "LLM returned malformed response" },
+      ],
+    });
+    expect(out).toContain("✓ `first`");
+    expect(out).toContain("score *80*");
+    expect(out).toContain("(suggested: high)");
+    expect(out).toContain("✓ `second`");
+    expect(out).toContain("✗ `boom`");
+    expect(out).toContain("Scored 2, 1 error(s)");
+  });
+});
+
+describe("formatDraftResults", () => {
+  it("returns the no-op message when there are no ideas", () => {
+    expect(
+      formatDraftResults({ draftedCount: 0, errorCount: 0, entries: [] }),
+    ).toContain("No ideas in `Business_Ideas.md`");
+  });
+
+  it("formats drafted, skipped, and errored entries with distinct markers", () => {
+    const out = formatDraftResults({
+      draftedCount: 1,
+      errorCount: 1,
+      entries: [
+        { ideaId: "a", planId: "20260505T0900-foo" },
+        { ideaId: "b", skippedReason: "below threshold (score 50 < 80)" },
+        { ideaId: "c", error: "strategist failed: timeout" },
+      ],
+    });
+    expect(out).toContain("✓ `a` → drafted `20260505T0900-foo`");
+    expect(out).toContain("– `b` skipped (below threshold");
+    expect(out).toContain("✗ `c` — strategist failed: timeout");
+    expect(out).toContain("Drafted 1, 1 error(s)");
   });
 });

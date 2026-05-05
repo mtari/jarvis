@@ -24,8 +24,15 @@ import { dbFile } from "../../cli/paths.ts";
 import { buildSkipReasonModal } from "./blocks/setup-task.ts";
 import { buildReviseModal } from "./blocks/plan-review.ts";
 import {
+  autoDraftFromIdeas,
+  scoreUnscoredIdeas,
+} from "../../agents/scout.ts";
+import {
   buildInboxSummaryText,
   buildOnDemandTriageBlocks,
+  formatDraftResults,
+  formatScoreResults,
+  parseScoutFlags,
 } from "./slash-commands.ts";
 import { surfacePlan, updateSurfacedPlan, type SurfaceContext } from "./surface.ts";
 
@@ -425,10 +432,24 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
         return runSlashInbox(ctx, respond);
       case "triage":
         return runSlashTriage(ctx, respond, command.channel_id, client);
+      case "scout": {
+        const sub = parts[1];
+        if (sub === "score") {
+          return runSlashScoutScore(parts.slice(2), ctx, respond);
+        }
+        if (sub === "draft") {
+          return runSlashScoutDraft(parts.slice(2), ctx, respond);
+        }
+        await respond({
+          response_type: "ephemeral",
+          text: "Usage: `/jarvis scout score|draft [--threshold N] [--vault <v>]`",
+        });
+        return;
+      }
       default:
         await respond({
           response_type: "ephemeral",
-          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`.`,
+          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`.`,
         });
     }
   });
@@ -440,6 +461,8 @@ const SLASH_USAGE = [
   "• `/jarvis bug <app> <description>` — draft a bugfix plan",
   "• `/jarvis inbox` — show pending plan reviews + setup tasks (just for you)",
   "• `/jarvis triage` — post the on-demand triage report to this channel",
+  "• `/jarvis scout score [--vault <v>]` — score unscored ideas in `Business_Ideas.md`",
+  "• `/jarvis scout draft [--threshold N] [--vault <v>]` — auto-draft plans from high-scoring ideas",
 ].join("\n");
 
 type SlashRespond = (args: {
@@ -566,6 +589,75 @@ async function runSlashTriage(
     await respond({
       response_type: "ephemeral",
       text: `✗ Triage build failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    });
+  }
+}
+
+async function runSlashScoutScore(
+  args: string[],
+  ctx: HandlerContext,
+  respond: SlashRespond,
+): Promise<void> {
+  const { vault } = parseScoutFlags(args);
+  await respond({
+    response_type: "ephemeral",
+    text: "🔍 Scout scoring unscored ideas…",
+  });
+  try {
+    const client = ctx.getAnthropicClient();
+    const result = await scoreUnscoredIdeas({
+      dataDir: ctx.dataDir,
+      client,
+      vault,
+    });
+    ctx.log("scout score via slack", {
+      vault,
+      scored: result.scoredCount,
+      errors: result.errorCount,
+    });
+    await respond({ response_type: "ephemeral", text: formatScoreResults(result) });
+  } catch (err) {
+    ctx.logError("/jarvis scout score failed", err, { vault });
+    await respond({
+      response_type: "ephemeral",
+      text: `✗ Scout score failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    });
+  }
+}
+
+async function runSlashScoutDraft(
+  args: string[],
+  ctx: HandlerContext,
+  respond: SlashRespond,
+): Promise<void> {
+  const flags = parseScoutFlags(args);
+  await respond({
+    response_type: "ephemeral",
+    text: `📝 Scout drafting plans for ideas scoring ≥ ${flags.threshold ?? 80}…`,
+  });
+  try {
+    const client = ctx.getAnthropicClient();
+    const result = await autoDraftFromIdeas({
+      dataDir: ctx.dataDir,
+      vault: flags.vault,
+      client,
+      ...(flags.threshold !== undefined && { scoreThreshold: flags.threshold }),
+    });
+    ctx.log("scout draft via slack", {
+      vault: flags.vault,
+      drafted: result.draftedCount,
+      errors: result.errorCount,
+    });
+    await respond({ response_type: "ephemeral", text: formatDraftResults(result) });
+  } catch (err) {
+    ctx.logError("/jarvis scout draft failed", err, flags);
+    await respond({
+      response_type: "ephemeral",
+      text: `✗ Scout draft failed: ${
         err instanceof Error ? err.message : String(err)
       }`,
     });
