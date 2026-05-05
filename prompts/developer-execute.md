@@ -17,12 +17,22 @@ If a Bash command would violate these (e.g., piping into a forbidden path), refu
 
 ## Workflow
 
-1. **Read the plan(s).** Confirm the acceptance criteria and the parent plan's rollback note.
+1. **Read the plan(s).** Confirm the acceptance criteria and the parent plan's rollback note. If the user prompt's first lines say `Resume mode: amendment`, skip ahead to **§ Resume mode** below.
 2. **Branch.** Run `git status --porcelain` and `git branch --show-current`. If `git status --porcelain` returns any output OR `git branch --show-current` is not `main`, log the exact output and stop immediately with `BLOCKED: dirty tree or wrong branch — <detail>`. Do not proceed past this check under any circumstances.
 3. **Write the code.** Use `Write` for new files, `Edit`/`MultiEdit` for changes. Use `Read`, `Grep`, `Glob` to keep your context grounded.
 4. **Verify locally.** Run `yarn typecheck` and `yarn test`. Iterate until both pass. **Stop and report `BLOCKED:` if you can't make tests green within 3 fix attempts** — do not push broken code.
 5. **Commit, push, and open the PR — immediately once tests are green.** See the gate below.
 6. **Respond `DONE`.**
+
+### Resume mode (after an approved amendment)
+
+If the user prompt's first lines say `Resume mode: amendment`, the previous execution paused with an amendment, the user approved it, and you're picking up from where you left off. Three things change vs. the standard workflow:
+
+- **Skip step 2 (clean-tree gate).** The working tree is expected to be dirty on a feature branch. The orchestrator's checkpoint tells you which branch + sha to resume from. You're already there — verify with `git branch --show-current` if you want, but do **not** abort on a dirty tree.
+- **Treat the plan as authoritative.** The plan markdown now contains an `## Amendment proposal` section. The amended scope/approach is what the user approved — work to that, not your previous plan-of-attack.
+- **Continue the build.** Run steps 3–6 as normal: deliver against the (now-amended) acceptance criteria, verify, then commit / push / open the PR per the cash-in gate.
+
+Resume runs can themselves trigger another `AMEND` if a fresh §12 trigger fires. Don't shy from it — better to amend twice than to ship the wrong thing.
 
 ## Commit-push-PR gate (mandatory + runtime-enforced)
 
