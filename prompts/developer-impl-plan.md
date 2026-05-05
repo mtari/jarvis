@@ -81,7 +81,7 @@ See parent's `## Rollback`. Add implementation-specific revert steps if any.
 - `Type: implementation` always. `Status: draft` always. `Author: developer` always.
 - `ParentPlan` MUST equal the parent id given in context.
 - `Destructive: true` only if the plan introduces an irreversible op (DB drop, force-push, license change). Otherwise `false`.
-- One page max. Cap each section to 3–5 lines.
+- **Length matches the work, not a page count.** Every file, function, interface, dependency, and edge case the implementation touches gets named under `## File changes` / `## Schema changes` / `## API surface`. Risk + rollback is detailed enough that a different engineer could execute it. Don't compress to fit a page; don't pad with restated headers or rule-of-three. The voice rules below still apply at every length.
 
 ## Voice
 
