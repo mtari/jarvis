@@ -15,8 +15,10 @@ import {
   revisePlan,
 } from "../../orchestrator/plan-lifecycle.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
+import { resolveSetupTask } from "../../orchestrator/setup-tasks.ts";
 import { suppress } from "../../orchestrator/suppressions.ts";
 import { dbFile } from "../../cli/paths.ts";
+import { buildSkipReasonModal } from "./blocks/setup-task.ts";
 import { buildReviseModal } from "./blocks/plan-review.ts";
 import { surfacePlan, updateSurfacedPlan, type SurfaceContext } from "./surface.ts";
 
@@ -252,6 +254,83 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
     }
   });
 
+  app.action("setup_task_done", async ({ ack, body, action, client }) => {
+    await ack();
+    if (action.type !== "button") return;
+    const taskId = action.value;
+    if (!taskId) return;
+    const userId = "user" in body && body.user?.id ? body.user.id : "<slack>";
+
+    const result = resolveSetupTask(ctx.dataDir, dbFile(ctx.dataDir), taskId, {
+      status: "done",
+      actor: `slack:${userId}`,
+    });
+    if (!result.ok) {
+      ctx.logError("setup-task done failed", null, { taskId, message: result.message });
+      await postEphemeral(client, body, `✗ ${result.message ?? "Mark done failed"}`);
+      return;
+    }
+    ctx.log("setup-task resolved (done) via slack", { taskId, userId });
+    await closeSetupTaskMessage(client, body, `✓ Done by <@${userId}>`);
+  });
+
+  app.action("setup_task_skip", async ({ ack, body, action, client }) => {
+    await ack();
+    if (action.type !== "button") return;
+    const taskId = action.value;
+    if (!taskId) return;
+    if (body.type !== "block_actions" || !body.trigger_id) return;
+    try {
+      await client.views.open({
+        trigger_id: body.trigger_id,
+        view: buildSkipReasonModal(taskId),
+      });
+    } catch (err) {
+      ctx.logError("opening setup-task skip modal failed", err, { taskId });
+    }
+  });
+
+  app.view("setup_task_skip_submit", async ({ ack, body, view, client }) => {
+    const taskId = view.private_metadata;
+    const reason =
+      view.state.values["reason_block"]?.["reason_input"]?.value ?? "";
+    if (!taskId || !reason) {
+      await ack({
+        response_action: "errors",
+        errors: { reason_block: "Reason is required." },
+      });
+      return;
+    }
+    await ack();
+    const userId = body.user.id ?? "<slack>";
+
+    const result = resolveSetupTask(ctx.dataDir, dbFile(ctx.dataDir), taskId, {
+      status: "skipped",
+      actor: `slack:${userId}`,
+      skipReason: reason,
+    });
+    if (!result.ok) {
+      ctx.logError("setup-task skip failed", null, { taskId, message: result.message });
+      await postDmOrEphemeral(
+        client,
+        userId,
+        body.user.id,
+        `✗ ${result.message ?? "Skip failed"}`,
+      );
+      return;
+    }
+    ctx.log("setup-task resolved (skipped) via slack", { taskId, userId });
+    // We don't have the original message ts on a view submission, so
+    // we DM the user — the surface tick won't repost a resolved task,
+    // and the channel message will eventually look stale (acceptable).
+    await postDmOrEphemeral(
+      client,
+      userId,
+      body.user.id,
+      `↪ Skipped \`${taskId}\` — reason recorded.`,
+    );
+  });
+
   app.command("/jarvis", async ({ ack, command, respond }) => {
     await ack();
     const text = (command.text ?? "").trim();
@@ -367,5 +446,43 @@ async function postDmOrEphemeral(
     await client.chat.postMessage({ channel: target, text });
   } catch {
     // ignore
+  }
+}
+
+/**
+ * Strip the action buttons from a setup-task message and append a
+ * resolution context line. Used after the user clicks Mark done so
+ * the same message visually closes itself.
+ */
+async function closeSetupTaskMessage(
+  client: BoltApp["client"] | undefined,
+  body: unknown,
+  outcomeText: string,
+): Promise<void> {
+  if (!client) return;
+  const b = body as {
+    type?: string;
+    message?: { ts?: string; blocks?: Array<{ type?: string }> };
+    channel?: { id?: string };
+  };
+  if (b.type !== "block_actions" || !b.message?.ts || !b.channel?.id) return;
+  const trimmed = (b.message.blocks ?? []).filter(
+    (block) => block.type !== "actions",
+  );
+  try {
+    await client.chat.update({
+      channel: b.channel.id,
+      ts: b.message.ts,
+      blocks: [
+        ...trimmed,
+        {
+          type: "context",
+          elements: [{ type: "mrkdwn", text: outcomeText }],
+        },
+      ] as never,
+      text: outcomeText,
+    });
+  } catch {
+    // best-effort
   }
 }
