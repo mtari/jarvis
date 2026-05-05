@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { brainDir, brainFile, dbFile } from "../paths.ts";
+import { brainDir, brainFile, businessIdeasFile, dbFile } from "../paths.ts";
 import { saveBrain } from "../../orchestrator/brain.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { suppress } from "../../orchestrator/suppressions.ts";
@@ -343,6 +343,109 @@ describe("buildTriageReport", () => {
     ]);
     expect(report.counts.activeSuppressions).toBe(3);
   });
+
+  // -------------------------------------------------------------------------
+  // Scout recommendations section
+  // -------------------------------------------------------------------------
+
+  function writeIdeas(content: string): void {
+    fs.writeFileSync(businessIdeasFile(sandbox.dataDir), content);
+  }
+
+  it("returns empty scoutRecommendations when Business_Ideas.md is missing", () => {
+    const report = build();
+    expect(report.scoutRecommendations).toEqual([]);
+    expect(report.unscoredIdeasCount).toBe(0);
+  });
+
+  it("counts unscored ideas without surfacing them in recommendations", () => {
+    writeIdeas(
+      [
+        "## Unscored A",
+        "App: demo",
+        "Brief: x",
+        "",
+        "## Unscored B",
+        "App: demo",
+        "Brief: y",
+        "",
+      ].join("\n"),
+    );
+    const report = build();
+    expect(report.scoutRecommendations).toEqual([]);
+    expect(report.unscoredIdeasCount).toBe(2);
+  });
+
+  it("sorts scored ideas highest-score-first and caps at top N", () => {
+    const sections: string[] = [];
+    // Mix order with varied scores; expect descending output.
+    const scores = [42, 91, 67, 18, 75, 88, 5, 30];
+    for (let i = 0; i < scores.length; i += 1) {
+      sections.push(
+        [
+          `## Idea ${i}`,
+          "App: demo",
+          `Brief: brief ${i}`,
+          `Score: ${scores[i]}`,
+          "Rationale: r",
+          "",
+        ].join("\n"),
+      );
+    }
+    writeIdeas(sections.join(""));
+    const report = build();
+    expect(report.scoutRecommendations.map((r) => r.score)).toEqual([
+      91, 88, 75, 67, 42,
+    ]);
+    expect(report.scoutRecommendations).toHaveLength(5);
+    expect(report.unscoredIdeasCount).toBe(0);
+  });
+
+  it("includes title, score, rationale, app on each recommendation", () => {
+    writeIdeas(
+      [
+        "## Shorten checkout funnel",
+        "App: erdei-fahazak",
+        "Brief: Address-step drop-off",
+        "Score: 88",
+        "Rationale: high signal; quick to ship",
+        "",
+      ].join("\n"),
+    );
+    const report = build();
+    expect(report.scoutRecommendations).toHaveLength(1);
+    expect(report.scoutRecommendations[0]).toMatchObject({
+      ideaId: "shorten-checkout-funnel",
+      title: "Shorten checkout funnel",
+      app: "erdei-fahazak",
+      score: 88,
+      rationale: "high signal; quick to ship",
+    });
+  });
+
+  it("mixes scored + unscored ideas: scored show up, unscored counted", () => {
+    writeIdeas(
+      [
+        "## Scored",
+        "App: demo",
+        "Brief: x",
+        "Score: 70",
+        "",
+        "## Unscored A",
+        "App: demo",
+        "Brief: y",
+        "",
+        "## Unscored B",
+        "App: demo",
+        "Brief: z",
+        "",
+      ].join("\n"),
+    );
+    const report = build();
+    expect(report.scoutRecommendations).toHaveLength(1);
+    expect(report.scoutRecommendations[0]?.title).toBe("Scored");
+    expect(report.unscoredIdeasCount).toBe(2);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -359,6 +462,8 @@ describe("formatMarkdown", () => {
       stuckPlans: [],
       quietApps: [],
       expiringSuppressions: [],
+      scoutRecommendations: [],
+      unscoredIdeasCount: 0,
       counts: {
         signalsBySeverity: { low: 0, medium: 0, high: 0, critical: 0 },
         plansByStatus: {},
@@ -370,10 +475,12 @@ describe("formatMarkdown", () => {
     expect(md).toContain("## Summary");
     expect(md).toContain("## Critical signals not yet drafted (0)");
     expect(md).toContain("## Plans awaiting review (0)");
+    expect(md).toContain("## Scout recommendations (0)");
     expect(md).toContain("## Stuck plans (0)");
     expect(md).toContain("## Quiet apps (0)");
     expect(md).toContain("## Suppressions expiring");
     expect(md).toContain("_Inbox is empty._");
+    expect(md).toContain("No ideas in Business_Ideas.md");
   });
 
   it("renders critical signals + plans when present", () => {
@@ -406,6 +513,8 @@ describe("formatMarkdown", () => {
       stuckPlans: [],
       quietApps: [],
       expiringSuppressions: [],
+      scoutRecommendations: [],
+      unscoredIdeasCount: 0,
       counts: {
         signalsBySeverity: { low: 0, medium: 0, high: 0, critical: 1 },
         plansByStatus: { "awaiting-review": 1 },
@@ -417,5 +526,76 @@ describe("formatMarkdown", () => {
     expect(md).toContain("`plan-a` demo [high] — Fix auth (2d old)");
     expect(md).toContain("critical=1");
     expect(md).toContain("awaiting-review=1");
+  });
+
+  it("renders Scout recommendations sorted by score with rationale", () => {
+    const report: TriageReport = {
+      generatedAt: "2026-05-01T00:00:00.000Z",
+      windowDays: 7,
+      criticalSignals: [],
+      pendingReviews: [],
+      stuckPlans: [],
+      quietApps: [],
+      expiringSuppressions: [],
+      scoutRecommendations: [
+        {
+          ideaId: "high-impact",
+          title: "High impact thing",
+          app: "demo",
+          score: 88,
+          rationale: "quick to ship; high signal",
+          brief: "y",
+        },
+        {
+          ideaId: "second",
+          title: "Second-best",
+          app: "demo",
+          score: 60,
+          rationale: "fine but not urgent",
+          brief: "y",
+        },
+      ],
+      unscoredIdeasCount: 3,
+      counts: {
+        signalsBySeverity: { low: 0, medium: 0, high: 0, critical: 0 },
+        plansByStatus: {},
+        activeSuppressions: 0,
+      },
+    };
+    const md = formatMarkdown(report);
+    expect(md).toContain("## Scout recommendations (2, +3 unscored)");
+    expect(md).toContain(
+      "**88** `high-impact` demo — High impact thing (quick to ship; high signal)",
+    );
+    expect(md).toContain(
+      "**60** `second` demo — Second-best (fine but not urgent)",
+    );
+    expect(md).toContain(
+      "_3 unscored idea(s) waiting — run `yarn jarvis scout score` to rank them._",
+    );
+  });
+
+  it("hints at scout score when there are unscored ideas but no scored ones", () => {
+    const report: TriageReport = {
+      generatedAt: "2026-05-01T00:00:00.000Z",
+      windowDays: 7,
+      criticalSignals: [],
+      pendingReviews: [],
+      stuckPlans: [],
+      quietApps: [],
+      expiringSuppressions: [],
+      scoutRecommendations: [],
+      unscoredIdeasCount: 4,
+      counts: {
+        signalsBySeverity: { low: 0, medium: 0, high: 0, critical: 0 },
+        plansByStatus: {},
+        activeSuppressions: 0,
+      },
+    };
+    const md = formatMarkdown(report);
+    expect(md).toContain("## Scout recommendations (0, +4 unscored)");
+    expect(md).toContain(
+      "_4 unscored idea(s) in Business_Ideas.md — run `yarn jarvis scout score` to rank them._",
+    );
   });
 });
