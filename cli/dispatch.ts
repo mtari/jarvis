@@ -3,6 +3,7 @@ import { runAsk } from "./commands/ask.ts";
 import { runBacklog } from "./commands/backlog.ts";
 import { runCost } from "./commands/cost.ts";
 import { runDaemon } from "./commands/daemon.ts";
+import { runDiscussCommand } from "./commands/discuss.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
@@ -105,6 +106,10 @@ Utilities:
   ask "<text>"                Translate a natural-language request into one of
                               the supported Jarvis commands and run it.
                               Example: ask "what is on fire?" runs triage.
+  discuss --app <name> [--vault <v>] "<topic>"
+                              Multi-turn co-owner conversation. Outcomes:
+                              draft a plan, save an idea, append a note,
+                              create a setup task, or close without one.
   triage [--format markdown|json] [--window-days N]
                               Portfolio summary: critical signals, pending
                               reviews, stuck plans, quiet apps, expiring
@@ -147,6 +152,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runApprove(rest);
     case "ask":
       return runAsk(rest, { dispatch });
+    case "discuss":
+      return runDiscussCommand(rest);
     case "revise":
       return runRevise(rest);
     case "reject":
