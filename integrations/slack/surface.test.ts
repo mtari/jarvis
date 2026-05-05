@@ -8,10 +8,14 @@ import {
   type ConsoleSilencer,
   type InstallSandbox,
 } from "../../cli/commands/_test-helpers.ts";
+import { appendEvent } from "../../orchestrator/event-log.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
 import {
+  findAmendmentSurfaceRecord,
+  findPendingAmendment,
   findSurfaceRecord,
   runSurfaceTick,
+  surfaceAmendmentReview,
   surfacePlan,
   updateSurfacedPlan,
   type SurfaceContext,
@@ -191,5 +195,261 @@ describe("updateSurfacedPlan", () => {
     };
     await updateSurfacedPlan(ctx, record, "noop");
     expect(updates).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Slice 1: amendment surface
+// ---------------------------------------------------------------------------
+
+describe("findPendingAmendment", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function recordAmendment(
+    planId: string,
+    payload: Record<string, unknown>,
+    kind = "amendment-proposed",
+  ): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: "jarvis",
+        vaultId: "personal",
+        kind,
+        payload: { planId, ...payload },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("returns null when no amendment-proposed event exists", () => {
+    expect(findPendingAmendment(dbFile(sandbox.dataDir), "no-such")).toBeNull();
+  });
+
+  it("returns the latest amendment-proposed payload, with eventId", () => {
+    recordAmendment("plan-x", {
+      reason: "first",
+      proposal: "first proposal",
+      branch: "feat/old",
+      sha: "abc",
+      modifiedFileCount: 1,
+    });
+    recordAmendment("plan-x", {
+      reason: "second",
+      proposal: "second proposal",
+      branch: "feat/new",
+      sha: "def",
+      modifiedFileCount: 4,
+    });
+    const result = findPendingAmendment(dbFile(sandbox.dataDir), "plan-x");
+    expect(result).not.toBeNull();
+    expect(result?.reason).toBe("second");
+    expect(result?.branch).toBe("feat/new");
+    expect(result?.modifiedFileCount).toBe(4);
+    expect(typeof result?.eventId).toBe("number");
+  });
+
+  it("returns null when proposed count <= applied count (loop closed)", () => {
+    recordAmendment("plan-y", { reason: "r", proposal: "p" });
+    recordAmendment("plan-y", { reason: "r2", proposal: "p2" });
+    recordAmendment("plan-y", {}, "amendment-applied");
+    recordAmendment("plan-y", {}, "amendment-applied");
+    expect(findPendingAmendment(dbFile(sandbox.dataDir), "plan-y")).toBeNull();
+  });
+
+  it("returns the pending amendment when proposed > applied (re-amend mid-loop)", () => {
+    recordAmendment("plan-z", { reason: "r1", proposal: "p1" });
+    recordAmendment("plan-z", {}, "amendment-applied");
+    recordAmendment("plan-z", { reason: "r2", proposal: "p2" });
+    const result = findPendingAmendment(dbFile(sandbox.dataDir), "plan-z");
+    expect(result?.reason).toBe("r2");
+  });
+
+  it("skips events with malformed payload (missing reason / proposal)", () => {
+    recordAmendment("plan-q", { reason: "ok" }); // no proposal
+    expect(findPendingAmendment(dbFile(sandbox.dataDir), "plan-q")).toBeNull();
+  });
+});
+
+describe("surfaceAmendmentReview", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("posts an amendment-review message and records a slack-amendment-surfaced event", async () => {
+    dropPlan(sandbox, "2026-04-28-amend", { status: "awaiting-review" });
+    const record = findPlan(sandbox.dataDir, "2026-04-28-amend")!;
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+
+    const result = await surfaceAmendmentReview(ctx, record, {
+      eventId: 99,
+      reason: "scope expanded",
+      proposal: "do X instead of Y",
+      branch: "feat/x",
+      sha: "abcdef12",
+      modifiedFileCount: 3,
+    });
+
+    expect(result.posted).toBe(true);
+    expect(posts).toHaveLength(1);
+    const summary = (posts[0]!.blocks as Array<{ type: string }>).find(
+      (b) => b.type === "section",
+    );
+    expect(summary).toBeDefined();
+    expect(posts[0]!.text).toContain("Amendment to review");
+
+    const stored = findAmendmentSurfaceRecord(dbFile(sandbox.dataDir), 99);
+    expect(stored?.channel).toBe("C-INBOX");
+  });
+
+  it("is idempotent on amendment eventId — second call reuses the record", async () => {
+    dropPlan(sandbox, "2026-04-28-idem-a", { status: "awaiting-review" });
+    const record = findPlan(sandbox.dataDir, "2026-04-28-idem-a")!;
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const amendment = {
+      eventId: 1,
+      reason: "r",
+      proposal: "p",
+    };
+    const first = await surfaceAmendmentReview(ctx, record, amendment);
+    const second = await surfaceAmendmentReview(ctx, record, amendment);
+    expect(first.posted).toBe(true);
+    expect(second.posted).toBe(false);
+    expect(posts).toHaveLength(1);
+  });
+
+  it("does post a fresh message for a NEW amendment eventId (re-amend)", async () => {
+    dropPlan(sandbox, "2026-04-28-reamend", { status: "awaiting-review" });
+    const record = findPlan(sandbox.dataDir, "2026-04-28-reamend")!;
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    await surfaceAmendmentReview(ctx, record, {
+      eventId: 1,
+      reason: "first",
+      proposal: "p1",
+    });
+    await surfaceAmendmentReview(ctx, record, {
+      eventId: 2,
+      reason: "second",
+      proposal: "p2",
+    });
+    expect(posts).toHaveLength(2);
+  });
+});
+
+describe("runSurfaceTick — amendment routing", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function recordAmendmentProposed(
+    planId: string,
+    reason = "r",
+    proposal = "p",
+  ): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: "jarvis",
+        vaultId: "personal",
+        kind: "amendment-proposed",
+        payload: { planId, reason, proposal },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("routes a plan with a pending amendment to the amendment surface, not plan-review", async () => {
+    dropPlan(sandbox, "p-amend", {
+      status: "awaiting-review",
+      title: "AMENDED PLAN",
+    });
+    dropPlan(sandbox, "p-fresh", {
+      status: "awaiting-review",
+      title: "FRESH PLAN",
+    });
+    recordAmendmentProposed("p-amend", "scope expanded", "do X instead");
+
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const result = await runSurfaceTick(ctx);
+    expect(result.surfaced.sort()).toEqual(["p-amend@amendment", "p-fresh"]);
+
+    // Amendment post has the "Amendment to review" fallback text;
+    // plan-review post has "Plan to review".
+    const amendmentPost = posts.find((p) =>
+      p.text?.startsWith("Amendment to review"),
+    );
+    const planPost = posts.find((p) =>
+      p.text?.startsWith("Plan to review"),
+    );
+    expect(amendmentPost).toBeDefined();
+    expect(planPost).toBeDefined();
+    expect(amendmentPost?.text).toContain("AMENDED PLAN");
+    expect(planPost?.text).toContain("FRESH PLAN");
+  });
+
+  it("does not double-post the amendment on a second tick (idempotent on amendment eventId)", async () => {
+    dropPlan(sandbox, "p-once", { status: "awaiting-review" });
+    recordAmendmentProposed("p-once");
+
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    await runSurfaceTick(ctx);
+    await runSurfaceTick(ctx);
+    expect(posts).toHaveLength(1);
   });
 });
