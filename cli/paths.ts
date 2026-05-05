@@ -34,6 +34,10 @@ export function ideasDir(dataDir: string): string {
   return path.join(dataDir, "ideas");
 }
 
+export function businessIdeasFile(dataDir: string): string {
+  return path.join(dataDir, "Business_Ideas.md");
+}
+
 export function logsDir(dataDir: string): string {
   return path.join(dataDir, "logs");
 }
