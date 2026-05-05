@@ -13,6 +13,7 @@ import {
   RateLimitedError,
   type RunAgentTransport,
 } from "../../orchestrator/agent-sdk-runtime.ts";
+import { recordEscalation } from "../../orchestrator/escalations.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { loadBrain } from "../../orchestrator/brain.ts";
 import { listPlans, type PlanRecord } from "../../orchestrator/plan-store.ts";
@@ -259,6 +260,14 @@ async function fireDeveloper(
           resetsAt: reset,
         },
       );
+      recordEscalation(dbFile(fire.dataDir), {
+        kind: "rate-limit",
+        severity: "high",
+        summary: `Claude Code subscription rate limit hit during ${mode} fire on ${planId}`,
+        detail: `rate limit type: ${err.rateLimitType ?? "unknown"}\nresets at: ${reset}\nplan execution paused; will resume after the window expires.`,
+        planId,
+        app,
+      });
       return {
         planId,
         app,
@@ -278,6 +287,14 @@ async function fireDeveloper(
         err,
         { planId, mode, postCommitBashCount: err.postCommitBashCount },
       );
+      recordEscalation(dbFile(fire.dataDir), {
+        kind: "cash-in-violation",
+        severity: "critical",
+        summary: `Cash-in gate fired on ${planId} — partial commit on disk needs manual salvage`,
+        detail: `Developer committed but exceeded the ${err.postCommitBashCount}-call post-commit bash budget without pushing or opening a PR.\nThe runtime interrupted the SDK query.\nSalvage steps: cd into the app repo, push the branch, then open the PR by hand. After that, re-fire the plan if needed.`,
+        planId,
+        app,
+      });
       return {
         planId,
         app,
