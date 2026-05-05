@@ -694,6 +694,84 @@ describe("plan-executor execute-queue", () => {
       repo.cleanup();
     }
   });
+
+  it("amendment-resume fire skips assertCleanMain (dirty tree on a feature branch is expected)", async () => {
+    const repo = makeCleanMainRepo();
+    try {
+      // Set up the repo as it would look during an amendment resume:
+      // checked out on a feature branch with uncommitted changes.
+      execSync("git checkout -b feat/2026-04-28-resume-test", {
+        cwd: repo.dir,
+        stdio: "pipe",
+      });
+      writeFileSync(join(repo.dir, "in-progress.txt"), "wip\n");
+
+      const planId = "2026-04-28-resume-test";
+      dropPlan(sandbox, planId, {
+        status: "approved",
+        implementationReview: "skip",
+      });
+
+      // Seed an amendment-proposed event + a checkpoint so isAmendmentResume() returns true.
+      const conn = new Database(dbFile(sandbox.dataDir));
+      try {
+        conn
+          .prepare(
+            "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+          )
+          .run(
+            "jarvis",
+            "personal",
+            "amendment-proposed",
+            JSON.stringify({ planId }),
+            new Date().toISOString(),
+          );
+      } finally {
+        conn.close();
+      }
+      const checkpointDirPath = join(sandbox.dataDir, "logs", "checkpoints");
+      mkdirSync(checkpointDirPath, { recursive: true });
+      const checkpointPath = join(checkpointDirPath, `${planId}.json`);
+      writeFileSync(
+        checkpointPath,
+        JSON.stringify({
+          planId,
+          branch: "feat/2026-04-28-resume-test",
+          sha: "abc",
+          modifiedFiles: [{ status: "M", path: "x.ts" }],
+          amendmentReason: "r",
+          amendmentProposal: "p",
+          timestamp: new Date().toISOString(),
+        }),
+      );
+
+      const { transport } = scriptedTransport([
+        [
+          "DONE",
+          "Branch: feat/2026-04-28-resume-test",
+          "PR URL: https://github.com/mtari/jarvis/pull/123",
+          "Tests: pass",
+          "Notes: resumed and finished.",
+        ].join("\n"),
+      ]);
+
+      const result = await runPlanExecutorTick({
+        dataDir: sandbox.dataDir,
+        transport,
+        ctx: fakeDaemonCtx(),
+        repoRoot: repo.dir,
+      });
+
+      expect(result.fired).toHaveLength(1);
+      // Did NOT BLOCK on assertCleanMain — actually fired and got DONE
+      expect(result.fired[0]?.reason).toBeUndefined();
+      const r = result.fired[0]?.result as Record<string, unknown> | undefined;
+      expect(r?.["done"]).toBe(true);
+      expect(r?.["resume"]).toBe(true);
+    } finally {
+      repo.cleanup();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

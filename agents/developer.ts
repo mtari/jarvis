@@ -218,6 +218,14 @@ export interface ExecutePlanInput {
   /** Test injection for the SDK transport. */
   transport?: RunAgentTransport;
   model?: string;
+  /**
+   * When true, treat this fire as an amendment resume: read the
+   * checkpoint, build a resume-mode user prompt that explains the
+   * dirty-tree expectation, and on DONE record `amendment-applied`
+   * + delete the checkpoint. Caller (plan-executor) determines this
+   * via `isAmendmentResume()`.
+   */
+  resume?: boolean;
 }
 
 export interface ExecutePlanResult {
@@ -257,26 +265,59 @@ export async function executePlan(
 
   // Build context (include parent plan if implementation type)
   const planMarkdown = fs.readFileSync(record.path, "utf8");
-  const contextLines: string[] = [
-    `Plan id: ${input.planId}`,
-    "Plan content:",
-    "",
-    planMarkdown,
-  ];
-  if (
-    record.plan.metadata.type === "implementation" &&
-    record.plan.metadata.parentPlan
-  ) {
-    const parent = findPlan(input.dataDir, record.plan.metadata.parentPlan);
-    if (parent) {
-      contextLines.push("");
-      contextLines.push(
-        `Parent improvement plan id: ${record.plan.metadata.parentPlan}`,
+
+  // Resume mode short-circuits the standard prompt with checkpoint context.
+  let userPrompt: string;
+  let resumeCheckpoint: AmendmentCheckpoint | null = null;
+  if (input.resume === true) {
+    resumeCheckpoint = readAmendmentCheckpoint(input.planId, input.dataDir);
+    if (resumeCheckpoint === null) {
+      throw new DeveloperError(
+        `plan ${input.planId} is flagged as amendment-resume but the checkpoint is missing`,
       );
-      contextLines.push("Parent plan content:");
-      contextLines.push("");
-      contextLines.push(fs.readFileSync(parent.path, "utf8"));
     }
+    let parentMarkdown: string | undefined;
+    let parentPlanId: string | undefined;
+    if (
+      record.plan.metadata.type === "implementation" &&
+      record.plan.metadata.parentPlan
+    ) {
+      const parent = findPlan(input.dataDir, record.plan.metadata.parentPlan);
+      if (parent) {
+        parentMarkdown = fs.readFileSync(parent.path, "utf8");
+        parentPlanId = record.plan.metadata.parentPlan;
+      }
+    }
+    userPrompt = buildResumePrompt({
+      planId: input.planId,
+      planMarkdown,
+      checkpoint: resumeCheckpoint,
+      ...(parentMarkdown !== undefined && { parentMarkdown }),
+      ...(parentPlanId !== undefined && { parentPlanId }),
+    });
+  } else {
+    const contextLines: string[] = [
+      `Plan id: ${input.planId}`,
+      "Plan content:",
+      "",
+      planMarkdown,
+    ];
+    if (
+      record.plan.metadata.type === "implementation" &&
+      record.plan.metadata.parentPlan
+    ) {
+      const parent = findPlan(input.dataDir, record.plan.metadata.parentPlan);
+      if (parent) {
+        contextLines.push("");
+        contextLines.push(
+          `Parent improvement plan id: ${record.plan.metadata.parentPlan}`,
+        );
+        contextLines.push("Parent plan content:");
+        contextLines.push("");
+        contextLines.push(fs.readFileSync(parent.path, "utf8"));
+      }
+    }
+    userPrompt = contextLines.join("\n");
   }
 
   const developerPromptText = loadDeveloperPrompt("developer-execute.md");
@@ -289,7 +330,7 @@ export async function executePlan(
     systemPrompt: "", // ignored when presetSystemPrompt: true
     presetSystemPrompt: true,
     appendSystemPrompt: developerPromptText,
-    userPrompt: contextLines.join("\n"),
+    userPrompt,
     cwd: repo,
     maxTurns: input.maxTurns ?? DEFAULT_MAX_TURNS_EXECUTE,
     toolPreset: { kind: "claude_code" },
@@ -381,6 +422,31 @@ export async function executePlan(
     } else if (done) {
       recordTransition(updatedRecord, "done", input.dataDir);
       finalStatus = "done";
+      // If this run was a resume, record the matching amendment-applied
+      // event so future runs of `isAmendmentResume` return false, and
+      // remove the checkpoint so the next fire of this plan id (after
+      // a hypothetical re-approval) is treated as a fresh execution.
+      if (input.resume === true) {
+        const db = new Database(dbFile(input.dataDir));
+        try {
+          appendEvent(db, {
+            appId: input.app,
+            vaultId: input.vault,
+            kind: "amendment-applied",
+            payload: {
+              planId: input.planId,
+              actor: "developer",
+              ...(resumeCheckpoint !== null && {
+                resumedBranch: resumeCheckpoint.branch,
+                resumedSha: resumeCheckpoint.sha,
+              }),
+            },
+          });
+        } finally {
+          db.close();
+        }
+        removeAmendmentCheckpoint(input.planId, input.dataDir);
+      }
     } else if (blocked) {
       recordTransition(updatedRecord, "blocked", input.dataDir);
       finalStatus = "blocked";
@@ -654,4 +720,133 @@ export function appendAmendmentToPlan(
     "",
   ].join("\n");
   fs.writeFileSync(record.path, trimmed + section, "utf8");
+}
+
+/**
+ * True iff there's an `amendment-proposed` event for `planId` with no
+ * later `amendment-applied` event. Used by the plan-executor to decide
+ * whether a freshly-`approved` plan is a fresh fire or an amendment
+ * resume.
+ */
+export function isAmendmentResume(
+  planId: string,
+  dataDir: string,
+): boolean {
+  const db = new Database(dbFile(dataDir), { readonly: true });
+  try {
+    const proposed = db
+      .prepare(
+        "SELECT COUNT(*) AS c FROM events WHERE kind = 'amendment-proposed' AND json_extract(payload, '$.planId') = ?",
+      )
+      .get(planId) as { c: number };
+    if (proposed.c === 0) return false;
+    const applied = db
+      .prepare(
+        "SELECT COUNT(*) AS c FROM events WHERE kind = 'amendment-applied' AND json_extract(payload, '$.planId') = ?",
+      )
+      .get(planId) as { c: number };
+    return proposed.c > applied.c;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Reads the most recent amendment checkpoint for `planId`. Returns
+ * null when no checkpoint file exists or the JSON is malformed.
+ */
+export function readAmendmentCheckpoint(
+  planId: string,
+  dataDir: string,
+): AmendmentCheckpoint | null {
+  const filePath = path.join(checkpointsDir(dataDir), `${planId}.json`);
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    return JSON.parse(raw) as AmendmentCheckpoint;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Removes the checkpoint file for `planId`. No-op when the file is
+ * absent. Called after a successful resume so the next execution
+ * isn't mis-detected as another resume.
+ */
+export function removeAmendmentCheckpoint(
+  planId: string,
+  dataDir: string,
+): void {
+  const filePath = path.join(checkpointsDir(dataDir), `${planId}.json`);
+  try {
+    fs.unlinkSync(filePath);
+  } catch {
+    // missing or unreadable — best-effort cleanup
+  }
+}
+
+/**
+ * Composes the user prompt for an amendment-resume execution. Includes:
+ *   - Previous branch + sha + modified files (so Developer knows the
+ *     working state)
+ *   - The amendment reason + accepted proposal
+ *   - The full plan markdown (which now contains the amendment section)
+ *   - An explicit override telling Developer the clean-tree gate
+ *     does not apply this run
+ */
+export function buildResumePrompt(input: {
+  planId: string;
+  planMarkdown: string;
+  parentMarkdown?: string;
+  parentPlanId?: string;
+  checkpoint: AmendmentCheckpoint;
+}): string {
+  const lines: string[] = [];
+  lines.push(`Plan id: ${input.planId}`);
+  lines.push("Resume mode: amendment");
+  lines.push("");
+  lines.push(
+    "This is an amendment resume. The previous execution stopped to surface an amendment, the user approved it, and you're now continuing from where you left off.",
+  );
+  lines.push("");
+  lines.push("Previous run state:");
+  lines.push(`  Branch: ${input.checkpoint.branch}`);
+  lines.push(`  HEAD: ${input.checkpoint.sha}`);
+  if (input.checkpoint.modifiedFiles.length === 0) {
+    lines.push("  Modified files: (none — tree was clean at amendment time)");
+  } else {
+    lines.push("  Modified files in tree:");
+    for (const f of input.checkpoint.modifiedFiles) {
+      lines.push(`  - ${f.status} ${f.path}`);
+    }
+  }
+  lines.push("");
+  lines.push("Why the previous run paused:");
+  lines.push(`  ${input.checkpoint.amendmentReason}`);
+  lines.push("");
+  lines.push("The user-approved amendment proposal:");
+  for (const line of input.checkpoint.amendmentProposal.split("\n")) {
+    lines.push(`  ${line}`);
+  }
+  lines.push("");
+  lines.push(
+    "The plan markdown below now includes an `## Amendment proposal` section reflecting the accepted change. Treat the amended plan as authoritative.",
+  );
+  lines.push("");
+  lines.push("Plan content:");
+  lines.push("");
+  lines.push(input.planMarkdown);
+  if (input.parentMarkdown && input.parentPlanId) {
+    lines.push("");
+    lines.push(`Parent improvement plan id: ${input.parentPlanId}`);
+    lines.push("Parent plan content:");
+    lines.push("");
+    lines.push(input.parentMarkdown);
+  }
+  lines.push("");
+  lines.push(
+    "Continue execution from the current branch. **The clean-tree gate at step 2 of your workflow does not apply on resume — the dirty tree is expected.** Pick up where you left off, deliver against the (now-amended) acceptance criteria, then commit / push / open the PR per the cash-in gate.",
+  );
+  return lines.join("\n");
 }

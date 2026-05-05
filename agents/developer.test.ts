@@ -20,8 +20,12 @@ import {
   draftImplementationPlan,
   DeveloperError,
   executePlan,
+  isAmendmentResume,
   parseAmendmentResponse,
+  readAmendmentCheckpoint,
+  type AmendmentCheckpoint,
 } from "./developer.ts";
+import { checkpointsDir } from "../cli/paths.ts";
 import { parsePlan } from "../orchestrator/plan.ts";
 import { findPlan } from "../orchestrator/plan-store.ts";
 
@@ -752,5 +756,291 @@ describe("executePlan AMEND integration", () => {
     expect(child?.plan.metadata.status).toBe("awaiting-review");
     // Parent stays at executing — not mirrored
     expect(parent?.plan.metadata.status).toBe("executing");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// executePlan resume mode — slice 3
+// ---------------------------------------------------------------------------
+
+describe("executePlan resume mode", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function readEvents(kind: string): Array<Record<string, unknown>> {
+    const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const rows = conn
+        .prepare("SELECT payload FROM events WHERE kind = ?")
+        .all(kind) as Array<{ payload: string }>;
+      return rows.map((r) => JSON.parse(r.payload) as Record<string, unknown>);
+    } finally {
+      conn.close();
+    }
+  }
+
+  function seedCheckpoint(planId: string, overrides: Partial<AmendmentCheckpoint> = {}): AmendmentCheckpoint {
+    const checkpoint: AmendmentCheckpoint = {
+      planId,
+      branch: "feat/2026-04-27-resume",
+      sha: "abc1234",
+      modifiedFiles: [
+        { status: "M", path: "src/foo.ts" },
+        { status: "??", path: "src/new-file.ts" },
+      ],
+      amendmentReason: "scope expanded",
+      amendmentProposal: "Update twelve callsites instead of one.",
+      timestamp: "2026-05-05T10:00:00Z",
+      ...overrides,
+    };
+    fs.mkdirSync(checkpointsDir(sandbox.dataDir), { recursive: true });
+    fs.writeFileSync(
+      path.join(checkpointsDir(sandbox.dataDir), `${planId}.json`),
+      JSON.stringify(checkpoint, null, 2),
+    );
+    return checkpoint;
+  }
+
+  function seedAmendmentEvent(planId: string): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      const ev = {
+        appId: "jarvis",
+        vaultId: "personal",
+        kind: "amendment-proposed",
+        payload: { planId, reason: "x", proposal: "y" },
+      };
+      // appendEvent imported only by inbox.test.ts — re-import inline:
+      conn
+        .prepare(
+          "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .run(
+          ev.appId,
+          ev.vaultId,
+          ev.kind,
+          JSON.stringify(ev.payload),
+          new Date().toISOString(),
+        );
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("uses the checkpoint to build a resume-mode user prompt", async () => {
+    const planId = "2026-04-27-resume";
+    dropPlan(sandbox, planId, { status: "approved" });
+    seedAmendmentEvent(planId);
+    seedCheckpoint(planId, {
+      branch: "feat/special",
+      amendmentReason: "tests fail because schema changed",
+      amendmentProposal: "Add a migration for the new column.",
+      modifiedFiles: [{ status: "M", path: "src/auth.ts" }],
+    });
+
+    const { transport, calls } = scriptedTransport([
+      fixedRunResult(
+        [
+          "DONE",
+          "Branch: feat/special",
+          "PR URL: https://github.com/mtari/jarvis/pull/99",
+          "Tests: pass",
+          "Notes: resumed and finished.",
+        ].join("\n"),
+      ),
+    ]);
+
+    await executePlan({
+      transport,
+      planId,
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      resume: true,
+    });
+
+    expect(calls).toHaveLength(1);
+    const userPrompt = calls[0]!.prompt;
+    expect(userPrompt).toContain("Resume mode: amendment");
+    expect(userPrompt).toContain("Branch: feat/special");
+    expect(userPrompt).toContain("tests fail because schema changed");
+    expect(userPrompt).toContain("Add a migration for the new column.");
+    expect(userPrompt).toContain("M src/auth.ts");
+    expect(userPrompt).toContain(
+      "clean-tree gate at step 2 of your workflow does not apply",
+    );
+  });
+
+  it("records amendment-applied + removes checkpoint when resume succeeds", async () => {
+    const planId = "2026-04-27-applied";
+    dropPlan(sandbox, planId, { status: "approved" });
+    seedAmendmentEvent(planId);
+    seedCheckpoint(planId);
+    expect(readAmendmentCheckpoint(planId, sandbox.dataDir)).not.toBeNull();
+
+    const { transport } = scriptedTransport([
+      fixedRunResult(
+        [
+          "DONE",
+          "Branch: feat/2026-04-27-resume",
+          "PR URL: https://github.com/mtari/jarvis/pull/100",
+          "Tests: pass",
+          "Notes: resumed and finished.",
+        ].join("\n"),
+      ),
+    ]);
+
+    const result = await executePlan({
+      transport,
+      planId,
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      resume: true,
+    });
+
+    expect(result.done).toBe(true);
+    expect(readAmendmentCheckpoint(planId, sandbox.dataDir)).toBeNull();
+    expect(isAmendmentResume(planId, sandbox.dataDir)).toBe(false);
+
+    const applied = readEvents("amendment-applied");
+    expect(applied).toHaveLength(1);
+    expect(applied[0]).toMatchObject({
+      planId,
+      actor: "developer",
+      resumedBranch: "feat/2026-04-27-resume",
+    });
+  });
+
+  it("re-AMEND on resume: status flips back to awaiting-review, new checkpoint replaces old", async () => {
+    const planId = "2026-04-27-double-amend";
+    dropPlan(sandbox, planId, { status: "approved" });
+    seedAmendmentEvent(planId);
+    seedCheckpoint(planId);
+
+    const { transport } = scriptedTransport([
+      fixedRunResult(
+        [
+          "AMEND",
+          "Reason: discovered yet another upstream issue",
+          "",
+          "Need to also update the test fixtures for the new schema.",
+        ].join("\n"),
+      ),
+    ]);
+
+    const result = await executePlan({
+      transport,
+      planId,
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+      resume: true,
+    });
+
+    expect(result.amended).toBe(true);
+    expect(result.done).toBe(false);
+
+    const finalRecord = findPlan(sandbox.dataDir, planId);
+    expect(finalRecord?.plan.metadata.status).toBe("awaiting-review");
+
+    // Two amendment-proposed events now exist (the seeded one + the new one)
+    const proposed = readEvents("amendment-proposed");
+    expect(proposed.length).toBeGreaterThanOrEqual(2);
+
+    // No amendment-applied yet — the resume itself amended again.
+    expect(readEvents("amendment-applied")).toEqual([]);
+
+    // Still considered a resume next time around.
+    expect(isAmendmentResume(planId, sandbox.dataDir)).toBe(true);
+  });
+
+  it("throws when resume=true but the checkpoint file is missing", async () => {
+    const planId = "2026-04-27-no-checkpoint";
+    dropPlan(sandbox, planId, { status: "approved" });
+    seedAmendmentEvent(planId);
+    // No seedCheckpoint() call
+
+    const { transport } = scriptedTransport([fixedRunResult("DONE")]);
+    await expect(
+      executePlan({
+        transport,
+        planId,
+        app: "jarvis",
+        vault: "personal",
+        dataDir: sandbox.dataDir,
+        resume: true,
+      }),
+    ).rejects.toThrow(/checkpoint is missing/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isAmendmentResume — event-based detection
+// ---------------------------------------------------------------------------
+
+describe("isAmendmentResume", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function event(planId: string, kind: string): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      conn
+        .prepare(
+          "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .run(
+          "jarvis",
+          "personal",
+          kind,
+          JSON.stringify({ planId }),
+          new Date().toISOString(),
+        );
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("returns false when no amendment-proposed event exists", () => {
+    expect(isAmendmentResume("nope", sandbox.dataDir)).toBe(false);
+  });
+
+  it("returns true after a single amendment-proposed event", () => {
+    event("plan-a", "amendment-proposed");
+    expect(isAmendmentResume("plan-a", sandbox.dataDir)).toBe(true);
+  });
+
+  it("returns false after a matching amendment-applied event", () => {
+    event("plan-b", "amendment-proposed");
+    event("plan-b", "amendment-applied");
+    expect(isAmendmentResume("plan-b", sandbox.dataDir)).toBe(false);
+  });
+
+  it("returns true when there are more proposed than applied (re-amend)", () => {
+    event("plan-c", "amendment-proposed");
+    event("plan-c", "amendment-applied");
+    event("plan-c", "amendment-proposed");
+    expect(isAmendmentResume("plan-c", sandbox.dataDir)).toBe(true);
   });
 });

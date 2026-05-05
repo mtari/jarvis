@@ -6,6 +6,7 @@ import {
   draftImplementationPlan,
   DeveloperError,
   executePlan,
+  isAmendmentResume,
 } from "../../agents/developer.ts";
 import {
   CashInGateViolatedError,
@@ -181,6 +182,7 @@ export function resolveAppCwd(
 async function fireDeveloper(
   record: PlanRecord,
   fire: FireOnce,
+  resume = false,
 ): Promise<FiredPayload> {
   const planId = record.id;
   const app = record.app;
@@ -222,6 +224,7 @@ async function fireDeveloper(
       vault: record.vault,
       dataDir: fire.dataDir,
       repoRoot: fire.cwd,
+      resume,
       ...(fire.transport !== undefined && { transport: fire.transport }),
     });
     return {
@@ -232,10 +235,15 @@ async function fireDeveloper(
       result: {
         done: result.done,
         blocked: result.blocked,
+        amended: result.amended,
         numTurns: result.numTurns,
         subtype: result.subtype,
+        resume,
         ...(result.branch !== undefined && { branch: result.branch }),
         ...(result.prUrl !== undefined && { prUrl: result.prUrl }),
+        ...(result.amendmentReason !== undefined && {
+          amendmentReason: result.amendmentReason,
+        }),
       },
     };
   } catch (err) {
@@ -321,28 +329,35 @@ async function runExecute(
   record: PlanRecord,
   fire: FireOnce,
 ): Promise<FiredPayload> {
-  try {
-    assertCleanMain(fire.cwd);
-  } catch (err) {
-    const message =
-      err instanceof DeveloperError
-        ? err.message
-        : err instanceof Error
+  // Amendment resume runs from the saved branch with a deliberately
+  // dirty tree — the previous execution stopped mid-flight and we're
+  // picking up where it left off. The clean-tree gate would reject
+  // that state, so skip it for resume fires.
+  const resume = isAmendmentResume(record.id, fire.dataDir);
+  if (!resume) {
+    try {
+      assertCleanMain(fire.cwd);
+    } catch (err) {
+      const message =
+        err instanceof DeveloperError
           ? err.message
-          : String(err);
-    fire.ctx.logger.error(
-      "plan-executor: assertCleanMain blocked execute fire",
-      err,
-      { planId: record.id },
-    );
-    return {
-      planId: record.id,
-      app: record.app,
-      mode: "execute",
-      reason: `BLOCKED: ${message}`,
-    };
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      fire.ctx.logger.error(
+        "plan-executor: assertCleanMain blocked execute fire",
+        err,
+        { planId: record.id },
+      );
+      return {
+        planId: record.id,
+        app: record.app,
+        mode: "execute",
+        reason: `BLOCKED: ${message}`,
+      };
+    }
   }
-  return fireDeveloper(record, fire);
+  return fireDeveloper(record, fire, resume);
 }
 
 export interface TickInput {
