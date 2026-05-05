@@ -15,6 +15,7 @@ import {
   revisePlan,
 } from "../../orchestrator/plan-lifecycle.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
+import { suppress } from "../../orchestrator/suppressions.ts";
 import { dbFile } from "../../cli/paths.ts";
 import { buildReviseModal } from "./blocks/plan-review.ts";
 import { surfacePlan, updateSurfacedPlan, type SurfaceContext } from "./surface.ts";
@@ -196,6 +197,58 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
         updatedRecord,
         `✗ Rejected by <@${userId}>`,
       );
+    }
+  });
+
+  app.action("signal_suppress", async ({ ack, body, action, client }) => {
+    await ack();
+    if (action.type !== "button") return;
+    const dedupKey = action.value;
+    if (!dedupKey) return;
+    const userId = "user" in body && body.user?.id ? body.user.id : "<slack>";
+
+    try {
+      suppress(dbFile(ctx.dataDir), {
+        patternId: dedupKey,
+        pattern: dedupKey,
+        reason: `suppressed via slack by ${userId}`,
+      });
+    } catch (err) {
+      ctx.logError("suppress via slack failed", err, { dedupKey });
+      await postEphemeral(client, body, `✗ Suppress failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`);
+      return;
+    }
+    ctx.log("suppressed via slack", { dedupKey, userId });
+
+    // Strip the action button from the original message — the alert
+    // is now muted, no further action available.
+    if (body.type === "block_actions" && body.message?.ts && body.channel?.id) {
+      const trimmed = (body.message.blocks ?? []).filter(
+        (b: { type?: string }) => b.type !== "actions",
+      );
+      try {
+        await client.chat.update({
+          channel: body.channel.id,
+          ts: body.message.ts,
+          blocks: [
+            ...trimmed,
+            {
+              type: "context",
+              elements: [
+                {
+                  type: "mrkdwn",
+                  text: `🔕 Suppressed by <@${userId}> — \`yarn jarvis unsuppress ${dedupKey}\` to lift.`,
+                },
+              ],
+            },
+          ],
+          text: `Suppressed: ${dedupKey}`,
+        });
+      } catch (err) {
+        ctx.logError("update after suppress failed", err, { dedupKey });
+      }
     }
   });
 
