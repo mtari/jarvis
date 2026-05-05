@@ -77,6 +77,9 @@ Utilities:
   scout score [--vault <v>]   Score unscored ideas in Business_Ideas.md. Writes
                               score, scoredAt, rationale back to the file and
                               records an idea-scored event per idea.
+  scout draft [--threshold N] [--vault <v>]
+                              Auto-draft a Strategist plan for each idea scoring
+                              ≥ threshold (default 80). Idempotent per idea.
   observe-impact <plan-id> [--vault <name>]
                               Post-merge check: re-runs the analyst collectors
                               against the plan's app and transitions the plan
