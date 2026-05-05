@@ -1,4 +1,5 @@
 import { runApprove } from "./commands/approve.ts";
+import { runAsk } from "./commands/ask.ts";
 import { runBacklog } from "./commands/backlog.ts";
 import { runCost } from "./commands/cost.ts";
 import { runDaemon } from "./commands/daemon.ts";
@@ -101,6 +102,9 @@ Utilities:
                               Free-text project notes. With --append, append a
                               timestamped entry; without, open in $EDITOR.
                               Read by Strategist / Scout / Developer for context.
+  ask "<text>"                Translate a natural-language request into one of
+                              the supported Jarvis commands and run it.
+                              Example: ask "what is on fire?" runs triage.
   triage [--format markdown|json] [--window-days N]
                               Portfolio summary: critical signals, pending
                               reviews, stuck plans, quiet apps, expiring
@@ -141,6 +145,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runInbox(rest);
     case "approve":
       return runApprove(rest);
+    case "ask":
+      return runAsk(rest, { dispatch });
     case "revise":
       return runRevise(rest);
     case "reject":

@@ -17,6 +17,7 @@ import {
 } from "../../orchestrator/plan-lifecycle.ts";
 import Database from "better-sqlite3";
 import { appendEvent } from "../../orchestrator/event-log.ts";
+import { interpretAsk } from "../../cli/commands/ask.ts";
 import { appendNote } from "../../orchestrator/notes.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
 import { resolveSetupTask } from "../../orchestrator/setup-tasks.ts";
@@ -449,10 +450,12 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       }
       case "notes":
         return runSlashNotes(parts.slice(1), ctx, respond, command);
+      case "ask":
+        return runSlashAsk(parts.slice(1).join(" "), ctx, respond);
       default:
         await respond({
           response_type: "ephemeral",
-          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`notes\`.`,
+          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`notes\`, \`ask\`.`,
         });
     }
   });
@@ -467,6 +470,7 @@ const SLASH_USAGE = [
   "• `/jarvis scout score [--vault <v>]` — score unscored ideas in `Business_Ideas.md`",
   "• `/jarvis scout draft [--threshold N] [--vault <v>]` — auto-draft plans from high-scoring ideas",
   "• `/jarvis notes <app> <text>` — append a free-text note read by Strategist / Scout / Developer",
+  "• `/jarvis ask <text>` — natural-language router into the right Jarvis command",
 ].join("\n");
 
 type SlashRespond = (args: {
@@ -662,6 +666,68 @@ async function runSlashScoutDraft(
     await respond({
       response_type: "ephemeral",
       text: `✗ Scout draft failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    });
+  }
+}
+
+async function runSlashAsk(
+  text: string,
+  ctx: HandlerContext,
+  respond: SlashRespond,
+): Promise<void> {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) {
+    await respond({
+      response_type: "ephemeral",
+      text: 'Usage: `/jarvis ask "<text>"`',
+    });
+    return;
+  }
+  await respond({
+    response_type: "ephemeral",
+    text: "🤔 Interpreting…",
+  });
+  try {
+    const client = ctx.getAnthropicClient();
+    const interpretation = await interpretAsk(trimmed, client);
+    if (interpretation.kind === "clarify") {
+      await respond({
+        response_type: "ephemeral",
+        text: `*Need more info:* ${interpretation.question}`,
+      });
+      return;
+    }
+    if (interpretation.kind === "refuse") {
+      await respond({
+        response_type: "ephemeral",
+        text: interpretation.reason,
+      });
+      return;
+    }
+    // Don't run the command from Slack — show the user what to run.
+    // Slack output capture for arbitrary CLI commands is a deeper
+    // refactor (commands print to stdout, not return strings); v1
+    // shows the resolved command + a one-line explanation so the
+    // user can paste it. The CLI flavour does run it directly.
+    await respond({
+      response_type: "ephemeral",
+      text: [
+        `*${interpretation.explanation}*`,
+        "",
+        "```",
+        `yarn jarvis ${interpretation.command} ${interpretation.argv.slice(1).join(" ")}`,
+        "```",
+        "",
+        "_Run that in your terminal. Slack output capture for arbitrary commands lands in a follow-up._",
+      ].join("\n"),
+    });
+  } catch (err) {
+    ctx.logError("/jarvis ask failed", err, { text: trimmed });
+    await respond({
+      response_type: "ephemeral",
+      text: `✗ Ask failed: ${
         err instanceof Error ? err.message : String(err)
       }`,
     });
