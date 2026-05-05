@@ -3,6 +3,10 @@ import { parseArgs } from "node:util";
 import Database from "better-sqlite3";
 import { readAutoDraftedDedupKeys } from "../../agents/analyst.ts";
 import { listOnboardedApps } from "../../orchestrator/brain.ts";
+import {
+  loadBusinessIdeas,
+  type BusinessIdea,
+} from "../../orchestrator/business-ideas.ts";
 import { listEvents, type EventRow } from "../../orchestrator/event-log.ts";
 import { listPlans, type PlanRecord } from "../../orchestrator/plan-store.ts";
 import {
@@ -41,6 +45,7 @@ const STUCK_REVIEW_DAYS = 7;
 const STUCK_EXECUTING_DAYS = 1;
 const EXPIRY_SOON_DAYS = 7;
 const QUIET_APP_DAYS = 14;
+const SCOUT_TOP_N = 5;
 
 const MS_PER_DAY = 1000 * 60 * 60 * 24;
 
@@ -78,6 +83,16 @@ interface ExpiringSuppression {
   daysUntilExpiry: number;
 }
 
+interface ScoutRecommendation {
+  ideaId: string;
+  title: string;
+  app: string;
+  score: number;
+  rationale?: string;
+  brief: string;
+  scoredAt?: string;
+}
+
 export interface TriageReport {
   generatedAt: string;
   windowDays: number;
@@ -86,6 +101,10 @@ export interface TriageReport {
   stuckPlans: PlanInfo[];
   quietApps: AppActivity[];
   expiringSuppressions: ExpiringSuppression[];
+  /** Top scored ideas from Business_Ideas.md, highest first. */
+  scoutRecommendations: ScoutRecommendation[];
+  /** Ideas in Business_Ideas.md that don't have a Score yet. */
+  unscoredIdeasCount: number;
   counts: {
     signalsBySeverity: Record<SignalSeverity, number>;
     plansByStatus: Record<string, number>;
@@ -307,6 +326,28 @@ export function buildTriageReport(input: {
   }
   expiringSuppressions.sort((a, b) => a.daysUntilExpiry - b.daysUntilExpiry);
 
+  // Scout recommendations: top-N scored ideas, highest score first.
+  // Unscored ideas are surfaced as a count so the user knows when to
+  // run `yarn jarvis scout score` — they don't show up in the
+  // recommendations list (no score = nothing to recommend on).
+  const ideasFile = loadBusinessIdeas(dataDir);
+  const scoredIdeas = ideasFile.ideas.filter(
+    (i): i is BusinessIdea & { score: number } => typeof i.score === "number",
+  );
+  const unscoredIdeasCount = ideasFile.ideas.length - scoredIdeas.length;
+  scoredIdeas.sort((a, b) => b.score - a.score);
+  const scoutRecommendations: ScoutRecommendation[] = scoredIdeas
+    .slice(0, SCOUT_TOP_N)
+    .map((i) => ({
+      ideaId: i.id,
+      title: i.title,
+      app: i.app,
+      score: i.score,
+      brief: i.brief,
+      ...(i.rationale !== undefined && { rationale: i.rationale }),
+      ...(i.scoredAt !== undefined && { scoredAt: i.scoredAt }),
+    }));
+
   return {
     generatedAt: now.toISOString(),
     windowDays,
@@ -315,6 +356,8 @@ export function buildTriageReport(input: {
     stuckPlans,
     quietApps,
     expiringSuppressions,
+    scoutRecommendations,
+    unscoredIdeasCount,
     counts,
   };
 }
@@ -387,6 +430,37 @@ export function formatMarkdown(report: TriageReport): string {
     for (const p of report.pendingReviews) {
       lines.push(
         `- \`${p.id}\` ${p.app} [${p.priority}] — ${p.title} (${p.ageDays}d old)`,
+      );
+    }
+  }
+  lines.push("");
+
+  const scoutHeading = `## Scout recommendations (${report.scoutRecommendations.length}${
+    report.unscoredIdeasCount > 0
+      ? `, +${report.unscoredIdeasCount} unscored`
+      : ""
+  })`;
+  lines.push(scoutHeading);
+  if (report.scoutRecommendations.length === 0) {
+    if (report.unscoredIdeasCount > 0) {
+      lines.push(
+        `_${report.unscoredIdeasCount} unscored idea(s) in Business_Ideas.md — run \`yarn jarvis scout score\` to rank them._`,
+      );
+    } else {
+      lines.push(
+        "_No ideas in Business_Ideas.md. Add some, then run `yarn jarvis scout score`._",
+      );
+    }
+  } else {
+    for (const r of report.scoutRecommendations) {
+      lines.push(
+        `- **${r.score}** \`${r.ideaId}\` ${r.app} — ${r.title}${r.rationale !== undefined ? ` (${r.rationale})` : ""}`,
+      );
+    }
+    if (report.unscoredIdeasCount > 0) {
+      lines.push("");
+      lines.push(
+        `_${report.unscoredIdeasCount} unscored idea(s) waiting — run \`yarn jarvis scout score\` to rank them._`,
       );
     }
   }
