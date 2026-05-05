@@ -1,4 +1,5 @@
 import type { App as BoltApp } from "@slack/bolt";
+import { removeAmendmentCheckpoint } from "../../agents/developer.ts";
 import {
   redraftPlan,
   runStrategist,
@@ -184,6 +185,9 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       await postEphemeral(client, body, `✗ Reject failed: ${result.message}`);
       return;
     }
+    // Parity with `yarn jarvis reject`: drop any amendment checkpoint
+    // tied to this plan id. No-op when there's no checkpoint.
+    removeAmendmentCheckpoint(planId, ctx.dataDir);
     ctx.log("rejected via slack", { planId, userId });
     const updatedRecord = findPlan(ctx.dataDir, planId);
     if (updatedRecord) {

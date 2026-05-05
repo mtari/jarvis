@@ -9,6 +9,10 @@ import {
 import type { Plan } from "../../orchestrator/plan.ts";
 import { dbFile } from "../../cli/paths.ts";
 import {
+  buildAmendmentReviewBlocks,
+  type AmendmentEventData,
+} from "./blocks/amendment-review.ts";
+import {
   buildPlanReviewBlocks,
   buildOutcomeContext,
 } from "./blocks/plan-review.ts";
@@ -166,9 +170,17 @@ export async function runSurfaceTick(ctx: SurfaceContext): Promise<{
     (p) => p.plan.metadata.status === "awaiting-review",
   );
   for (const candidate of candidates) {
+    // Route to the amendment review surface when a pending amendment
+    // event exists; otherwise the standard plan-review path.
+    const pending = findPendingAmendment(dbFile(ctx.dataDir), candidate.id);
     try {
-      const result = await surfacePlan(ctx, candidate);
-      if (result.posted) surfaced.push(candidate.id);
+      if (pending) {
+        const result = await surfaceAmendmentReview(ctx, candidate, pending);
+        if (result.posted) surfaced.push(`${candidate.id}@amendment`);
+      } else {
+        const result = await surfacePlan(ctx, candidate);
+        if (result.posted) surfaced.push(candidate.id);
+      }
     } catch (err) {
       errors.push({
         planId: candidate.id,
@@ -177,6 +189,178 @@ export async function runSurfaceTick(ctx: SurfaceContext): Promise<{
     }
   }
   return { surfaced, errors };
+}
+
+/**
+ * Returns the latest unapplied amendment-proposed event for `planId`,
+ * or null when none exists. "Pending" = there's at least one
+ * amendment-proposed event AND there are more proposed than applied
+ * (re-amend on resume increments both counts).
+ *
+ * The returned eventId is the auto-increment key of the
+ * amendment-proposed event row — used as the dedup key for
+ * `slack-amendment-surfaced` events so we don't re-post on every tick.
+ */
+export function findPendingAmendment(
+  dbFilePath: string,
+  planId: string,
+): AmendmentEventData | null {
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    const proposedRows = db
+      .prepare(
+        "SELECT id, payload FROM events WHERE kind = 'amendment-proposed' AND json_extract(payload, '$.planId') = ? ORDER BY id DESC",
+      )
+      .all(planId) as Array<{ id: number; payload: string }>;
+    if (proposedRows.length === 0) return null;
+
+    const appliedCount = db
+      .prepare(
+        "SELECT COUNT(*) AS c FROM events WHERE kind = 'amendment-applied' AND json_extract(payload, '$.planId') = ?",
+      )
+      .get(planId) as { c: number };
+    if (proposedRows.length <= appliedCount.c) return null;
+
+    // Latest proposed (rows are DESC sorted by id)
+    const latest = proposedRows[0]!;
+    let payload: {
+      reason?: string;
+      proposal?: string;
+      branch?: string;
+      sha?: string;
+      modifiedFileCount?: number;
+    };
+    try {
+      payload = JSON.parse(latest.payload);
+    } catch {
+      return null;
+    }
+    if (typeof payload.reason !== "string" || payload.reason.length === 0) {
+      return null;
+    }
+    if (typeof payload.proposal !== "string" || payload.proposal.length === 0) {
+      return null;
+    }
+    return {
+      eventId: latest.id,
+      reason: payload.reason,
+      proposal: payload.proposal,
+      ...(typeof payload.branch === "string" && { branch: payload.branch }),
+      ...(typeof payload.sha === "string" && { sha: payload.sha }),
+      ...(typeof payload.modifiedFileCount === "number" && {
+        modifiedFileCount: payload.modifiedFileCount,
+      }),
+    };
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Returns the surface record for a previously-surfaced amendment event.
+ * Lookup is by `amendmentEventId` so re-amend on resume produces a
+ * fresh post instead of re-using the prior one.
+ */
+export function findAmendmentSurfaceRecord(
+  dbFilePath: string,
+  amendmentEventId: number,
+): SurfaceRecord | null {
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    const rows = db
+      .prepare(
+        "SELECT payload, created_at FROM events WHERE kind = 'slack-amendment-surfaced' ORDER BY id DESC",
+      )
+      .all() as Array<{ payload: string; created_at: string }>;
+    for (const r of rows) {
+      try {
+        const payload = JSON.parse(r.payload) as {
+          amendmentEventId?: number;
+          channel?: string;
+          messageTs?: string;
+        };
+        if (
+          payload.amendmentEventId === amendmentEventId &&
+          typeof payload.channel === "string" &&
+          typeof payload.messageTs === "string"
+        ) {
+          return {
+            channel: payload.channel,
+            messageTs: payload.messageTs,
+            surfacedAt: r.created_at,
+          };
+        }
+      } catch {
+        // skip malformed
+      }
+    }
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Posts an amendment-review message to `#jarvis-inbox` and records a
+ * `slack-amendment-surfaced` event. Idempotent on the
+ * `amendmentEventId`: a re-amend on resume produces a fresh post; the
+ * same amendment doesn't re-post on subsequent ticks.
+ */
+export async function surfaceAmendmentReview(
+  ctx: SurfaceContext,
+  record: PlanRecord,
+  amendment: AmendmentEventData,
+): Promise<SurfacePlanResult> {
+  const existing = findAmendmentSurfaceRecord(
+    dbFile(ctx.dataDir),
+    amendment.eventId,
+  );
+  if (existing) return { posted: false, surface: existing };
+
+  const blocks = buildAmendmentReviewBlocks({
+    planId: record.id,
+    plan: record.plan,
+    amendment,
+    path: record.path,
+  });
+
+  const result = await ctx.client.chat.postMessage({
+    channel: ctx.inboxChannelId,
+    blocks,
+    text: `Amendment to review: ${record.plan.metadata.title}`,
+  });
+
+  if (!result.ok || !result.ts) {
+    throw new Error(
+      `chat.postMessage failed (amendment): ${result.error ?? "unknown"}`,
+    );
+  }
+
+  const db = new Database(dbFile(ctx.dataDir));
+  try {
+    appendEvent(db, {
+      appId: record.app,
+      vaultId: record.vault,
+      kind: "slack-amendment-surfaced",
+      payload: {
+        planId: record.id,
+        amendmentEventId: amendment.eventId,
+        channel: ctx.inboxChannelId,
+        messageTs: result.ts,
+      },
+    });
+  } finally {
+    db.close();
+  }
+
+  return {
+    posted: true,
+    surface: {
+      channel: ctx.inboxChannelId,
+      messageTs: result.ts,
+      surfacedAt: new Date().toISOString(),
+    },
+  };
 }
 
 export function reloadPlanFromDisk(
