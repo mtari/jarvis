@@ -4,6 +4,7 @@ import { runBacklog } from "./commands/backlog.ts";
 import { runCost } from "./commands/cost.ts";
 import { runDaemon } from "./commands/daemon.ts";
 import { runDiscussCommand } from "./commands/discuss.ts";
+import { runDocs } from "./commands/docs.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
@@ -103,6 +104,15 @@ Utilities:
                               Free-text project notes. With --append, append a
                               timestamped entry; without, open in $EDITOR.
                               Read by Strategist / Scout / Developer for context.
+  docs list --app <name> [--vault <v>] [--format table|json]
+                              List registered docs for an app.
+  docs add --app <name> --keep <path-or-url> [--title <t>] [--tags <a,b,c>]
+                              Cache a doc (full content kept on disk for
+                              on-demand reference). Absorb mode (without
+                              --keep) lands in a follow-up.
+  docs remove --app <name> <id> [--vault <v>]
+                              Unregister a doc. Cache files are removed;
+                              anything already absorbed into the brain stays.
   ask "<text>"                Translate a natural-language request into one of
                               the supported Jarvis commands and run it.
                               Example: ask "what is on fire?" runs triage.
@@ -154,6 +164,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runAsk(rest, { dispatch });
     case "discuss":
       return runDiscussCommand(rest);
+    case "docs":
+      return runDocs(rest);
     case "revise":
       return runRevise(rest);
     case "reject":
