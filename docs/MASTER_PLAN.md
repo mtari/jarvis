@@ -971,18 +971,17 @@ During autonomous execution, the executor (Developer or Marketer) must halt and 
 
 Amendments are a normal part of the loop, not a failure. Strategist learns from amendment rates and adjusts plan specificity.
 
-### Implementation status (Phase 2, PRs #34–#36)
+### Implementation status (Phase 2, PRs #34–#36, #38)
 
-CLI surfaces are wired end-to-end:
+CLI + Slack surfaces wired end-to-end:
 - **AMEND output protocol** from Developer (`AMEND` line, `Reason:` line, multi-line proposal). Precedence: AMEND > BLOCKED > DONE. Detected by `parseAmendmentResponse` in `agents/developer.ts`.
 - **Checkpoint** at `<dataDir>/logs/checkpoints/<planId>.json` capturing branch, sha, modified files, reason, and proposal — best-effort capture; failures log `amendment-checkpoint-error` but don't abort the amendment.
 - **Plan body update**: a stacked `## Amendment proposal (mid-execution, YYYY-MM-DD)` section is appended so the user reviewing the plan in their inbox sees context inline with the original plan.
 - **State transition**: `executing → awaiting-review` with an `amendment-proposed` event recorded.
-- **Inbox tagging**: CLI `yarn jarvis inbox` separates "Pending amendment reviews" from "Pending plan reviews" with an `[AMEND]` row tag, driven by `amendment-proposed` minus `amendment-applied` event count.
+- **Inbox tagging**: CLI `yarn jarvis inbox` separates "Pending amendment reviews" from "Pending plan reviews" with an `[AMEND]` row tag.
+- **Slack surface** (PR #38): `runSurfaceTick` routes amendment-state plans to `surfaceAmendmentReview`, which posts a distinct Block Kit message to `#jarvis-inbox` with reason + proposal context, branch / sha / modified-file count, and Approve & resume / Revise / Reject buttons. Idempotent on the `amendment-proposed` event id; re-amend on resume produces a fresh post.
 - **Auto-resume** (`executePlan({resume: true})`): plan-executor detects resume state via `isAmendmentResume`, skips `assertCleanMain`, runs Developer with a resume-mode prompt that explains the dirty-tree expectation. On DONE, records `amendment-applied`, deletes the checkpoint.
-- **Reject cleanup**: `yarn jarvis reject <id>` removes the checkpoint after a successful rejection (best-effort no-op for non-amendment plans).
-
-The **Slack amendment review surface** (proposal block + distinct buttons in `#jarvis-inbox`) is the last remaining piece and lands as part of the Phase 2 Slack-primary buildout (§16).
+- **Reject cleanup** (CLI + Slack): both `yarn jarvis reject <id>` and the Slack reject button remove the checkpoint after a successful rejection (best-effort no-op for non-amendment plans).
 
 ---
 
@@ -1241,29 +1240,28 @@ Once the code-repo structure is in place, write `jarvis/CLAUDE.md` (the repo-lev
 
 **Exit:** `erdei-fahazak` is onboarded as the first real app, plans of all three types flow through Slack plan-review, and at least one real-project plan has shipped to main.
 
-### Phase 2 — Analyst + Scout (Week 5–6) — in progress
+### Phase 2 — Analyst + Scout (Week 5–6) — complete (modulo external)
 
-**Shipped (PRs #17–#36):**
+**Shipped (PRs #17–#43):**
 - ✅ **Analyst** — signal collector framework + `yarn-audit`, `broken-links`, and `content-freshness` collectors (PRs #17, #21, #22). Hourly daemon sweep across every onboarded app with `brain.repo` configured (#18). Auto-draft hand-off to Strategist when signals at/above a severity threshold land (#19). Suppressions table with glob pattern matching (#20, #24) plus per-tick GC of expired/cleared rows (#23). Per-vault SQL signals listing CLI (#25). Post-merge observation primitive `observeImpact` + auto-fire on `shipped-pending-impact` plans aged ≥24h (#28, #29). Weekly triage report (CLI `yarn jarvis triage` + daemon-driven Monday-morning file write at `<dataDir>/triage/<date>.md`, PRs #26, #27).
 - ✅ **Scout** — `Business_Ideas.md` format + parser (#30). LLM-driven scoring with strict `<score>` JSON protocol (#31). Top-N recommendations in the triage report with an "unscored" hint that drives the user to `yarn jarvis scout score` (#32). Auto-draft of high-scoring ideas to Strategist via `yarn jarvis scout draft` (#33).
-- ✅ **§12 amendment flow + escalate-within-plan (CLI surfaces only)** — AMEND text protocol from Developer, checkpoint capture, plan-body update, `[AMEND]` inbox tag, auto-resume from checkpoint after approval, checkpoint cleanup on reject (PRs #34–#36). The Slack surface for amendments is the final piece, delivered in the Slack-primary track below. See §12 for the full implementation status.
+- ✅ **§12 amendment flow + escalate-within-plan** — AMEND text protocol from Developer, checkpoint capture, plan-body update, `[AMEND]` inbox tag, auto-resume from checkpoint after approval, checkpoint cleanup on reject (PRs #34–#36). Slack amendment review surface with proposal context + approve/revise/reject buttons (#38). See §12 for the full implementation status.
+- ✅ **Slack-primary buildout** — Slack now surfaces every actionable plan event and every notable system event:
+  - **Amendment review surface** in `#jarvis-inbox` (#38)
+  - **Critical-signal alerts** to `#jarvis-alerts` with severity tag + Suppress button (#39)
+  - **Triage delivery** to `#jarvis-inbox` (file + Monday-morning post, with the daemon's weekly job) (#40)
+  - **Setup tasks** as Block Kit with Mark done / Skip… buttons + skip-reason modal; new `orchestrator/setup-tasks.ts` primitives (#41)
+  - **Slash commands** — `/jarvis plan|bug|inbox|triage` (#42)
+  - **Runtime escalation alerts** to `#jarvis-alerts` for rate-limit hits and cash-in violations, with Acknowledge button + audit event; `recordEscalation` primitive in `orchestrator/escalations.ts` (#43)
 
-**Active: Slack-primary buildout.** Goal: every CLI action and every system notification reaches the user in Slack with enough context to decide on the spot. Six slices, ordered by user-facing impact:
-
-1. **Amendment surface** in `#jarvis-inbox` — distinct from the generic plan-review post; renders the amendment proposal context (reason, modified files from the checkpoint) with approve / revise / reject buttons. Closes §12 slice 5.
-2. **Critical-signal alerts** to `#jarvis-alerts` — analyst tick records → Slack post with severity tag, dedupKey, and a "suppress" button.
-3. **Triage delivery** to `#jarvis-inbox` Monday 9am — alongside the existing file write so the report shows up in the channel without the user reaching for a markdown file.
-4. **Setup tasks** as their own Block Kit surface — list view with dismiss / complete buttons; replaces the current "see `setup-queue.txt`" indirection in CLI inbox.
-5. **Slash commands** — `/jarvis plan`, `/jarvis bug`, `/jarvis triage`, `/jarvis inbox`, `/jarvis scout score|draft`, `/jarvis scan` — convenience surfaces so the user stays in Slack instead of switching to terminal.
-6. **Escalation alerts** to `#jarvis-alerts` for runtime errors (rate limits, missing secrets, daemon crashes, persistent BLOCKED outcomes) — currently only `ctx.logger.error` lines.
-
-**Deferred (Phase 3+):**
+**Deferred to later phases:**
 - **Marketer in executor pool** — blocked on the Phase 3 Marketer agent build.
 - **Umami install + metrics collector** — needs a Vercel deploy + Supabase Postgres + script tags on apps. Code-side metrics collector lands once the deploy is in place; until then the Umami API call returns no data.
 - **Scheduled-post review** Slack surface — depends on Marketer (Phase 3).
+- **Slash-command coverage gaps** — `/jarvis scout score|draft`, `/jarvis scan`, `/jarvis approve|revise|reject <id>` aren't slash-aliased yet. Buttons cover the approve/revise/reject path; the rest lands as polish if/when the typing rate justifies it.
 - **Multi-vault Slack channel mapping** — current architecture assumes one inbox + one alerts channel for the whole portfolio; multi-vault mapping is a Phase 4+ refinement.
 
-**Exit:** Slack is the primary inbox — every plan review, amendment, signal alert, triage report, and runtime escalation reaches the user in `#jarvis-inbox` or `#jarvis-alerts` with enough context to decide approve / revise / reject without dropping into the CLI. The original Phase 2 exit (Monday triage report influencing what plan gets drafted next) shipped via the Analyst + Scout tracks; the Slack-primary track makes that surface the default channel.
+**Exit (met):** Slack is the primary inbox. Every plan review, amendment, signal alert, triage report, setup task, and runtime escalation reaches the user in `#jarvis-inbox` or `#jarvis-alerts` with enough context to decide approve / revise / reject / acknowledge without dropping into the CLI. The original Phase 2 exit (Monday triage report influencing what plan gets drafted next) shipped via the Analyst + Scout tracks; the Slack-primary buildout makes that surface the default channel.
 
 ### Phase 3 — Marketer + marketing plan loop (Week 7–8)
 - Marketer agent
