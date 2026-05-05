@@ -13,6 +13,7 @@ import { findPlan } from "../../orchestrator/plan-store.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { triageDir } from "../../cli/paths.ts";
+import { recordEscalation } from "../../orchestrator/escalations.ts";
 import { appendSetupTask } from "../../orchestrator/setup-tasks.ts";
 import { suppress } from "../../orchestrator/suppressions.ts";
 import {
@@ -20,13 +21,16 @@ import {
   findPendingAmendment,
   findSurfaceRecord,
   findUnpostedAlertableSignals,
+  findUnpostedEscalations,
   findUnpostedTriageReports,
   findUnsurfacedSetupTasks,
   runAlertTick,
+  runEscalationDeliveryTick,
   runSetupTaskDeliveryTick,
   runSurfaceTick,
   runTriageDeliveryTick,
   surfaceAmendmentReview,
+  surfaceEscalation,
   surfacePlan,
   surfaceSetupTask,
   surfaceSignalAlert,
@@ -1264,5 +1268,253 @@ describe("runSetupTaskDeliveryTick", () => {
     const result = await runSetupTaskDeliveryTick(ctx);
     expect(result.posted).toEqual(["ok"]);
     expect(result.errors.map((e) => e.taskId)).toEqual(["fail"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Slice 6: escalation delivery to #jarvis-alerts
+// ---------------------------------------------------------------------------
+
+describe("findUnpostedEscalations", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function recordSurfaced(escalationEventId: number): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: "jarvis",
+        vaultId: "personal",
+        kind: "slack-escalation-surfaced",
+        payload: { escalationEventId },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("returns nothing when no escalations exist", () => {
+    expect(findUnpostedEscalations(dbFile(sandbox.dataDir))).toEqual([]);
+  });
+
+  it("returns most-recent-first up to limit", () => {
+    for (let i = 0; i < 5; i += 1) {
+      recordEscalation(dbFile(sandbox.dataDir), {
+        kind: "rate-limit",
+        severity: "high",
+        summary: `s${i}`,
+      });
+    }
+    const found = findUnpostedEscalations(dbFile(sandbox.dataDir), {
+      limit: 3,
+    });
+    expect(found).toHaveLength(3);
+    expect(found.map((e) => e.summary)).toEqual(["s4", "s3", "s2"]);
+  });
+
+  it("filters out escalations already surfaced", () => {
+    recordEscalation(dbFile(sandbox.dataDir), {
+      kind: "x",
+      severity: "high",
+      summary: "first",
+    });
+    recordEscalation(dbFile(sandbox.dataDir), {
+      kind: "x",
+      severity: "high",
+      summary: "second",
+    });
+    // Look up the first escalation's id so we don't depend on install-marker placement.
+    const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    let firstId: number;
+    try {
+      const row = conn
+        .prepare(
+          "SELECT id FROM events WHERE kind = 'escalation' ORDER BY id ASC LIMIT 1",
+        )
+        .get() as { id: number };
+      firstId = row.id;
+    } finally {
+      conn.close();
+    }
+    recordSurfaced(firstId);
+    const found = findUnpostedEscalations(dbFile(sandbox.dataDir));
+    expect(found.map((e) => e.summary)).toEqual(["second"]);
+  });
+
+  it("skips escalation events with malformed payload (missing required fields)", () => {
+    // Direct DB insert to simulate a bad row
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: "jarvis",
+        vaultId: "personal",
+        kind: "escalation",
+        payload: { kind: "x" /* missing severity + summary */ },
+      });
+    } finally {
+      conn.close();
+    }
+    expect(findUnpostedEscalations(dbFile(sandbox.dataDir))).toEqual([]);
+  });
+
+  it("includes detail / planId when present", () => {
+    recordEscalation(dbFile(sandbox.dataDir), {
+      kind: "cash-in-violation",
+      severity: "critical",
+      summary: "x",
+      detail: "stack",
+      planId: "p-1",
+      app: "demo",
+    });
+    const [esc] = findUnpostedEscalations(dbFile(sandbox.dataDir));
+    expect(esc).toMatchObject({
+      kind: "cash-in-violation",
+      severity: "critical",
+      detail: "stack",
+      planId: "p-1",
+      app: "demo",
+    });
+  });
+});
+
+describe("surfaceEscalation", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("posts to alerts channel and records a slack-escalation-surfaced event", async () => {
+    const { client, posts } = fakeWebClient();
+    const ctx: AlertContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+      alertsChannelId: "C-ALERTS",
+    };
+    await surfaceEscalation(ctx, {
+      escalationEventId: 7,
+      recordedAt: "2026-05-05T12:00:00Z",
+      app: "jarvis",
+      vault: "personal",
+      kind: "rate-limit",
+      severity: "high",
+      summary: "x",
+    });
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.channel).toBe("C-ALERTS");
+    expect(posts[0]?.text).toContain("HIGH escalation");
+
+    const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const events = conn
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'slack-escalation-surfaced'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(events).toHaveLength(1);
+      expect(JSON.parse(events[0]!.payload)).toMatchObject({
+        escalationEventId: 7,
+        kind: "rate-limit",
+        severity: "high",
+      });
+    } finally {
+      conn.close();
+    }
+  });
+});
+
+describe("runEscalationDeliveryTick", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("posts each unposted escalation exactly once across two ticks", async () => {
+    recordEscalation(dbFile(sandbox.dataDir), {
+      kind: "rate-limit",
+      severity: "high",
+      summary: "first",
+    });
+    recordEscalation(dbFile(sandbox.dataDir), {
+      kind: "cash-in-violation",
+      severity: "critical",
+      summary: "second",
+    });
+
+    const { client, posts } = fakeWebClient();
+    const ctx: AlertContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+      alertsChannelId: "C-ALERTS",
+    };
+    const t1 = await runEscalationDeliveryTick(ctx);
+    expect(t1.posted).toHaveLength(2);
+    expect(posts).toHaveLength(2);
+
+    const t2 = await runEscalationDeliveryTick(ctx);
+    expect(t2.posted).toEqual([]);
+    expect(posts).toHaveLength(2);
+  });
+
+  it("isolates per-escalation errors", async () => {
+    recordEscalation(dbFile(sandbox.dataDir), {
+      kind: "rate-limit",
+      severity: "high",
+      summary: "ok",
+    });
+    recordEscalation(dbFile(sandbox.dataDir), {
+      kind: "rate-limit",
+      severity: "high",
+      summary: "boom",
+    });
+
+    let i = 0;
+    const client = {
+      chat: {
+        async postMessage(p: { text?: string; blocks: unknown[] }) {
+          i += 1;
+          if (p.text?.includes("boom")) {
+            return { ok: false, error: "channel_not_found" };
+          }
+          return { ok: true, ts: `1.${i}` };
+        },
+      },
+    } as never;
+    const ctx: AlertContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+      alertsChannelId: "C-ALERTS",
+    };
+    const result = await runEscalationDeliveryTick(ctx);
+    expect(result.posted).toHaveLength(1);
+    expect(result.errors).toHaveLength(1);
   });
 });

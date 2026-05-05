@@ -24,6 +24,7 @@ import {
   buildPlanReviewBlocks,
   buildOutcomeContext,
 } from "./blocks/plan-review.ts";
+import { buildEscalationBlocks } from "./blocks/escalation.ts";
 import { buildSetupTaskBlocks } from "./blocks/setup-task.ts";
 import { buildSignalAlertBlocks } from "./blocks/signal-alert.ts";
 import { buildTriageReportBlocks } from "./blocks/triage-report.ts";
@@ -872,6 +873,168 @@ export async function runSetupTaskDeliveryTick(
     } catch (err) {
       result.errors.push({
         taskId: candidate.task.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Slice 6 — runtime escalations to #jarvis-alerts
+// ---------------------------------------------------------------------------
+
+export interface UnpostedEscalation {
+  escalationEventId: number;
+  recordedAt: string;
+  app: string;
+  vault: string;
+  kind: string;
+  severity: SignalSeverity;
+  summary: string;
+  detail?: string;
+  planId?: string;
+}
+
+/**
+ * Returns `escalation` events that don't have a matching
+ * `slack-escalation-surfaced` row yet. Most-recent-first; capped at
+ * `limit` (default 50).
+ */
+export function findUnpostedEscalations(
+  dbFilePath: string,
+  opts: { limit?: number } = {},
+): UnpostedEscalation[] {
+  const limit = opts.limit ?? 50;
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    const surfacedRows = db
+      .prepare(
+        "SELECT payload FROM events WHERE kind = 'slack-escalation-surfaced'",
+      )
+      .all() as Array<{ payload: string }>;
+    const posted = new Set<number>();
+    for (const r of surfacedRows) {
+      try {
+        const p = JSON.parse(r.payload) as { escalationEventId?: number };
+        if (typeof p.escalationEventId === "number") {
+          posted.add(p.escalationEventId);
+        }
+      } catch {
+        // skip malformed
+      }
+    }
+
+    const rows = db
+      .prepare(
+        "SELECT id, app_id, vault_id, payload, created_at FROM events WHERE kind = 'escalation' ORDER BY id DESC LIMIT ?",
+      )
+      .all(limit * 4) as Array<{
+      id: number;
+      app_id: string;
+      vault_id: string;
+      payload: string;
+      created_at: string;
+    }>;
+
+    const out: UnpostedEscalation[] = [];
+    for (const row of rows) {
+      if (posted.has(row.id)) continue;
+      let payload: {
+        kind?: string;
+        severity?: SignalSeverity;
+        summary?: string;
+        detail?: string;
+        planId?: string;
+      };
+      try {
+        payload = JSON.parse(row.payload);
+      } catch {
+        continue;
+      }
+      if (
+        typeof payload.kind !== "string" ||
+        typeof payload.severity !== "string" ||
+        typeof payload.summary !== "string"
+      ) {
+        continue;
+      }
+      out.push({
+        escalationEventId: row.id,
+        recordedAt: row.created_at,
+        app: row.app_id,
+        vault: row.vault_id,
+        kind: payload.kind,
+        severity: payload.severity,
+        summary: payload.summary,
+        ...(typeof payload.detail === "string" && { detail: payload.detail }),
+        ...(typeof payload.planId === "string" && { planId: payload.planId }),
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Posts an escalation to `#jarvis-alerts` and records a
+ * `slack-escalation-surfaced` event keyed on `escalationEventId`.
+ */
+export async function surfaceEscalation(
+  ctx: AlertContext,
+  escalation: UnpostedEscalation,
+): Promise<{ posted: boolean }> {
+  const blocks = buildEscalationBlocks(escalation);
+  const result = await ctx.client.chat.postMessage({
+    channel: ctx.alertsChannelId,
+    blocks,
+    text: `${escalation.severity.toUpperCase()} escalation: ${escalation.summary}`,
+  });
+  if (!result.ok || !result.ts) {
+    throw new Error(
+      `chat.postMessage failed (escalation): ${result.error ?? "unknown"}`,
+    );
+  }
+  const conn = new Database(dbFile(ctx.dataDir));
+  try {
+    appendEvent(conn, {
+      appId: escalation.app,
+      vaultId: escalation.vault,
+      kind: "slack-escalation-surfaced",
+      payload: {
+        escalationEventId: escalation.escalationEventId,
+        kind: escalation.kind,
+        severity: escalation.severity,
+        channel: ctx.alertsChannelId,
+        messageTs: result.ts,
+      },
+    });
+  } finally {
+    conn.close();
+  }
+  return { posted: true };
+}
+
+export interface RunEscalationDeliveryTickResult {
+  posted: number[];
+  errors: Array<{ escalationEventId: number; error: string }>;
+}
+
+export async function runEscalationDeliveryTick(
+  ctx: AlertContext,
+  opts: { limit?: number } = {},
+): Promise<RunEscalationDeliveryTickResult> {
+  const result: RunEscalationDeliveryTickResult = { posted: [], errors: [] };
+  const candidates = findUnpostedEscalations(dbFile(ctx.dataDir), opts);
+  for (const candidate of candidates) {
+    try {
+      await surfaceEscalation(ctx, candidate);
+      result.posted.push(candidate.escalationEventId);
+    } catch (err) {
+      result.errors.push({
+        escalationEventId: candidate.escalationEventId,
         error: err instanceof Error ? err.message : String(err),
       });
     }

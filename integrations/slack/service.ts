@@ -12,6 +12,7 @@ import {
 import { registerHandlers } from "./handlers.ts";
 import {
   runAlertTick,
+  runEscalationDeliveryTick,
   runSetupTaskDeliveryTick,
   runSurfaceTick,
   runTriageDeliveryTick,
@@ -47,6 +48,13 @@ export interface SlackServiceOptions {
    * tasks CLI-only.
    */
   setupTaskDeliveryEnabled?: boolean;
+  /**
+   * Whether the surface tick should also deliver runtime escalations
+   * (rate limits, cash-in violations, daemon errors) to
+   * `#jarvis-alerts`. Default `true`. Set `false` to keep escalations
+   * log-only.
+   */
+  escalationDeliveryEnabled?: boolean;
   /** Allow tests to inject a fake client (skip the real Bolt connection). */
   buildBoltApp?: (opts: {
     botToken: string;
@@ -90,6 +98,7 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
     opts.alertThreshold === undefined ? "high" : opts.alertThreshold;
   const triageDeliveryEnabled = opts.triageDeliveryEnabled ?? true;
   const setupTaskDeliveryEnabled = opts.setupTaskDeliveryEnabled ?? true;
+  const escalationDeliveryEnabled = opts.escalationDeliveryEnabled ?? true;
 
   return {
     name: "slack",
@@ -214,6 +223,22 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
             }
           } catch (err) {
             ctx.logger.error("setup-task delivery tick errored", err);
+          }
+        }
+        if (escalationDeliveryEnabled) {
+          try {
+            const esc = await runEscalationDeliveryTick(alertCtxFor());
+            if (esc.posted.length > 0) {
+              ctx.logger.info("delivered escalations to slack", {
+                count: esc.posted.length,
+                escalationEventIds: esc.posted,
+              });
+            }
+            for (const e of esc.errors) {
+              ctx.logger.error("escalation delivery failed", null, e);
+            }
+          } catch (err) {
+            ctx.logger.error("escalation delivery tick errored", err);
           }
         }
       };

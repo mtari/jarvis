@@ -15,6 +15,8 @@ import {
   rejectPlan,
   revisePlan,
 } from "../../orchestrator/plan-lifecycle.ts";
+import Database from "better-sqlite3";
+import { appendEvent } from "../../orchestrator/event-log.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
 import { resolveSetupTask } from "../../orchestrator/setup-tasks.ts";
 import { suppress } from "../../orchestrator/suppressions.ts";
@@ -334,6 +336,73 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       body.user.id,
       `↪ Skipped \`${taskId}\` — reason recorded.`,
     );
+  });
+
+  app.action("escalation_acknowledge", async ({ ack, body, action, client }) => {
+    await ack();
+    if (action.type !== "button") return;
+    const eventIdStr = action.value;
+    const escalationEventId = eventIdStr ? Number.parseInt(eventIdStr, 10) : NaN;
+    if (!Number.isFinite(escalationEventId)) return;
+    const userId = "user" in body && body.user?.id ? body.user.id : "<slack>";
+
+    // Record an `escalation-acknowledged` event for the audit trail.
+    // The Slack message itself gets its action stripped + a context
+    // line appended so the team can see it's been seen.
+    try {
+      const conn = new Database(dbFile(ctx.dataDir));
+      try {
+        appendEvent(conn, {
+          appId: "jarvis",
+          vaultId: "personal",
+          kind: "escalation-acknowledged",
+          payload: {
+            escalationEventId,
+            actor: `slack:${userId}`,
+          },
+        });
+      } finally {
+        conn.close();
+      }
+    } catch (err) {
+      ctx.logError("escalation acknowledge — DB write failed", err, {
+        escalationEventId,
+      });
+      // Continue to the message update — best-effort
+    }
+    ctx.log("escalation acknowledged via slack", {
+      escalationEventId,
+      userId,
+    });
+
+    if (body.type === "block_actions" && body.message?.ts && body.channel?.id) {
+      const trimmed = (body.message.blocks ?? []).filter(
+        (b: { type?: string }) => b.type !== "actions",
+      );
+      try {
+        await client.chat.update({
+          channel: body.channel.id,
+          ts: body.message.ts,
+          blocks: [
+            ...trimmed,
+            {
+              type: "context",
+              elements: [
+                {
+                  type: "mrkdwn",
+                  text: `✓ Acknowledged by <@${userId}>.`,
+                },
+              ],
+            },
+          ],
+          text: `Acknowledged: escalation #${escalationEventId}`,
+        });
+      } catch (err) {
+        ctx.logError("update after escalation acknowledge failed", err, {
+          escalationEventId,
+        });
+      }
+    }
   });
 
   app.command("/jarvis", async ({ ack, command, respond, client }) => {
