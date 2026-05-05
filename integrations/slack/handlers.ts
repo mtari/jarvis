@@ -1,4 +1,5 @@
 import type { App as BoltApp } from "@slack/bolt";
+import type { KnownBlock } from "@slack/types";
 import { removeAmendmentCheckpoint } from "../../agents/developer.ts";
 import {
   redraftPlan,
@@ -20,6 +21,10 @@ import { suppress } from "../../orchestrator/suppressions.ts";
 import { dbFile } from "../../cli/paths.ts";
 import { buildSkipReasonModal } from "./blocks/setup-task.ts";
 import { buildReviseModal } from "./blocks/plan-review.ts";
+import {
+  buildInboxSummaryText,
+  buildOnDemandTriageBlocks,
+} from "./slash-commands.ts";
 import { surfacePlan, updateSurfacedPlan, type SurfaceContext } from "./surface.ts";
 
 export interface HandlerContext {
@@ -331,90 +336,171 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
     );
   });
 
-  app.command("/jarvis", async ({ ack, command, respond }) => {
+  app.command("/jarvis", async ({ ack, command, respond, client }) => {
     await ack();
     const text = (command.text ?? "").trim();
     const parts = text.split(/\s+/).filter((s) => s.length > 0);
     const subcommand = parts[0];
+
     if (!subcommand) {
-      await respond({
-        response_type: "ephemeral",
-        text: "Usage: `/jarvis plan <app> <brief>`",
-      });
-      return;
-    }
-    if (subcommand !== "plan") {
-      await respond({
-        response_type: "ephemeral",
-        text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`.`,
-      });
+      await respond({ response_type: "ephemeral", text: SLASH_USAGE });
       return;
     }
 
-    const app = parts[1];
-    const brief = parts.slice(2).join(" ");
-    if (!app || !brief) {
-      await respond({
-        response_type: "ephemeral",
-        text: "Usage: `/jarvis plan <app> <brief>`",
-      });
-      return;
-    }
-
-    // Default to improvement plans via slash. Future: parse --type/--subtype.
-    const planType: StrategistPlanType = "improvement";
-    if (!isStrategistPlanType(planType)) return; // tautological — keeps the type narrowing tidy
-
-    await respond({
-      response_type: "ephemeral",
-      text: `📝 Strategist drafting plan for *${app}*…`,
-    });
-
-    const baseClient = ctx.getAnthropicClient();
-    // No planId yet — we don't have it until Strategist returns
-    const recorder = buildAgentCallRecorder(baseClient, dbFile(ctx.dataDir), {
-      app,
-      vault: "personal",
-      agent: "strategist",
-      mode: "subscription",
-    });
-
-    try {
-      const result = await runStrategist({
-        client: recorder.client,
-        brief,
-        app,
-        vault: "personal",
-        dataDir: ctx.dataDir,
-        type: planType,
-        challenge: false, // Slack surface skips the Socratic stdin loop
-      });
-      recorder.ctx.planId = result.planId;
-      recorder.flush();
-
-      const surfacedRecord = findPlan(ctx.dataDir, result.planId);
-      if (surfacedRecord) {
-        await surfacePlan(ctx.surfaceCtx, surfacedRecord);
-      }
-      await respond({
-        response_type: "ephemeral",
-        text: `✓ Plan \`${result.planId}\` drafted — see #jarvis-inbox.`,
-      });
-    } catch (err) {
-      recorder.flush();
-      const message =
-        err instanceof StrategistError
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : String(err);
-      ctx.logError("/jarvis plan failed", err, { app, brief });
-      await respond({
-        response_type: "ephemeral",
-        text: `✗ Plan drafting failed: ${message}`,
-      });
+    switch (subcommand) {
+      case "plan":
+        return runSlashPlan(parts.slice(1), ctx, respond, "improvement");
+      case "bug":
+        return runSlashPlan(parts.slice(1), ctx, respond, "improvement", "bugfix");
+      case "inbox":
+        return runSlashInbox(ctx, respond);
+      case "triage":
+        return runSlashTriage(ctx, respond, command.channel_id, client);
+      default:
+        await respond({
+          response_type: "ephemeral",
+          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`.`,
+        });
     }
   });
+}
+
+const SLASH_USAGE = [
+  "*Available `/jarvis` subcommands:*",
+  "• `/jarvis plan <app> <brief>` — draft an improvement plan",
+  "• `/jarvis bug <app> <description>` — draft a bugfix plan",
+  "• `/jarvis inbox` — show pending plan reviews + setup tasks (just for you)",
+  "• `/jarvis triage` — post the on-demand triage report to this channel",
+].join("\n");
+
+type SlashRespond = (args: {
+  response_type: "ephemeral" | "in_channel";
+  text?: string;
+  blocks?: KnownBlock[];
+}) => Promise<unknown>;
+
+async function runSlashPlan(
+  args: string[],
+  ctx: HandlerContext,
+  respond: SlashRespond,
+  planType: StrategistPlanType,
+  subtype?: string,
+): Promise<void> {
+  const subtypeLabel = subtype ? `${planType}/${subtype}` : planType;
+  const usage = subtype
+    ? "Usage: `/jarvis bug <app> <description>`"
+    : "Usage: `/jarvis plan <app> <brief>`";
+
+  const app = args[0];
+  const brief = args.slice(1).join(" ");
+  if (!app || !brief) {
+    await respond({ response_type: "ephemeral", text: usage });
+    return;
+  }
+  if (!isStrategistPlanType(planType)) return;
+
+  await respond({
+    response_type: "ephemeral",
+    text: `📝 Strategist drafting *${subtypeLabel}* plan for *${app}*…`,
+  });
+
+  const baseClient = ctx.getAnthropicClient();
+  const recorder = buildAgentCallRecorder(baseClient, dbFile(ctx.dataDir), {
+    app,
+    vault: "personal",
+    agent: "strategist",
+    mode: "subscription",
+  });
+
+  try {
+    const result = await runStrategist({
+      client: recorder.client,
+      brief,
+      app,
+      vault: "personal",
+      dataDir: ctx.dataDir,
+      type: planType,
+      ...(subtype !== undefined && { subtype }),
+      challenge: false, // Slack surface skips the Socratic stdin loop
+    });
+    recorder.ctx.planId = result.planId;
+    recorder.flush();
+
+    const surfacedRecord = findPlan(ctx.dataDir, result.planId);
+    if (surfacedRecord) {
+      await surfacePlan(ctx.surfaceCtx, surfacedRecord);
+    }
+    await respond({
+      response_type: "ephemeral",
+      text: `✓ Plan \`${result.planId}\` drafted — see #jarvis-inbox.`,
+    });
+  } catch (err) {
+    recorder.flush();
+    const message =
+      err instanceof StrategistError
+        ? err.message
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    ctx.logError(`/jarvis ${subtype ?? "plan"} failed`, err, { app, brief });
+    await respond({
+      response_type: "ephemeral",
+      text: `✗ Plan drafting failed: ${message}`,
+    });
+  }
+}
+
+async function runSlashInbox(
+  ctx: HandlerContext,
+  respond: SlashRespond,
+): Promise<void> {
+  try {
+    const text = buildInboxSummaryText({ dataDir: ctx.dataDir });
+    await respond({ response_type: "ephemeral", text });
+  } catch (err) {
+    ctx.logError("/jarvis inbox failed", err);
+    await respond({
+      response_type: "ephemeral",
+      text: `✗ Inbox lookup failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    });
+  }
+}
+
+async function runSlashTriage(
+  ctx: HandlerContext,
+  respond: SlashRespond,
+  channelId: string | undefined,
+  client: BoltApp["client"] | undefined,
+): Promise<void> {
+  await respond({
+    response_type: "ephemeral",
+    text: "📋 Building on-demand triage report…",
+  });
+  try {
+    const result = buildOnDemandTriageBlocks({ dataDir: ctx.dataDir });
+    // Post in the channel where the slash was issued so the team
+    // sees the same report. Falls back to inbox channel when the
+    // user invoked the command in a DM (no channel id available
+    // for posting back to).
+    const target = channelId ?? ctx.surfaceCtx.inboxChannelId;
+    if (!client) return;
+    await client.chat.postMessage({
+      channel: target,
+      blocks: result.blocks,
+      text: result.text,
+    });
+    ctx.log("on-demand triage posted via slack", { date: result.date, channel: target });
+  } catch (err) {
+    ctx.logError("/jarvis triage failed", err);
+    await respond({
+      response_type: "ephemeral",
+      text: `✗ Triage build failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    });
+  }
 }
 
 async function postEphemeral(
