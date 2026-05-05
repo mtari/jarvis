@@ -10,7 +10,13 @@ import {
   type ResolvedChannels,
 } from "./channel-resolver.ts";
 import { registerHandlers } from "./handlers.ts";
-import { runSurfaceTick, type SurfaceContext } from "./surface.ts";
+import {
+  runAlertTick,
+  runSurfaceTick,
+  type AlertContext,
+  type SurfaceContext,
+} from "./surface.ts";
+import type { SignalSeverity } from "../../tools/scanners/types.ts";
 
 export interface SlackServiceOptions {
   botToken: string;
@@ -21,6 +27,12 @@ export interface SlackServiceOptions {
   dataDir: string;
   /** Tick interval for the auto-surface scan. Default 30s. */
   surfaceTickMs?: number;
+  /**
+   * Severity threshold for posting analyst signals to `#jarvis-alerts`.
+   * Default `high` (alerts on `high` and `critical`). Set to `null` to
+   * disable signal alerts entirely.
+   */
+  alertThreshold?: SignalSeverity | null;
   /** Allow tests to inject a fake client (skip the real Bolt connection). */
   buildBoltApp?: (opts: {
     botToken: string;
@@ -48,6 +60,20 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
       inboxChannelId: channels.inbox,
     };
   };
+
+  const alertCtxFor = (): AlertContext => {
+    if (!channels) throw new Error("Slack channels not resolved yet");
+    if (!webClient) throw new Error("Slack web client not available yet");
+    return {
+      dataDir: opts.dataDir,
+      client: webClient,
+      inboxChannelId: channels.inbox,
+      alertsChannelId: channels.alerts,
+    };
+  };
+
+  const alertThreshold: SignalSeverity | null =
+    opts.alertThreshold === undefined ? "high" : opts.alertThreshold;
 
   return {
     name: "slack",
@@ -102,7 +128,10 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
       await app.start();
       ctx.logger.info("Slack Socket Mode connected");
 
-      // Initial surface scan + interval tick
+      // Initial surface scan + interval tick. Each tick runs both the
+      // plan-review surface (#jarvis-inbox) and, when configured, the
+      // signal-alert surface (#jarvis-alerts). Errors in one don't
+      // abort the other.
       const tickFn = async (): Promise<void> => {
         try {
           const result = await runSurfaceTick(surfaceCtxFor());
@@ -117,6 +146,27 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
           }
         } catch (err) {
           ctx.logger.error("surface tick errored", err);
+        }
+        if (alertThreshold !== null) {
+          try {
+            const alerts = await runAlertTick(alertCtxFor(), {
+              threshold: alertThreshold,
+            });
+            if (
+              alerts.alerted.length > 0 ||
+              alerts.suppressedSkipped.length > 0
+            ) {
+              ctx.logger.info("alerted signals to slack", {
+                alerted: alerts.alerted.length,
+                suppressedSkipped: alerts.suppressedSkipped.length,
+              });
+            }
+            for (const e of alerts.errors) {
+              ctx.logger.error("signal alert failed", null, e);
+            }
+          } catch (err) {
+            ctx.logger.error("alert tick errored", err);
+          }
         }
       };
       // Fire once immediately, then on interval

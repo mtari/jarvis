@@ -7,6 +7,8 @@ import {
   type PlanRecord,
 } from "../../orchestrator/plan-store.ts";
 import type { Plan } from "../../orchestrator/plan.ts";
+import { isSuppressed } from "../../orchestrator/suppressions.ts";
+import type { SignalSeverity } from "../../tools/scanners/types.ts";
 import { dbFile } from "../../cli/paths.ts";
 import {
   buildAmendmentReviewBlocks,
@@ -16,6 +18,7 @@ import {
   buildPlanReviewBlocks,
   buildOutcomeContext,
 } from "./blocks/plan-review.ts";
+import { buildSignalAlertBlocks } from "./blocks/signal-alert.ts";
 
 export interface SurfaceContext {
   dataDir: string;
@@ -370,4 +373,222 @@ export function reloadPlanFromDisk(
   const r = findPlan(dataDir, planId);
   if (!r) return null;
   return { record: r, plan: r.plan };
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2 — high/critical signal alerts to #jarvis-alerts
+// ---------------------------------------------------------------------------
+
+const SEVERITY_RANK: Record<SignalSeverity, number> = {
+  low: 0,
+  medium: 1,
+  high: 2,
+  critical: 3,
+};
+
+export interface AlertContext extends SurfaceContext {
+  alertsChannelId: string;
+}
+
+export interface AlertableSignal {
+  signalEventId: number;
+  createdAt: string;
+  app: string;
+  vault: string;
+  kind: string;
+  severity: SignalSeverity;
+  summary: string;
+  dedupKey?: string;
+}
+
+/**
+ * Returns signal events at or above `threshold` that haven't been
+ * surfaced to Slack yet (no `slack-signal-surfaced` event referencing
+ * the same signalEventId). Most-recent first; capped at `limit` to
+ * keep the per-tick fan-out bounded.
+ */
+export function findUnpostedAlertableSignals(
+  dbFilePath: string,
+  opts: { threshold: SignalSeverity; limit?: number },
+): AlertableSignal[] {
+  const limit = opts.limit ?? 50;
+  const minRank = SEVERITY_RANK[opts.threshold];
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    // Set of signalEventIds that already have a Slack surface row.
+    const posted = new Set<number>();
+    const surfacedRows = db
+      .prepare(
+        "SELECT payload FROM events WHERE kind = 'slack-signal-surfaced'",
+      )
+      .all() as Array<{ payload: string }>;
+    for (const r of surfacedRows) {
+      try {
+        const p = JSON.parse(r.payload) as { signalEventId?: number };
+        if (typeof p.signalEventId === "number") posted.add(p.signalEventId);
+      } catch {
+        // skip malformed
+      }
+    }
+
+    const signalRows = db
+      .prepare(
+        "SELECT id, app_id, vault_id, payload, created_at FROM events WHERE kind = 'signal' ORDER BY id DESC LIMIT ?",
+      )
+      .all(limit * 4) as Array<{
+      id: number;
+      app_id: string;
+      vault_id: string;
+      payload: string;
+      created_at: string;
+    }>;
+
+    const out: AlertableSignal[] = [];
+    for (const row of signalRows) {
+      if (posted.has(row.id)) continue;
+      let payload: {
+        kind?: string;
+        severity?: SignalSeverity;
+        summary?: string;
+        dedupKey?: string;
+      };
+      try {
+        payload = JSON.parse(row.payload);
+      } catch {
+        continue;
+      }
+      if (
+        typeof payload.kind !== "string" ||
+        typeof payload.summary !== "string" ||
+        typeof payload.severity !== "string"
+      ) {
+        continue;
+      }
+      const rank = SEVERITY_RANK[payload.severity];
+      if (rank === undefined || rank < minRank) continue;
+      out.push({
+        signalEventId: row.id,
+        createdAt: row.created_at,
+        app: row.app_id,
+        vault: row.vault_id,
+        kind: payload.kind,
+        severity: payload.severity,
+        summary: payload.summary,
+        ...(typeof payload.dedupKey === "string" && {
+          dedupKey: payload.dedupKey,
+        }),
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Posts a signal alert to `#jarvis-alerts` and records a
+ * `slack-signal-surfaced` event. Idempotent on `signal.signalEventId`.
+ */
+export async function surfaceSignalAlert(
+  ctx: AlertContext,
+  signal: AlertableSignal,
+): Promise<{ posted: boolean }> {
+  const blocks = buildSignalAlertBlocks(signal);
+  const result = await ctx.client.chat.postMessage({
+    channel: ctx.alertsChannelId,
+    blocks,
+    text: `${signal.severity.toUpperCase()} signal: ${signal.summary}`,
+  });
+  if (!result.ok || !result.ts) {
+    throw new Error(
+      `chat.postMessage failed (alert): ${result.error ?? "unknown"}`,
+    );
+  }
+
+  const db = new Database(dbFile(ctx.dataDir));
+  try {
+    appendEvent(db, {
+      appId: signal.app,
+      vaultId: signal.vault,
+      kind: "slack-signal-surfaced",
+      payload: {
+        signalEventId: signal.signalEventId,
+        channel: ctx.alertsChannelId,
+        messageTs: result.ts,
+        severity: signal.severity,
+        ...(signal.dedupKey !== undefined && { dedupKey: signal.dedupKey }),
+      },
+    });
+  } finally {
+    db.close();
+  }
+  return { posted: true };
+}
+
+export interface RunAlertTickResult {
+  alerted: number[];
+  /** Signal event ids skipped because the dedupKey is suppressed. */
+  suppressedSkipped: number[];
+  errors: Array<{ signalEventId: number; error: string }>;
+}
+
+/**
+ * One tick: find unposted high/critical signals, skip suppressed ones,
+ * post the rest to `#jarvis-alerts`. Per-signal errors are isolated
+ * so one bad post doesn't abort the batch.
+ */
+export async function runAlertTick(
+  ctx: AlertContext,
+  opts: { threshold: SignalSeverity; limit?: number },
+): Promise<RunAlertTickResult> {
+  const result: RunAlertTickResult = {
+    alerted: [],
+    suppressedSkipped: [],
+    errors: [],
+  };
+  const dbPath = dbFile(ctx.dataDir);
+  const candidates = findUnpostedAlertableSignals(dbPath, opts);
+  for (const candidate of candidates) {
+    if (
+      candidate.dedupKey !== undefined &&
+      isSuppressed(dbPath, candidate.dedupKey)
+    ) {
+      result.suppressedSkipped.push(candidate.signalEventId);
+      // Record a synthetic "surfaced" event so this signal isn't
+      // re-evaluated next tick — the suppression decision is sticky
+      // until the user lifts the suppression and a new matching
+      // signal arrives. (Avoids hammering isSuppressed every tick
+      // for high-volume noisy patterns.)
+      const conn = new Database(dbPath);
+      try {
+        appendEvent(conn, {
+          appId: candidate.app,
+          vaultId: candidate.vault,
+          kind: "slack-signal-surfaced",
+          payload: {
+            signalEventId: candidate.signalEventId,
+            severity: candidate.severity,
+            suppressed: true,
+            ...(candidate.dedupKey !== undefined && {
+              dedupKey: candidate.dedupKey,
+            }),
+          },
+        });
+      } finally {
+        conn.close();
+      }
+      continue;
+    }
+    try {
+      await surfaceSignalAlert(ctx, candidate);
+      result.alerted.push(candidate.signalEventId);
+    } catch (err) {
+      result.errors.push({
+        signalEventId: candidate.signalEventId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return result;
 }

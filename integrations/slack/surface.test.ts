@@ -10,14 +10,19 @@ import {
 } from "../../cli/commands/_test-helpers.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
+import { suppress } from "../../orchestrator/suppressions.ts";
 import {
   findAmendmentSurfaceRecord,
   findPendingAmendment,
   findSurfaceRecord,
+  findUnpostedAlertableSignals,
+  runAlertTick,
   runSurfaceTick,
   surfaceAmendmentReview,
   surfacePlan,
+  surfaceSignalAlert,
   updateSurfacedPlan,
+  type AlertContext,
   type SurfaceContext,
 } from "./surface.ts";
 
@@ -451,5 +456,342 @@ describe("runSurfaceTick — amendment routing", () => {
     await runSurfaceTick(ctx);
     await runSurfaceTick(ctx);
     expect(posts).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Slice 2: signal alerts to #jarvis-alerts
+// ---------------------------------------------------------------------------
+
+describe("findUnpostedAlertableSignals", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function recordSignal(opts: {
+    severity: "low" | "medium" | "high" | "critical";
+    summary?: string;
+    kind?: string;
+    dedupKey?: string;
+    app?: string;
+  }): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: opts.app ?? "demo",
+        vaultId: "personal",
+        kind: "signal",
+        payload: {
+          kind: opts.kind ?? "yarn-audit",
+          severity: opts.severity,
+          summary: opts.summary ?? "test signal",
+          ...(opts.dedupKey !== undefined && { dedupKey: opts.dedupKey }),
+        },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  function recordSurfaced(signalEventId: number): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: "demo",
+        vaultId: "personal",
+        kind: "slack-signal-surfaced",
+        payload: { signalEventId },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("returns nothing when no signals exist", () => {
+    expect(
+      findUnpostedAlertableSignals(dbFile(sandbox.dataDir), {
+        threshold: "high",
+      }),
+    ).toEqual([]);
+  });
+
+  it("filters out signals below the threshold", () => {
+    recordSignal({ severity: "low", summary: "shh" });
+    recordSignal({ severity: "medium", summary: "shh" });
+    recordSignal({ severity: "high", summary: "alert me" });
+    recordSignal({ severity: "critical", summary: "alert me too" });
+    const found = findUnpostedAlertableSignals(dbFile(sandbox.dataDir), {
+      threshold: "high",
+    });
+    expect(found.map((s) => s.severity).sort()).toEqual(["critical", "high"]);
+  });
+
+  it("filters out signals already surfaced (slack-signal-surfaced event)", () => {
+    recordSignal({ severity: "high", summary: "first" });
+    recordSignal({ severity: "high", summary: "second" });
+    // Look up the first signal's auto-increment id so we don't depend
+    // on whether the install sandbox seeded any events ahead of it.
+    const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    let firstId: number;
+    try {
+      const row = conn
+        .prepare(
+          "SELECT id FROM events WHERE kind = 'signal' ORDER BY id ASC LIMIT 1",
+        )
+        .get() as { id: number };
+      firstId = row.id;
+    } finally {
+      conn.close();
+    }
+    recordSurfaced(firstId);
+    const found = findUnpostedAlertableSignals(dbFile(sandbox.dataDir), {
+      threshold: "high",
+    });
+    expect(found.map((s) => s.summary)).toEqual(["second"]);
+  });
+
+  it("returns most-recent-first up to limit", () => {
+    for (let i = 0; i < 6; i += 1) {
+      recordSignal({ severity: "high", summary: `s${i}` });
+    }
+    const found = findUnpostedAlertableSignals(dbFile(sandbox.dataDir), {
+      threshold: "high",
+      limit: 3,
+    });
+    expect(found).toHaveLength(3);
+    expect(found.map((s) => s.summary)).toEqual(["s5", "s4", "s3"]);
+  });
+
+  it("threshold=critical only returns critical signals", () => {
+    recordSignal({ severity: "high", summary: "high one" });
+    recordSignal({ severity: "critical", summary: "critical one" });
+    const found = findUnpostedAlertableSignals(dbFile(sandbox.dataDir), {
+      threshold: "critical",
+    });
+    expect(found.map((s) => s.summary)).toEqual(["critical one"]);
+  });
+
+  it("includes app, vault, kind, dedupKey, signalEventId, createdAt", () => {
+    recordSignal({
+      severity: "critical",
+      summary: "x",
+      kind: "broken-links",
+      dedupKey: "broken-links:https://x.example",
+      app: "alpha",
+    });
+    const [s] = findUnpostedAlertableSignals(dbFile(sandbox.dataDir), {
+      threshold: "high",
+    });
+    expect(s).toMatchObject({
+      app: "alpha",
+      vault: "personal",
+      kind: "broken-links",
+      severity: "critical",
+      dedupKey: "broken-links:https://x.example",
+    });
+    expect(typeof s?.signalEventId).toBe("number");
+    expect(typeof s?.createdAt).toBe("string");
+  });
+});
+
+describe("surfaceSignalAlert", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("posts to the alerts channel and records a slack-signal-surfaced event", async () => {
+    const { client, posts } = fakeWebClient();
+    const ctx: AlertContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+      alertsChannelId: "C-ALERTS",
+    };
+    const result = await surfaceSignalAlert(ctx, {
+      signalEventId: 7,
+      app: "demo",
+      vault: "personal",
+      kind: "yarn-audit",
+      severity: "critical",
+      summary: "RCE",
+      dedupKey: "yarn-audit:CVE-X",
+      createdAt: "2026-05-05T11:00:00Z",
+    });
+    expect(result.posted).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.channel).toBe("C-ALERTS");
+    expect(posts[0]?.text).toContain("CRITICAL signal");
+
+    const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const events = conn
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'slack-signal-surfaced'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(events).toHaveLength(1);
+      expect(JSON.parse(events[0]!.payload)).toMatchObject({
+        signalEventId: 7,
+        channel: "C-ALERTS",
+        severity: "critical",
+        dedupKey: "yarn-audit:CVE-X",
+      });
+    } finally {
+      conn.close();
+    }
+  });
+});
+
+describe("runAlertTick", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function recordSignal(opts: {
+    severity: "low" | "medium" | "high" | "critical";
+    dedupKey?: string;
+    summary?: string;
+  }): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: "demo",
+        vaultId: "personal",
+        kind: "signal",
+        payload: {
+          kind: "yarn-audit",
+          severity: opts.severity,
+          summary: opts.summary ?? "x",
+          ...(opts.dedupKey !== undefined && { dedupKey: opts.dedupKey }),
+        },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("posts each unposted high/critical signal exactly once across two ticks", async () => {
+    recordSignal({ severity: "critical", summary: "first" });
+    recordSignal({ severity: "high", summary: "second" });
+    recordSignal({ severity: "low", summary: "should be skipped" });
+
+    const { client, posts } = fakeWebClient();
+    const ctx: AlertContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+      alertsChannelId: "C-ALERTS",
+    };
+    const t1 = await runAlertTick(ctx, { threshold: "high" });
+    expect(t1.alerted).toHaveLength(2);
+    expect(t1.errors).toEqual([]);
+    expect(posts).toHaveLength(2);
+
+    const t2 = await runAlertTick(ctx, { threshold: "high" });
+    expect(t2.alerted).toEqual([]);
+    expect(posts).toHaveLength(2); // no new posts
+  });
+
+  it("skips signals whose dedupKey is suppressed and records a suppressed-surfaced event", async () => {
+    recordSignal({
+      severity: "critical",
+      dedupKey: "yarn-audit:CVE-MUTED",
+      summary: "muted",
+    });
+    suppress(dbFile(sandbox.dataDir), {
+      patternId: "yarn-audit:CVE-MUTED",
+      pattern: "muted under review",
+    });
+
+    const { client, posts } = fakeWebClient();
+    const ctx: AlertContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+      alertsChannelId: "C-ALERTS",
+    };
+    const result = await runAlertTick(ctx, { threshold: "high" });
+    expect(result.alerted).toEqual([]);
+    expect(result.suppressedSkipped).toHaveLength(1);
+    expect(posts).toHaveLength(0);
+
+    // Subsequent tick should not re-evaluate — the suppressed signal
+    // got a synthetic surfaced event so it's filtered out next time.
+    const t2 = await runAlertTick(ctx, { threshold: "high" });
+    expect(t2.suppressedSkipped).toEqual([]);
+    expect(t2.alerted).toEqual([]);
+  });
+
+  it("isolates per-signal errors and continues with the rest", async () => {
+    recordSignal({ severity: "critical", summary: "ok" });
+    recordSignal({ severity: "critical", summary: "boom" });
+
+    const calls: Array<{ text?: string }> = [];
+    let i = 0;
+    const client = {
+      chat: {
+        async postMessage(p: { text?: string; blocks: unknown[] }) {
+          calls.push(p);
+          i += 1;
+          if (p.text?.includes("boom")) {
+            return { ok: false, error: "channel_not_found" };
+          }
+          return { ok: true, ts: `1.${i}` };
+        },
+      },
+    } as never;
+    const ctx: AlertContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+      alertsChannelId: "C-ALERTS",
+    };
+    const result = await runAlertTick(ctx, { threshold: "high" });
+    expect(result.alerted).toHaveLength(1);
+    expect(result.errors).toHaveLength(1);
+  });
+
+  it("threshold=critical drops high-severity signals", async () => {
+    recordSignal({ severity: "high", summary: "high one" });
+    recordSignal({ severity: "critical", summary: "crit one" });
+
+    const { client, posts } = fakeWebClient();
+    const ctx: AlertContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+      alertsChannelId: "C-ALERTS",
+    };
+    const result = await runAlertTick(ctx, { threshold: "critical" });
+    expect(result.alerted).toHaveLength(1);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.text).toContain("crit one");
   });
 });
