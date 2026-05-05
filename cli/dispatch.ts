@@ -6,6 +6,7 @@ import { runDoctor } from "./commands/doctor.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
 import { runLogs } from "./commands/logs.ts";
+import { runNotes } from "./commands/notes.ts";
 import { runObserveImpact } from "./commands/observe-impact.ts";
 import { runOnboard } from "./commands/onboard.ts";
 import { runPlan } from "./commands/plan.ts";
@@ -96,6 +97,10 @@ Utilities:
   suppressions cleanup [--older-than N]
                               Hard-delete cleared/expired rows (default 90d retention)
   status                      Daemon status, plan counts, last agent call
+  notes <app> [--vault <v>] [--append "<text>"]
+                              Free-text project notes. With --append, append a
+                              timestamped entry; without, open in $EDITOR.
+                              Read by Strategist / Scout / Developer for context.
   triage [--format markdown|json] [--window-days N]
                               Portfolio summary: critical signals, pending
                               reviews, stuck plans, quiet apps, expiring
@@ -152,6 +157,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runCost(rest);
     case "logs":
       return runLogs(rest);
+    case "notes":
+      return runNotes(rest);
     case "scan":
       return runScan(rest);
     case "signals":

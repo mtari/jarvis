@@ -78,6 +78,14 @@ export function brainFile(
   return path.join(brainDir(dataDir, vaultName, app), "brain.json");
 }
 
+export function notesFile(
+  dataDir: string,
+  vaultName: string,
+  app: string,
+): string {
+  return path.join(brainDir(dataDir, vaultName, app), "notes.md");
+}
+
 export function brainLockFile(
   dataDir: string,
   vaultName: string,

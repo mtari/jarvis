@@ -11,6 +11,7 @@ import {
 import type { Brain } from "../orchestrator/brain.ts";
 import { brainExists, loadBrain } from "../orchestrator/brain.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
+import { notesContextBlock } from "../orchestrator/notes.ts";
 import type { Profile } from "../orchestrator/profile.ts";
 import { loadProfile } from "../orchestrator/profile.ts";
 import { runStrategist, StrategistError } from "./strategist.ts";
@@ -55,6 +56,8 @@ export interface ScoreIdeaInput {
   /** Brain of the idea's target app. Pass null when `idea.app === "new"`. */
   brain: Brain | null;
   client: AnthropicClient;
+  /** Free-text notes block from `notesContextBlock(...)`. Optional. */
+  notes?: string;
 }
 
 const VALID_PRIORITIES: ReadonlySet<SuggestedPriority> = new Set([
@@ -145,6 +148,10 @@ export async function scoreUnscoredIdeas(
         override: input.resolveBrain,
       }),
     });
+    const notes =
+      idea.app !== "new"
+        ? notesContextBlock(input.dataDir, input.vault, idea.app)
+        : null;
 
     let scored: ScoutScoreResult;
     try {
@@ -153,6 +160,7 @@ export async function scoreUnscoredIdeas(
         profile,
         brain,
         client: input.client,
+        ...(notes !== null && { notes }),
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -283,6 +291,11 @@ export function buildScoreContext(input: ScoreIdeaInput): string {
     lines.push(`No brain found for app "${input.idea.app}". Score from idea + profile alone.`);
   }
   lines.push("");
+
+  if (input.notes) {
+    lines.push(input.notes);
+    lines.push("");
+  }
 
   lines.push("Score this idea per the rubric. Return only a `<score>` block.");
   return lines.join("\n");
