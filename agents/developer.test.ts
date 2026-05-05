@@ -16,9 +16,11 @@ import {
   type InstallSandbox,
 } from "../cli/commands/_test-helpers.ts";
 import {
+  appendAmendmentToPlan,
   draftImplementationPlan,
   DeveloperError,
   executePlan,
+  parseAmendmentResponse,
 } from "./developer.ts";
 import { parsePlan } from "../orchestrator/plan.ts";
 import { findPlan } from "../orchestrator/plan-store.ts";
@@ -464,5 +466,291 @@ describe("executePlan", () => {
 
     const parent = findPlan(sandbox.dataDir, parentId);
     expect(parent?.plan.metadata.status).toBe("approved");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseAmendmentResponse — pure parser
+// ---------------------------------------------------------------------------
+
+describe("parseAmendmentResponse", () => {
+  it("parses a well-formed AMEND block", () => {
+    const text = [
+      "AMEND",
+      "Reason: scope expanded — discovered upstream API change",
+      "",
+      "The plan calls for a one-line patch but the upstream library renamed",
+      "`fooBar` to `fooBaz` in the version this repo pins. Patching one",
+      "callsite leaves twelve others broken.",
+      "",
+      "Proposed amendment: extend the plan to update all twelve callsites,",
+      "or revert to the prior pinned version.",
+    ].join("\n");
+    const result = parseAmendmentResponse(text);
+    expect(result).not.toBeNull();
+    expect(result!.reason).toBe(
+      "scope expanded — discovered upstream API change",
+    );
+    expect(result!.proposal).toContain("twelve others broken");
+    expect(result!.proposal).toContain("Proposed amendment");
+  });
+
+  it("returns null when no AMEND marker is present", () => {
+    expect(parseAmendmentResponse("DONE\nBranch: x\n")).toBeNull();
+    expect(
+      parseAmendmentResponse("BLOCKED: tests fail\nBranch: x"),
+    ).toBeNull();
+    expect(parseAmendmentResponse("")).toBeNull();
+  });
+
+  it("returns null when AMEND is present but Reason: is missing", () => {
+    expect(parseAmendmentResponse("AMEND\n\nproposal here")).toBeNull();
+  });
+
+  it("returns null when AMEND has Reason but no proposal body", () => {
+    expect(
+      parseAmendmentResponse("AMEND\nReason: something\n\n"),
+    ).toBeNull();
+  });
+
+  it("returns null when something else appears between AMEND and Reason:", () => {
+    const text = ["AMEND", "Branch: feat/x", "Reason: r", "", "p"].join("\n");
+    expect(parseAmendmentResponse(text)).toBeNull();
+  });
+
+  it("trims trailing whitespace from the proposal", () => {
+    const text = "AMEND\nReason: r\n\nbody body\n\n\n";
+    const result = parseAmendmentResponse(text);
+    expect(result?.proposal).toBe("body body");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// appendAmendmentToPlan — plan body mutation
+// ---------------------------------------------------------------------------
+
+describe("appendAmendmentToPlan", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("appends an amendment section to the plan markdown", () => {
+    const planId = "amend-test";
+    const planPath = dropPlan(sandbox, planId, { status: "executing" });
+    const record = findPlan(sandbox.dataDir, planId)!;
+
+    appendAmendmentToPlan(
+      record,
+      { reason: "scope shift", proposal: "do X instead of Y" },
+      new Date("2026-05-05T10:00:00Z"),
+    );
+
+    const contents = fs.readFileSync(planPath, "utf8");
+    expect(contents).toContain(
+      "## Amendment proposal (mid-execution, 2026-05-05)",
+    );
+    expect(contents).toContain("**Reason:** scope shift");
+    expect(contents).toContain("do X instead of Y");
+  });
+
+  it("stacks multiple amendments without overwriting previous ones", () => {
+    const planId = "stack-test";
+    const planPath = dropPlan(sandbox, planId, { status: "executing" });
+    const record = findPlan(sandbox.dataDir, planId)!;
+
+    appendAmendmentToPlan(
+      record,
+      { reason: "first reason", proposal: "first proposal" },
+      new Date("2026-05-05T10:00:00Z"),
+    );
+    const recordReloaded = findPlan(sandbox.dataDir, planId)!;
+    appendAmendmentToPlan(
+      recordReloaded,
+      { reason: "second reason", proposal: "second proposal" },
+      new Date("2026-05-06T10:00:00Z"),
+    );
+
+    const contents = fs.readFileSync(planPath, "utf8");
+    expect(contents).toContain("first reason");
+    expect(contents).toContain("first proposal");
+    expect(contents).toContain("second reason");
+    expect(contents).toContain("second proposal");
+    // Two amendment sections
+    const matches = contents.match(/## Amendment proposal/g);
+    expect(matches).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// executePlan — AMEND integration
+// ---------------------------------------------------------------------------
+
+describe("executePlan AMEND integration", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function readEvents(kind: string): Array<Record<string, unknown>> {
+    const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const rows = conn
+        .prepare("SELECT payload FROM events WHERE kind = ?")
+        .all(kind) as Array<{ payload: string }>;
+      return rows.map((r) => JSON.parse(r.payload) as Record<string, unknown>);
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("transitions executing → awaiting-review when SDK returns AMEND", async () => {
+    const planId = "2026-04-27-amend";
+    dropPlan(sandbox, planId, { status: "approved" });
+
+    const { transport } = scriptedTransport([
+      fixedRunResult(
+        [
+          "AMEND",
+          "Reason: rollback condition triggered",
+          "",
+          "Tests pass but the new behavior contradicts an existing UX rule",
+          "the plan didn't mention. Propose: split this plan into two —",
+          "one for the data change, one for the UX update.",
+        ].join("\n"),
+      ),
+    ]);
+
+    const result = await executePlan({
+      transport,
+      planId,
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+    });
+
+    expect(result.amended).toBe(true);
+    expect(result.done).toBe(false);
+    expect(result.blocked).toBe(false);
+    expect(result.amendmentReason).toBe("rollback condition triggered");
+    expect(result.amendmentProposal).toContain("split this plan");
+
+    const finalRecord = findPlan(sandbox.dataDir, planId);
+    expect(finalRecord?.plan.metadata.status).toBe("awaiting-review");
+
+    // Plan body has the amendment section
+    const planText = fs.readFileSync(finalRecord!.path, "utf8");
+    expect(planText).toContain("## Amendment proposal");
+    expect(planText).toContain("**Reason:** rollback condition triggered");
+
+    // amendment-proposed event recorded
+    const amendments = readEvents("amendment-proposed");
+    expect(amendments).toHaveLength(1);
+    expect(amendments[0]).toMatchObject({
+      planId,
+      reason: "rollback condition triggered",
+      actor: "developer",
+    });
+
+    // Transition history: approved -> executing -> awaiting-review
+    const transitions = readEvents("plan-transition");
+    const sequence = transitions.map((t) => t["to"]);
+    expect(sequence).toEqual(["executing", "awaiting-review"]);
+  });
+
+  it("amendment takes precedence over BLOCKED + DONE in the same response", async () => {
+    const planId = "2026-04-27-precedence";
+    dropPlan(sandbox, planId, { status: "approved" });
+
+    const { transport } = scriptedTransport([
+      fixedRunResult(
+        // The Developer prompt forbids this combination, but defense-in-depth:
+        // if both somehow appear, AMEND wins.
+        [
+          "AMEND",
+          "Reason: bad situation",
+          "",
+          "proposal body",
+          "",
+          "DONE",
+          "BLOCKED: stale state",
+        ].join("\n"),
+      ),
+    ]);
+
+    const result = await executePlan({
+      transport,
+      planId,
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+    });
+
+    expect(result.amended).toBe(true);
+    expect(result.done).toBe(false);
+    expect(result.blocked).toBe(false);
+    const finalRecord = findPlan(sandbox.dataDir, planId);
+    expect(finalRecord?.plan.metadata.status).toBe("awaiting-review");
+  });
+
+  it("does NOT mirror the parent plan's status when an impl plan amends", async () => {
+    const parentId = "2026-04-27-parent-stays";
+    dropPlan(sandbox, parentId, { status: "executing" });
+    const childId = "2026-04-27-child-amends";
+    const childPath = path.join(planDir(sandbox.dataDir, "personal", "jarvis"), `${childId}.md`);
+    fs.writeFileSync(
+      childPath,
+      [
+        "# Plan: child impl",
+        "Type: implementation",
+        `ParentPlan: ${parentId}`,
+        "App: jarvis",
+        "Priority: normal",
+        "Destructive: false",
+        "Status: approved",
+        "Author: developer",
+        "Confidence: 80 — small change",
+        "",
+        "## Approach",
+        "Implement the parent plan.",
+      ].join("\n"),
+    );
+
+    const { transport } = scriptedTransport([
+      fixedRunResult(
+        ["AMEND", "Reason: discovered new file", "", "proposal text"].join(
+          "\n",
+        ),
+      ),
+    ]);
+    await executePlan({
+      transport,
+      planId: childId,
+      app: "jarvis",
+      vault: "personal",
+      dataDir: sandbox.dataDir,
+    });
+
+    const child = findPlan(sandbox.dataDir, childId);
+    const parent = findPlan(sandbox.dataDir, parentId);
+    expect(child?.plan.metadata.status).toBe("awaiting-review");
+    // Parent stays at executing — not mirrored
+    expect(parent?.plan.metadata.status).toBe("executing");
   });
 });

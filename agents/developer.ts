@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
@@ -14,7 +15,12 @@ import {
   transitionPlan,
   type PlanStatus,
 } from "../orchestrator/plan.ts";
-import { dbFile, planDir, repoRoot as defaultRepoRoot } from "../cli/paths.ts";
+import {
+  checkpointsDir,
+  dbFile,
+  planDir,
+  repoRoot as defaultRepoRoot,
+} from "../cli/paths.ts";
 import { dumpFailedDraft } from "./strategist.ts";
 
 /**
@@ -220,6 +226,13 @@ export interface ExecutePlanResult {
   prUrl?: string;
   done: boolean;
   blocked: boolean;
+  /**
+   * True when Developer surfaced a §12 amendment proposal mid-execution.
+   * Mutually exclusive with `done` and `blocked`.
+   */
+  amended: boolean;
+  amendmentReason?: string;
+  amendmentProposal?: string;
   numTurns: number;
   toolCallCount: number;
   subtype: RunAgentResult["subtype"];
@@ -289,9 +302,18 @@ export async function executePlan(
   recordAgentCall(input.dataDir, input.app, input.vault, input.planId, result);
 
   const text = result.text;
+  const amendment = parseAmendmentResponse(text);
+  // Precedence: AMEND > BLOCKED > DONE. Developer's prompt enforces this
+  // ordering; even if both AMEND and BLOCKED could apply, we treat the
+  // amendment as authoritative.
   const blocked =
-    /^BLOCKED\b/m.test(text) || result.subtype === "error_max_turns";
-  const done = !blocked && /^DONE\b/m.test(text) && result.subtype === "success";
+    amendment === null &&
+    (/^BLOCKED\b/m.test(text) || result.subtype === "error_max_turns");
+  const done =
+    amendment === null &&
+    !blocked &&
+    /^DONE\b/m.test(text) &&
+    result.subtype === "success";
   const branchMatch = text.match(/^Branch:\s*(.+)$/m);
   const prMatch = text.match(/^PR URL:\s*(.+)$/m);
 
@@ -299,7 +321,64 @@ export async function executePlan(
   const updatedRecord = findPlan(input.dataDir, input.planId);
   let finalStatus: PlanStatus | null = null;
   if (updatedRecord) {
-    if (done) {
+    if (amendment) {
+      // Append the amendment to the plan body, capture a checkpoint of
+      // the working-tree state, transition executing → awaiting-review,
+      // and record an `amendment-proposed` event so the inbox can tag it.
+      appendAmendmentToPlan(updatedRecord, amendment);
+      let checkpoint: AmendmentCheckpoint | undefined;
+      try {
+        checkpoint = writeAmendmentCheckpoint({
+          dataDir: input.dataDir,
+          repoRoot: repo,
+          planId: input.planId,
+          amendment,
+        });
+      } catch (err) {
+        // Checkpoint capture is best-effort — slice 3's resume can still
+        // operate from the amended plan body even without git state.
+        // Surface the failure but don't abort the amendment.
+        const msg = err instanceof Error ? err.message : String(err);
+        const db = new Database(dbFile(input.dataDir));
+        try {
+          appendEvent(db, {
+            appId: input.app,
+            vaultId: input.vault,
+            kind: "amendment-checkpoint-error",
+            payload: { planId: input.planId, error: msg },
+          });
+        } finally {
+          db.close();
+        }
+      }
+      // Reload again — appendAmendmentToPlan mutated the file
+      const postAmendRecord = findPlan(input.dataDir, input.planId);
+      if (postAmendRecord) {
+        recordTransition(postAmendRecord, "awaiting-review", input.dataDir);
+      }
+      const db = new Database(dbFile(input.dataDir));
+      try {
+        appendEvent(db, {
+          appId: input.app,
+          vaultId: input.vault,
+          kind: "amendment-proposed",
+          payload: {
+            planId: input.planId,
+            reason: amendment.reason,
+            proposal: amendment.proposal,
+            ...(checkpoint !== undefined && {
+              branch: checkpoint.branch,
+              sha: checkpoint.sha,
+              modifiedFileCount: checkpoint.modifiedFiles.length,
+            }),
+            actor: "developer",
+          },
+        });
+      } finally {
+        db.close();
+      }
+      finalStatus = "awaiting-review";
+    } else if (done) {
       recordTransition(updatedRecord, "done", input.dataDir);
       finalStatus = "done";
     } else if (blocked) {
@@ -309,11 +388,14 @@ export async function executePlan(
     // Otherwise leave at "executing" — caller can inspect and decide.
   }
 
-  // §4: when an implementation plan finishes (done or blocked), mirror that
-  // on the parent improvement plan. Parent stays put if it's not currently
-  // "executing" (e.g., user paused or cancelled it manually).
+  // §4: when an implementation plan finishes (done or blocked), mirror
+  // that on the parent improvement plan. Parent stays put if it's not
+  // currently "executing" (e.g., user paused / cancelled it manually).
+  // Amendments deliberately do NOT mirror — the parent stays `executing`
+  // while the user reviews the impl-plan amendment, then resumes
+  // automatically when the impl plan returns to `executing`.
   if (
-    finalStatus !== null &&
+    (finalStatus === "done" || finalStatus === "blocked") &&
     updatedRecord?.plan.metadata.type === "implementation" &&
     updatedRecord.plan.metadata.parentPlan
   ) {
@@ -330,9 +412,12 @@ export async function executePlan(
     finalText: text,
     done,
     blocked,
+    amended: amendment !== null,
     numTurns: result.numTurns,
     toolCallCount: 0, // SDK doesn't expose tool-call count separately; numTurns is the proxy
     subtype: result.subtype,
+    ...(amendment !== null && { amendmentReason: amendment.reason }),
+    ...(amendment !== null && { amendmentProposal: amendment.proposal }),
   };
   if (branchMatch && branchMatch[1]) {
     out.branch = branchMatch[1].trim();
@@ -407,4 +492,166 @@ export function detectDeveloperMode(plan: Plan): DeveloperMode | null {
   // auto
   if (subtype === "new-feature" || subtype === "rework") return "draft-impl";
   return "execute";
+}
+
+// ---------------------------------------------------------------------------
+// §12 amendment flow — Developer surfaces "this plan is wrong, propose change"
+//
+// The system prompt instructs Developer to halt and reply with an `AMEND`
+// block when one of the §12 triggers fires. executePlan() detects that
+// block, captures a checkpoint of the current branch state, appends the
+// amendment proposal to the plan body, and transitions the plan from
+// `executing` to `awaiting-review`. The user reviews the amended plan
+// through the normal approve/revise/reject CLI surfaces; resume from
+// the checkpoint lands in slice 3.
+// ---------------------------------------------------------------------------
+
+export interface ParsedAmendment {
+  reason: string;
+  proposal: string;
+}
+
+/**
+ * Parses the `AMEND` block out of Developer's response. Returns null if
+ * the response isn't an amendment. Format expected:
+ *
+ *     AMEND
+ *     Reason: <one-line reason>
+ *
+ *     <proposal markdown — multi-line, runs to EOF>
+ *
+ * The `AMEND` line must be on its own line (line-anchored). The Reason
+ * line follows directly. The proposal starts after the first blank line
+ * and runs to the end of the response.
+ */
+export function parseAmendmentResponse(text: string): ParsedAmendment | null {
+  const lines = text.split(/\r?\n/);
+  const markerIdx = lines.findIndex((l) => l.trim() === "AMEND");
+  if (markerIdx === -1) return null;
+
+  // Walk forward to find Reason: line (skipping the AMEND marker)
+  let reasonIdx = -1;
+  for (let i = markerIdx + 1; i < lines.length; i += 1) {
+    const trimmed = lines[i]!.trim();
+    if (trimmed === "") continue;
+    if (trimmed.startsWith("Reason:")) {
+      reasonIdx = i;
+      break;
+    }
+    return null; // first non-blank line wasn't Reason — malformed
+  }
+  if (reasonIdx === -1) return null;
+
+  const reason = lines[reasonIdx]!.replace(/^Reason:\s*/, "").trim();
+  if (reason.length === 0) return null;
+
+  // Proposal = everything after the next blank line; collapse leading
+  // blanks but preserve internal structure.
+  let proposalStart = reasonIdx + 1;
+  while (
+    proposalStart < lines.length &&
+    lines[proposalStart]!.trim() === ""
+  ) {
+    proposalStart += 1;
+  }
+  const proposal = lines
+    .slice(proposalStart)
+    .join("\n")
+    .replace(/\s+$/, "");
+  if (proposal.length === 0) return null;
+
+  return { reason, proposal };
+}
+
+export interface AmendmentCheckpoint {
+  planId: string;
+  branch: string;
+  sha: string;
+  modifiedFiles: Array<{ status: string; path: string }>;
+  amendmentReason: string;
+  amendmentProposal: string;
+  timestamp: string;
+}
+
+/**
+ * Captures the working-tree state Developer left behind into a JSON
+ * checkpoint at `<dataDir>/logs/checkpoints/<planId>.json`. Slice 3
+ * (resume) reads this back to restart Developer on the same branch
+ * after the user approves the amendment.
+ */
+export function writeAmendmentCheckpoint(input: {
+  dataDir: string;
+  repoRoot: string;
+  planId: string;
+  amendment: ParsedAmendment;
+  now?: Date;
+}): AmendmentCheckpoint {
+  const branch = execSync("git branch --show-current", {
+    cwd: input.repoRoot,
+    encoding: "utf8",
+  }).trim();
+  const sha = execSync("git rev-parse HEAD", {
+    cwd: input.repoRoot,
+    encoding: "utf8",
+  }).trim();
+  const statusRaw = execSync("git status --porcelain", {
+    cwd: input.repoRoot,
+    encoding: "utf8",
+  });
+  const modifiedFiles: AmendmentCheckpoint["modifiedFiles"] = [];
+  for (const line of statusRaw.split(/\r?\n/)) {
+    if (line.length === 0) continue;
+    // Porcelain v1: first 2 cols are status code, then space, then path
+    const status = line.slice(0, 2).trim();
+    const file = line.slice(3).trim();
+    if (file.length > 0) modifiedFiles.push({ status, path: file });
+  }
+
+  const checkpoint: AmendmentCheckpoint = {
+    planId: input.planId,
+    branch,
+    sha,
+    modifiedFiles,
+    amendmentReason: input.amendment.reason,
+    amendmentProposal: input.amendment.proposal,
+    timestamp: (input.now ?? new Date()).toISOString(),
+  };
+
+  const dir = checkpointsDir(input.dataDir);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, `${input.planId}.json`),
+    JSON.stringify(checkpoint, null, 2),
+    "utf8",
+  );
+  return checkpoint;
+}
+
+/**
+ * Appends an `## Amendment proposal` section to the plan markdown so
+ * the user reviewing the plan in `yarn jarvis approve` sees the
+ * amendment context inline with the original plan.
+ *
+ * Multiple amendments stack — each new amendment gets a fresh section
+ * with its own timestamp.
+ */
+export function appendAmendmentToPlan(
+  record: PlanRecord,
+  amendment: ParsedAmendment,
+  now: Date = new Date(),
+): void {
+  const dateStr = now.toISOString().slice(0, 10);
+  const text = fs.readFileSync(record.path, "utf8");
+  const trimmed = text.replace(/\s+$/, "");
+  const section = [
+    "",
+    "",
+    `## Amendment proposal (mid-execution, ${dateStr})`,
+    "",
+    `**Reason:** ${amendment.reason}`,
+    "",
+    amendment.proposal,
+    "",
+  ].join("\n");
+  fs.writeFileSync(record.path, trimmed + section, "utf8");
 }

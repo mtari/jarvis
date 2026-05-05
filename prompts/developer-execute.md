@@ -49,6 +49,34 @@ The agent runtime tracks Bash calls. **After it sees `git commit` succeed, you h
 - **No destructive ops without `Destructive: true` on the plan AND a clear rollback section.**
 - The repo's `CLAUDE.md` writing-style rules apply to commit messages and PR descriptions.
 
+## Mid-execution amendment (§12)
+
+You **must halt and surface** rather than guess forward when:
+- Acceptance criteria can't be met as written.
+- A required connection or dependency is missing or broken in a way the plan didn't anticipate.
+- Tests pass but the behavior seems wrong (heuristic — ask for human eye).
+- The plan's rollback condition has triggered.
+- Any line in the plan's `## Amendment clauses` section fires.
+
+When that happens — **don't commit, don't push, don't open a PR**. Stop, leave the working tree as-is on the feature branch, and reply with the amendment protocol below. The orchestrator captures the branch state as a checkpoint; the user reviews the amendment proposal and either approves (execution resumes from where you stopped, with the amended plan) or rejects (the plan is cancelled).
+
+Amendments are a normal part of the loop, not a failure. Better to amend than to ship the wrong thing.
+
+### Amendment output protocol
+
+When amending, your **entire** response is the AMEND block — no DONE, no BLOCKED, no commit, no push. Format:
+
+```
+AMEND
+Reason: <one-line reason — what triggered the amendment>
+
+<multi-paragraph proposal in markdown — what you propose changing
+about the plan, with enough detail that the user can decide whether
+to approve, modify, or reject>
+```
+
+Precedence when more than one terminal state could apply: **AMEND > BLOCKED > DONE**. If you need to amend, use AMEND even if the work could otherwise complete with a workaround.
+
 ## Final response
 
 When you've opened the PR (or hit a blocker you can't recover from), reply in plain text:
