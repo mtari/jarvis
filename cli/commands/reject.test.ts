@@ -1,8 +1,9 @@
 import fs from "node:fs";
+import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parsePlan } from "../../orchestrator/plan.ts";
-import { dbFile } from "../paths.ts";
+import { checkpointsDir, dbFile } from "../paths.ts";
 import {
   dropPlan,
   makeInstallSandbox,
@@ -65,5 +66,66 @@ describe("runReject", () => {
   it("returns 1 when the plan is not in awaiting-review", async () => {
     dropPlan(sandbox, "2026-04-27-test", { status: "draft" });
     expect(await runReject(["2026-04-27-test"])).toBe(1);
+  });
+
+  function writeCheckpoint(planId: string): string {
+    const dir = checkpointsDir(sandbox.dataDir);
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `${planId}.json`);
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        planId,
+        branch: "feat/x",
+        sha: "abc",
+        modifiedFiles: [],
+        amendmentReason: "r",
+        amendmentProposal: "p",
+        timestamp: "2026-05-05T00:00:00Z",
+      }),
+    );
+    return filePath;
+  }
+
+  it("removes the amendment checkpoint when rejecting an amendment-state plan", async () => {
+    const planId = "2026-04-27-amend-reject";
+    dropPlan(sandbox, planId, { status: "awaiting-review" });
+    const checkpointPath = writeCheckpoint(planId);
+    expect(fs.existsSync(checkpointPath)).toBe(true);
+
+    const code = await runReject([planId]);
+    expect(code).toBe(0);
+    expect(fs.existsSync(checkpointPath)).toBe(false);
+  });
+
+  it("rejects cleanly when no checkpoint exists (no-op cleanup)", async () => {
+    const planId = "2026-04-27-no-checkpoint";
+    dropPlan(sandbox, planId, { status: "awaiting-review" });
+    // No writeCheckpoint() call
+
+    const code = await runReject([planId]);
+    expect(code).toBe(0);
+    // Plan is rejected on disk
+    const finalPath = path.join(
+      sandbox.dataDir,
+      "vaults",
+      "personal",
+      "plans",
+      "jarvis",
+      `${planId}.md`,
+    );
+    expect(parsePlan(fs.readFileSync(finalPath, "utf8")).metadata.status).toBe(
+      "rejected",
+    );
+  });
+
+  it("does NOT remove the checkpoint when reject fails (wrong-state path)", async () => {
+    const planId = "2026-04-27-wrong-state";
+    dropPlan(sandbox, planId, { status: "draft" });
+    const checkpointPath = writeCheckpoint(planId);
+
+    expect(await runReject([planId])).toBe(1);
+    // Checkpoint left intact — reject returned an error, no cleanup
+    expect(fs.existsSync(checkpointPath)).toBe(true);
   });
 });
