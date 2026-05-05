@@ -1,4 +1,8 @@
 import type { KnownBlock } from "@slack/types";
+import type {
+  AutoDraftFromIdeasResult,
+  ScoreUnscoredIdeasResult,
+} from "../../agents/scout.ts";
 import { listPlans } from "../../orchestrator/plan-store.ts";
 import { listPendingSetupTasks } from "../../orchestrator/setup-tasks.ts";
 import {
@@ -145,4 +149,90 @@ export function buildOnDemandTriageBlocks(
   });
   const text = `Triage — ${date} (on-demand)`;
   return { blocks, text, date };
+}
+
+// ---------------------------------------------------------------------------
+// /jarvis scout score|draft — Scout slash commands
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads `--vault <name>` and `--threshold N` flags out of a flat
+ * argument list. Unknown / malformed flags are silently dropped to
+ * keep the slash UX forgiving — the underlying ops have safe defaults.
+ */
+export function parseScoutFlags(args: ReadonlyArray<string>): {
+  vault: string;
+  threshold?: number;
+} {
+  let vault = "personal";
+  let threshold: number | undefined;
+  for (let i = 0; i < args.length; i += 1) {
+    const flag = args[i];
+    const value = args[i + 1];
+    if (flag === "--vault" && typeof value === "string" && value.length > 0) {
+      vault = value;
+      i += 1;
+    } else if (
+      flag === "--threshold" &&
+      typeof value === "string" &&
+      value.length > 0
+    ) {
+      const n = Number.parseInt(value, 10);
+      if (Number.isFinite(n) && n >= 0 && n <= 100) threshold = n;
+      i += 1;
+    }
+  }
+  return threshold !== undefined ? { vault, threshold } : { vault };
+}
+
+/**
+ * Formats a `ScoreUnscoredIdeasResult` as the ephemeral response body
+ * for `/jarvis scout score`. Mirrors the CLI output: one bullet per
+ * idea (✓ scored / ✗ error), then a summary footer.
+ */
+export function formatScoreResults(result: ScoreUnscoredIdeasResult): string {
+  if (result.scoredCount === 0 && result.errorCount === 0) {
+    return "No unscored ideas. Delete a `Score:` line from `Business_Ideas.md` to re-score.";
+  }
+  const lines: string[] = [];
+  for (const e of result.entries) {
+    if (e.error) {
+      lines.push(`• ✗ \`${e.ideaId}\` — ${e.error}`);
+    } else {
+      lines.push(
+        `• ✓ \`${e.ideaId}\` — score *${e.score}* (suggested: ${e.suggestedPriority})`,
+      );
+    }
+  }
+  lines.push("");
+  lines.push(
+    `Scored ${result.scoredCount}, ${result.errorCount} error(s).`,
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Formats an `AutoDraftFromIdeasResult` as the ephemeral response body
+ * for `/jarvis scout draft`. Mirrors the CLI output: one bullet per
+ * idea (✓ drafted / – skipped / ✗ error), then a summary footer.
+ */
+export function formatDraftResults(result: AutoDraftFromIdeasResult): string {
+  if (result.entries.length === 0) {
+    return "No ideas in `Business_Ideas.md`.";
+  }
+  const lines: string[] = [];
+  for (const e of result.entries) {
+    if (e.planId) {
+      lines.push(`• ✓ \`${e.ideaId}\` → drafted \`${e.planId}\``);
+    } else if (e.error) {
+      lines.push(`• ✗ \`${e.ideaId}\` — ${e.error}`);
+    } else {
+      lines.push(`• – \`${e.ideaId}\` skipped (${e.skippedReason ?? "no reason"})`);
+    }
+  }
+  lines.push("");
+  lines.push(
+    `Drafted ${result.draftedCount}, ${result.errorCount} error(s).`,
+  );
+  return lines.join("\n");
 }
