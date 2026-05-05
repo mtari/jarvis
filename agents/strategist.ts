@@ -10,6 +10,7 @@ import { recordFeedback } from "../orchestrator/feedback-store.ts";
 import { findPlan, savePlan } from "../orchestrator/plan-store.ts";
 import { parsePlan, transitionPlan } from "../orchestrator/plan.ts";
 import type { Plan } from "../orchestrator/plan.ts";
+import { notesContextBlock } from "../orchestrator/notes.ts";
 import type { Profile } from "../orchestrator/profile.ts";
 import { loadProfile } from "../orchestrator/profile.ts";
 import {
@@ -79,6 +80,7 @@ export async function runStrategist(
   const brain = loadBrain(brainFile(input.dataDir, input.vault, input.app));
   const profile = loadProfile(profileFile(input.dataDir));
   const systemPrompt = loadStrategistPrompt(planType);
+  const notes = notesContextBlock(input.dataDir, input.vault, input.app);
 
   const initialContext = buildContext({
     brain,
@@ -86,6 +88,7 @@ export async function runStrategist(
     brief: input.brief,
     planType,
     ...(input.subtype !== undefined && { subtypeHint: input.subtype }),
+    ...(notes !== null && { notes }),
   });
 
   const conversation: Array<{ role: "user" | "assistant"; content: string }> = [
@@ -272,6 +275,8 @@ function buildContext(args: {
   brief: string;
   planType: StrategistPlanType;
   subtypeHint?: string;
+  /** Free-text notes block from `notesContextBlock(...)`. Optional. */
+  notes?: string;
 }): string {
   const lines: string[] = [];
   lines.push(`Plan type: ${args.planType}`);
@@ -316,6 +321,10 @@ function buildContext(args: {
   if (args.subtypeHint) {
     lines.push("");
     lines.push(`Subtype hint from CLI: ${args.subtypeHint}`);
+  }
+  if (args.notes) {
+    lines.push("");
+    lines.push(args.notes);
   }
   return lines.join("\n");
 }

@@ -8,6 +8,7 @@ import {
   type RunAgentTransport,
 } from "../orchestrator/agent-sdk-runtime.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
+import { notesContextBlock } from "../orchestrator/notes.ts";
 import { findPlan, savePlan, type PlanRecord } from "../orchestrator/plan-store.ts";
 import type { Plan } from "../orchestrator/plan.ts";
 import {
@@ -316,6 +317,11 @@ export async function executePlan(
         contextLines.push("");
         contextLines.push(fs.readFileSync(parent.path, "utf8"));
       }
+    }
+    const notes = notesContextBlock(input.dataDir, record.vault, record.app);
+    if (notes !== null) {
+      contextLines.push("");
+      contextLines.push(notes);
     }
     userPrompt = contextLines.join("\n");
   }

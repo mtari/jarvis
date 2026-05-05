@@ -17,6 +17,7 @@ import {
 } from "../../orchestrator/plan-lifecycle.ts";
 import Database from "better-sqlite3";
 import { appendEvent } from "../../orchestrator/event-log.ts";
+import { appendNote } from "../../orchestrator/notes.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
 import { resolveSetupTask } from "../../orchestrator/setup-tasks.ts";
 import { suppress } from "../../orchestrator/suppressions.ts";
@@ -446,10 +447,12 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
         });
         return;
       }
+      case "notes":
+        return runSlashNotes(parts.slice(1), ctx, respond, command);
       default:
         await respond({
           response_type: "ephemeral",
-          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`.`,
+          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`notes\`.`,
         });
     }
   });
@@ -463,6 +466,7 @@ const SLASH_USAGE = [
   "• `/jarvis triage` — post the on-demand triage report to this channel",
   "• `/jarvis scout score [--vault <v>]` — score unscored ideas in `Business_Ideas.md`",
   "• `/jarvis scout draft [--threshold N] [--vault <v>]` — auto-draft plans from high-scoring ideas",
+  "• `/jarvis notes <app> <text>` — append a free-text note read by Strategist / Scout / Developer",
 ].join("\n");
 
 type SlashRespond = (args: {
@@ -658,6 +662,43 @@ async function runSlashScoutDraft(
     await respond({
       response_type: "ephemeral",
       text: `✗ Scout draft failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    });
+  }
+}
+
+async function runSlashNotes(
+  args: string[],
+  ctx: HandlerContext,
+  respond: SlashRespond,
+  command: { user_id?: string },
+): Promise<void> {
+  const app = args[0];
+  const text = args.slice(1).join(" ").trim();
+  if (!app || text.length === 0) {
+    await respond({
+      response_type: "ephemeral",
+      text: "Usage: `/jarvis notes <app> <text>` (vault defaults to `personal`)",
+    });
+    return;
+  }
+  const userId = command.user_id ?? "<slack>";
+  try {
+    appendNote(ctx.dataDir, "personal", app, {
+      text,
+      actor: `slack:${userId}`,
+    });
+    ctx.log("note appended via slack", { app, userId, len: text.length });
+    await respond({
+      response_type: "ephemeral",
+      text: `📝 Note appended to *${app}* — Strategist / Scout / Developer will read this in their next context.`,
+    });
+  } catch (err) {
+    ctx.logError("/jarvis notes failed", err, { app });
+    await respond({
+      response_type: "ephemeral",
+      text: `✗ Note append failed: ${
         err instanceof Error ? err.message : String(err)
       }`,
     });

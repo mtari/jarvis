@@ -203,6 +203,28 @@ describe("scoreIdea", () => {
     });
     expect(calls[0]!.context).toContain("New app — no existing brain");
   });
+
+  it("renders the notes block when passed in (from notesContextBlock)", async () => {
+    const { client, calls } = fakeScoutClient([
+      scoreXml({ score: 60, rationale: "x", suggestedPriority: "normal" }),
+    ]);
+    await scoreIdea({
+      idea: {
+        id: "i",
+        title: "x",
+        app: "demo",
+        brief: "y",
+        tags: [],
+        body: "",
+      },
+      profile: {} as ReturnType<typeof JSON.parse>,
+      brain: null,
+      client,
+      notes: "## Free-text notes for this app\n\nAddress-step is the killer.",
+    });
+    expect(calls[0]!.context).toContain("## Free-text notes for this app");
+    expect(calls[0]!.context).toContain("Address-step is the killer");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -397,6 +419,36 @@ describe("scoreUnscoredIdeas", () => {
     });
     expect(result.scoredCount).toBe(1);
     expect(calls[0]!.context).toContain("New app — no existing brain");
+  });
+
+  it("reads per-app free-text notes and includes them in the LLM context", async () => {
+    seedAppBrain("demo");
+    writeIdeas(
+      [
+        "## Idea using notes",
+        "App: demo",
+        "Brief: y",
+        "",
+      ].join("\n"),
+    );
+    // Drop a note for `demo` before scoring.
+    const { appendNote } = await import("../orchestrator/notes.ts");
+    appendNote(sandbox.dataDir, "personal", "demo", {
+      text: "Hypothesis: address-step is the funnel killer.",
+      now: new Date("2026-05-04T00:00:00Z"),
+    });
+
+    const { client, calls } = fakeScoutClient([
+      scoreXml({ score: 70, rationale: "x", suggestedPriority: "normal" }),
+    ]);
+    await scoreUnscoredIdeas({
+      dataDir: sandbox.dataDir,
+      client,
+      vault: "personal",
+      now: () => FIXED_NOW,
+    });
+    expect(calls[0]!.context).toContain("## Free-text notes for this app");
+    expect(calls[0]!.context).toContain("address-step is the funnel killer");
   });
 
   it("does not write to disk when nothing was scored", async () => {
