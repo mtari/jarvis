@@ -1,4 +1,5 @@
 import { parseArgs } from "node:util";
+import { removeAmendmentCheckpoint } from "../../agents/developer.ts";
 import { rejectPlan } from "../../orchestrator/plan-lifecycle.ts";
 import { dbFile, getDataDir } from "../paths.ts";
 
@@ -39,6 +40,13 @@ export async function runReject(rawArgs: string[]): Promise<number> {
     console.error(`reject: ${result.message}`);
     return 1;
   }
+
+  // Drop any amendment checkpoint that was waiting on this plan. The
+  // plan is terminal now (rejected has no outgoing transitions), so
+  // the saved branch state would otherwise stay on disk forever.
+  // No-op when there's no checkpoint — best-effort cleanup.
+  removeAmendmentCheckpoint(planId, dataDir);
+
   console.log(`✓ Rejected plan ${planId}.`);
   return 0;
 }
