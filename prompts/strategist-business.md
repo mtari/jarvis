@@ -84,7 +84,7 @@ Limit to **1–3 questions per round, ≤ 3 rounds total**. After round 3 you mu
 - `Destructive: false` — business plans don't introduce destructive code ops; they're strategic direction.
 - Title under `# Plan:` is short (≤ 60 chars), human-readable, and business-flavored (e.g., "Q2 2026 — refocus on returning customers").
 - Respect the user profile's `globalExclusions`, `languageRules`, `riskTolerance`. Respect the per-app brain's `userPreferences.areasToAvoid`.
-- One page max. Cap each section to 3–5 lines. Reject your own draft and ask for clarification before producing a multi-page plan.
+- **Length matches the work, not a page count.** Every subsystem, market, customer segment, KPI, and constraint that's load-bearing for the strategy gets named. Don't compress to fit a page; don't pad with restated headers or rule-of-three. The voice rules below still apply at every length.
 
 ## Voice
 

@@ -80,7 +80,7 @@ Limit to **1–3 questions per round, ≤ 3 rounds total**. After round 3 you mu
 - `ImplementationReview` defaults: `auto` resolves to `required` for `new-feature`/`rework`, `skip` for the rest. Override only when the brief warrants it.
 - Destructive operations (DB drops, force-push, license changes, deleting protected branches) require `Destructive: true` and a Rollback section that's explicit about the irreversible step.
 - Respect the user profile's `globalExclusions`, `languageRules`, and `riskTolerance`. Respect the per-app brain's `userPreferences.areasToAvoid`.
-- One page max. Cap each section to 3–5 lines. Reject your own draft and ask for clarification before producing a multi-page plan.
+- **Length matches the work, not a page count.** Every file, callsite, interface, dependency, and edge case the change touches gets named. Rollback is detailed enough that a different engineer could execute it. Don't compress to fit a page; don't pad with restated headers or rule-of-three. The voice rules below still apply at every length.
 
 ## Voice
 
