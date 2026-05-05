@@ -13,6 +13,7 @@ import { registerHandlers } from "./handlers.ts";
 import {
   runAlertTick,
   runSurfaceTick,
+  runTriageDeliveryTick,
   type AlertContext,
   type SurfaceContext,
 } from "./surface.ts";
@@ -33,6 +34,12 @@ export interface SlackServiceOptions {
    * disable signal alerts entirely.
    */
   alertThreshold?: SignalSeverity | null;
+  /**
+   * Whether the surface tick should also deliver new triage reports
+   * (`<dataDir>/triage/<YYYY-MM-DD>.md`) to `#jarvis-inbox`. Default
+   * `true`. Set `false` to keep triage CLI-only.
+   */
+  triageDeliveryEnabled?: boolean;
   /** Allow tests to inject a fake client (skip the real Bolt connection). */
   buildBoltApp?: (opts: {
     botToken: string;
@@ -74,6 +81,7 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
 
   const alertThreshold: SignalSeverity | null =
     opts.alertThreshold === undefined ? "high" : opts.alertThreshold;
+  const triageDeliveryEnabled = opts.triageDeliveryEnabled ?? true;
 
   return {
     name: "slack",
@@ -166,6 +174,22 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
             }
           } catch (err) {
             ctx.logger.error("alert tick errored", err);
+          }
+        }
+        if (triageDeliveryEnabled) {
+          try {
+            const triage = await runTriageDeliveryTick(surfaceCtxFor());
+            if (triage.posted.length > 0) {
+              ctx.logger.info("delivered triage to slack", {
+                count: triage.posted.length,
+                dates: triage.posted,
+              });
+            }
+            for (const e of triage.errors) {
+              ctx.logger.error("triage delivery failed", null, e);
+            }
+          } catch (err) {
+            ctx.logger.error("triage delivery tick errored", err);
           }
         }
       };

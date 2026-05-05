@@ -10,17 +10,23 @@ import {
 } from "../../cli/commands/_test-helpers.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
+import fs from "node:fs";
+import path from "node:path";
+import { triageDir } from "../../cli/paths.ts";
 import { suppress } from "../../orchestrator/suppressions.ts";
 import {
   findAmendmentSurfaceRecord,
   findPendingAmendment,
   findSurfaceRecord,
   findUnpostedAlertableSignals,
+  findUnpostedTriageReports,
   runAlertTick,
   runSurfaceTick,
+  runTriageDeliveryTick,
   surfaceAmendmentReview,
   surfacePlan,
   surfaceSignalAlert,
+  surfaceTriageReport,
   updateSurfacedPlan,
   type AlertContext,
   type SurfaceContext,
@@ -793,5 +799,266 @@ describe("runAlertTick", () => {
     expect(result.alerted).toHaveLength(1);
     expect(posts).toHaveLength(1);
     expect(posts[0]?.text).toContain("crit one");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Slice 3: triage delivery to #jarvis-inbox
+// ---------------------------------------------------------------------------
+
+describe("findUnpostedTriageReports", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  // Pinned to UTC midnight so the 7-day window math is integer days.
+  const FIXED_NOW = new Date("2026-05-04T00:00:00.000Z");
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function writeTriageFile(date: string, body = "# Triage\nbody"): string {
+    const dir = triageDir(sandbox.dataDir);
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `${date}.md`);
+    fs.writeFileSync(filePath, body);
+    return filePath;
+  }
+
+  function recordSurfaced(date: string): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: "jarvis",
+        vaultId: "personal",
+        kind: "slack-triage-surfaced",
+        payload: { date },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("returns empty when the triage dir doesn't exist", () => {
+    expect(
+      findUnpostedTriageReports(sandbox.dataDir, dbFile(sandbox.dataDir), {
+        now: FIXED_NOW,
+      }),
+    ).toEqual([]);
+  });
+
+  it("returns triage files within the age window, most-recent-first", () => {
+    writeTriageFile("2026-05-04");
+    writeTriageFile("2026-04-27"); // 7 days old — exactly at boundary
+    writeTriageFile("2026-04-20"); // 14 days old — outside default 7-day window
+    const found = findUnpostedTriageReports(
+      sandbox.dataDir,
+      dbFile(sandbox.dataDir),
+      { now: FIXED_NOW },
+    );
+    expect(found.map((f) => f.date)).toEqual(["2026-05-04", "2026-04-27"]);
+  });
+
+  it("filters out posted dates via slack-triage-surfaced events", () => {
+    writeTriageFile("2026-05-04");
+    writeTriageFile("2026-05-03");
+    recordSurfaced("2026-05-03");
+    const found = findUnpostedTriageReports(
+      sandbox.dataDir,
+      dbFile(sandbox.dataDir),
+      { now: FIXED_NOW },
+    );
+    expect(found.map((f) => f.date)).toEqual(["2026-05-04"]);
+  });
+
+  it("ignores files that don't match the YYYY-MM-DD.md pattern", () => {
+    writeTriageFile("2026-05-04");
+    fs.writeFileSync(
+      path.join(triageDir(sandbox.dataDir), "scratch.md"),
+      "x",
+    );
+    fs.writeFileSync(
+      path.join(triageDir(sandbox.dataDir), "draft.txt"),
+      "x",
+    );
+    const found = findUnpostedTriageReports(
+      sandbox.dataDir,
+      dbFile(sandbox.dataDir),
+      { now: FIXED_NOW },
+    );
+    expect(found.map((f) => f.date)).toEqual(["2026-05-04"]);
+  });
+
+  it("respects a custom maxAgeDays", () => {
+    writeTriageFile("2026-04-20"); // 14 days old
+    const found = findUnpostedTriageReports(
+      sandbox.dataDir,
+      dbFile(sandbox.dataDir),
+      { now: FIXED_NOW, maxAgeDays: 30 },
+    );
+    expect(found.map((f) => f.date)).toEqual(["2026-04-20"]);
+  });
+});
+
+describe("surfaceTriageReport", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("posts the triage to the inbox channel and records a slack-triage-surfaced event", async () => {
+    const dir = triageDir(sandbox.dataDir);
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, "2026-05-04.md");
+    fs.writeFileSync(
+      filePath,
+      "# Triage — 2026-05-04\n\n## Critical\n- **[HIGH]** test signal",
+    );
+
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const result = await surfaceTriageReport(ctx, {
+      filePath,
+      date: "2026-05-04",
+    });
+    expect(result.posted).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.channel).toBe("C-INBOX");
+    expect(posts[0]?.text).toContain("2026-05-04");
+
+    // Bold conversion happened (`**[HIGH]**` → `*[HIGH]*`)
+    const section = (posts[0]?.blocks as Array<{ type: string }>).find(
+      (b) => b.type === "section",
+    );
+    expect(section).toBeDefined();
+
+    const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const events = conn
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'slack-triage-surfaced'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(events).toHaveLength(1);
+      const payload = JSON.parse(events[0]!.payload);
+      expect(payload.date).toBe("2026-05-04");
+      expect(payload.channel).toBe("C-INBOX");
+      expect(payload.filePath).toBe(filePath);
+    } finally {
+      conn.close();
+    }
+  });
+
+  it("throws a clear error when the triage file is missing", async () => {
+    const { client } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    await expect(
+      surfaceTriageReport(ctx, {
+        filePath: "/no/such/file.md",
+        date: "2026-05-04",
+      }),
+    ).rejects.toThrow(/triage file unreadable/);
+  });
+});
+
+describe("runTriageDeliveryTick", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  const FIXED_NOW = new Date("2026-05-04T00:00:00.000Z");
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function writeTriageFile(date: string, body = "# Triage\nbody"): void {
+    const dir = triageDir(sandbox.dataDir);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${date}.md`), body);
+  }
+
+  it("posts each unposted triage exactly once across two ticks", async () => {
+    writeTriageFile("2026-05-04");
+    writeTriageFile("2026-04-30");
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const t1 = await runTriageDeliveryTick(ctx, { now: FIXED_NOW });
+    expect(t1.posted.sort()).toEqual(["2026-04-30", "2026-05-04"]);
+    expect(posts).toHaveLength(2);
+
+    const t2 = await runTriageDeliveryTick(ctx, { now: FIXED_NOW });
+    expect(t2.posted).toEqual([]);
+    expect(posts).toHaveLength(2);
+  });
+
+  it("doesn't replay reports older than maxAgeDays", async () => {
+    writeTriageFile("2026-04-20"); // 14 days old → outside default 7d
+    writeTriageFile("2026-05-04");
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const result = await runTriageDeliveryTick(ctx, { now: FIXED_NOW });
+    expect(result.posted).toEqual(["2026-05-04"]);
+    expect(posts).toHaveLength(1);
+  });
+
+  it("isolates per-file errors and continues with the rest", async () => {
+    writeTriageFile("2026-05-04");
+    writeTriageFile("2026-04-30");
+
+    let i = 0;
+    const client = {
+      chat: {
+        async postMessage(p: { text?: string; blocks: unknown[] }) {
+          i += 1;
+          if (p.text?.includes("2026-05-04")) {
+            return { ok: false, error: "channel_not_found" };
+          }
+          return { ok: true, ts: `1.${i}` };
+        },
+      },
+    } as never;
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const result = await runTriageDeliveryTick(ctx, { now: FIXED_NOW });
+    expect(result.posted).toEqual(["2026-04-30"]);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]?.date).toBe("2026-05-04");
   });
 });

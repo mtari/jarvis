@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import Database from "better-sqlite3";
 import type { WebClient } from "@slack/web-api";
 import { appendEvent } from "../../orchestrator/event-log.ts";
@@ -9,7 +11,7 @@ import {
 import type { Plan } from "../../orchestrator/plan.ts";
 import { isSuppressed } from "../../orchestrator/suppressions.ts";
 import type { SignalSeverity } from "../../tools/scanners/types.ts";
-import { dbFile } from "../../cli/paths.ts";
+import { dbFile, triageDir } from "../../cli/paths.ts";
 import {
   buildAmendmentReviewBlocks,
   type AmendmentEventData,
@@ -19,6 +21,7 @@ import {
   buildOutcomeContext,
 } from "./blocks/plan-review.ts";
 import { buildSignalAlertBlocks } from "./blocks/signal-alert.ts";
+import { buildTriageReportBlocks } from "./blocks/triage-report.ts";
 
 export interface SurfaceContext {
   dataDir: string;
@@ -586,6 +589,177 @@ export async function runAlertTick(
     } catch (err) {
       result.errors.push({
         signalEventId: candidate.signalEventId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Slice 3 — weekly triage delivery to #jarvis-inbox
+// ---------------------------------------------------------------------------
+
+const TRIAGE_FILE_RE = /^(\d{4}-\d{2}-\d{2})\.md$/;
+const DEFAULT_TRIAGE_MAX_AGE_DAYS = 7;
+
+export interface UnpostedTriage {
+  /** Absolute path to the markdown file. */
+  filePath: string;
+  /** YYYY-MM-DD basename — used as the dedup key. */
+  date: string;
+}
+
+/**
+ * Files in `<dataDir>/triage/` that match `YYYY-MM-DD.md`, are not
+ * older than `maxAgeDays`, and don't have a matching
+ * `slack-triage-surfaced` event yet. Most-recent-first.
+ *
+ * `maxAgeDays` exists so a fresh Slack-install doesn't replay months
+ * of historical triage files into the channel. Default 7 days — by
+ * the time you'd see a stale Monday report it's no longer current.
+ */
+export function findUnpostedTriageReports(
+  dataDir: string,
+  dbFilePath: string,
+  opts: { maxAgeDays?: number; now?: Date } = {},
+): UnpostedTriage[] {
+  const maxAge = opts.maxAgeDays ?? DEFAULT_TRIAGE_MAX_AGE_DAYS;
+  const now = opts.now ?? new Date();
+  const dir = triageDir(dataDir);
+  if (!fs.existsSync(dir)) return [];
+
+  // Posted dates from the event log
+  const posted = new Set<string>();
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    const rows = db
+      .prepare(
+        "SELECT payload FROM events WHERE kind = 'slack-triage-surfaced'",
+      )
+      .all() as Array<{ payload: string }>;
+    for (const r of rows) {
+      try {
+        const p = JSON.parse(r.payload) as { date?: string };
+        if (typeof p.date === "string") posted.add(p.date);
+      } catch {
+        // skip malformed
+      }
+    }
+  } finally {
+    db.close();
+  }
+
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+
+  const out: UnpostedTriage[] = [];
+  for (const name of entries) {
+    const m = name.match(TRIAGE_FILE_RE);
+    if (!m || !m[1]) continue;
+    const date = m[1];
+    if (posted.has(date)) continue;
+    const fileTime = new Date(`${date}T00:00:00Z`).getTime();
+    if (Number.isNaN(fileTime)) continue;
+    const ageDays = (now.getTime() - fileTime) / (24 * 60 * 60 * 1000);
+    if (ageDays > maxAge) continue;
+    if (ageDays < -1) continue; // file dated more than a day in the future — skip
+    out.push({ filePath: path.join(dir, name), date });
+  }
+  return out.sort((a, b) => b.date.localeCompare(a.date));
+}
+
+/**
+ * Posts a triage report to `#jarvis-inbox` and records a
+ * `slack-triage-surfaced` event keyed on the date. Idempotent —
+ * the next tick's `findUnpostedTriageReports` filters this date out.
+ */
+export async function surfaceTriageReport(
+  ctx: SurfaceContext,
+  triage: UnpostedTriage,
+): Promise<{ posted: boolean }> {
+  let markdown: string;
+  try {
+    markdown = fs.readFileSync(triage.filePath, "utf8");
+  } catch (err) {
+    throw new Error(
+      `triage file unreadable: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const blocks = buildTriageReportBlocks({
+    markdown,
+    date: triage.date,
+    filePath: triage.filePath,
+  });
+
+  const result = await ctx.client.chat.postMessage({
+    channel: ctx.inboxChannelId,
+    blocks,
+    text: `Triage — ${triage.date}`,
+  });
+
+  if (!result.ok || !result.ts) {
+    throw new Error(
+      `chat.postMessage failed (triage): ${result.error ?? "unknown"}`,
+    );
+  }
+
+  const conn = new Database(dbFile(ctx.dataDir));
+  try {
+    appendEvent(conn, {
+      // Triage is portfolio-level; no specific app/vault. Use the
+      // self-bootstrap conventions ("jarvis" / "personal") so the
+      // event row's NOT NULL constraints are satisfied without
+      // implying the report belongs to a particular app.
+      appId: "jarvis",
+      vaultId: "personal",
+      kind: "slack-triage-surfaced",
+      payload: {
+        date: triage.date,
+        channel: ctx.inboxChannelId,
+        messageTs: result.ts,
+        filePath: triage.filePath,
+      },
+    });
+  } finally {
+    conn.close();
+  }
+
+  return { posted: true };
+}
+
+export interface RunTriageDeliveryTickResult {
+  posted: string[];
+  errors: Array<{ date: string; error: string }>;
+}
+
+/**
+ * One delivery tick. Finds unposted triage files within the age
+ * window, posts each, records the surface event. Per-file errors
+ * isolated.
+ */
+export async function runTriageDeliveryTick(
+  ctx: SurfaceContext,
+  opts: { maxAgeDays?: number; now?: Date } = {},
+): Promise<RunTriageDeliveryTickResult> {
+  const result: RunTriageDeliveryTickResult = { posted: [], errors: [] };
+  const candidates = findUnpostedTriageReports(
+    ctx.dataDir,
+    dbFile(ctx.dataDir),
+    opts,
+  );
+  for (const candidate of candidates) {
+    try {
+      await surfaceTriageReport(ctx, candidate);
+      result.posted.push(candidate.date);
+    } catch (err) {
+      result.errors.push({
+        date: candidate.date,
         error: err instanceof Error ? err.message : String(err),
       });
     }
