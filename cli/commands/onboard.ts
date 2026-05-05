@@ -10,11 +10,21 @@ import {
 } from "../../agents/onboard.ts";
 import type { RunAgentTransport } from "../../orchestrator/agent-sdk-runtime.ts";
 import { saveBrain } from "../../orchestrator/brain.ts";
+import {
+  cacheRelativePath,
+  defaultFetchUrl,
+  docIdFromSource,
+  isUrl,
+  loadDocSource,
+  saveDocsIndex,
+  writeCachedDocContent,
+  type DocEntry,
+  type FetchUrl,
+} from "../../orchestrator/docs.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import {
   brainDir,
-  brainDocsFile,
   brainFile,
   dbFile,
   envFile,
@@ -27,11 +37,10 @@ export interface OnboardCommandDeps {
   /** Test injection — overrides the SDK transport. */
   transport?: RunAgentTransport;
   /** For tests: skip the network and return a stub for any URL doc fetch. */
-  fetchUrl?: (url: string) => Promise<{ content: string; contentType?: string }>;
+  fetchUrl?: FetchUrl;
 }
 
 const APP_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$/;
-const MAX_DOC_BYTES = 256 * 1024;
 
 interface DocsArgs {
   absorb: string[];
@@ -128,11 +137,14 @@ export async function runOnboard(
   }>;
   try {
     absorbedDocs = await Promise.all(
-      docsArgs.absorb.map((src) => loadDoc(src, fetchUrl)),
+      docsArgs.absorb.map(async (src) => {
+        const doc = await loadDocSource(src, fetchUrl);
+        return { source: doc.source, content: doc.content };
+      }),
     );
     cachedDocs = await Promise.all(
       docsArgs.keep.map(async (src) => {
-        const doc = await loadDoc(src, fetchUrl);
+        const doc = await loadDocSource(src, fetchUrl);
         return {
           summary: {
             id: docIdFromSource(src),
@@ -179,14 +191,12 @@ export async function runOnboard(
   fs.mkdirSync(path.join(brainFolder, "research"), { recursive: true });
   fs.mkdirSync(planDir(dataDir, vault, app), { recursive: true });
 
-  const docsIndex: Array<Record<string, unknown>> = [];
+  const addedAt = new Date().toISOString();
+  const docsIndex: DocEntry[] = [];
 
   // Cache the kept docs to brains/<app>/docs/<id>/
   for (const c of cachedDocs) {
-    const cacheDir = path.join(brainFolder, "docs", c.summary.id);
-    fs.mkdirSync(cacheDir, { recursive: true });
-    const filename = "content.txt";
-    fs.writeFileSync(path.join(cacheDir, filename), c.content);
+    writeCachedDocContent(dataDir, vault, app, c.summary.id, c.content);
     docsIndex.push({
       id: c.summary.id,
       kind: isUrl(c.summary.source) ? "url" : "file",
@@ -194,9 +204,10 @@ export async function runOnboard(
       source: c.summary.source,
       title: c.summary.id,
       tags: [],
-      addedAt: new Date().toISOString(),
+      addedAt,
       summary: c.summary.summary ?? "",
-      cachedFile: `docs/${c.summary.id}/${filename}`,
+      cachedFile: cacheRelativePath(c.summary.id),
+      ...(isUrl(c.summary.source) ? { refreshedAt: addedAt } : {}),
     });
   }
   // Record absorbed docs as a stub entry (originals not retained per §7)
@@ -208,14 +219,11 @@ export async function runOnboard(
       source: a.source,
       title: docIdFromSource(a.source),
       tags: [],
-      addedAt: new Date().toISOString(),
+      addedAt,
       summary: "Absorbed at onboard; content extracted into brain.",
     });
   }
-  fs.writeFileSync(
-    brainDocsFile(dataDir, vault, app),
-    JSON.stringify(docsIndex, null, 2) + "\n",
-  );
+  saveDocsIndex(dataDir, vault, app, docsIndex);
 
   // Force `repo` onto the brain from the user's --repo + --monorepo-path
   // flags. The agent's prompt doesn't compose this (the SDK isn't told the
@@ -344,67 +352,3 @@ function resolveRepoRoot(
   return { ok: true, path: resolved };
 }
 
-async function loadDoc(
-  source: string,
-  fetcher: (url: string) => Promise<{ content: string; contentType?: string }>,
-): Promise<AbsorbedDoc> {
-  if (isUrl(source)) {
-    const fetched = await fetcher(source);
-    return {
-      source,
-      content: truncate(fetched.content, MAX_DOC_BYTES, source),
-    };
-  }
-  if (!path.isAbsolute(source)) {
-    throw new Error(
-      `doc path must be absolute or a URL (got "${source}")`,
-    );
-  }
-  if (!fs.existsSync(source)) {
-    throw new Error(`doc not found: ${source}`);
-  }
-  const stat = fs.statSync(source);
-  if (!stat.isFile()) {
-    throw new Error(`doc is not a regular file: ${source}`);
-  }
-  const buf = fs.readFileSync(source);
-  return {
-    source,
-    content: truncate(buf.toString("utf8"), MAX_DOC_BYTES, source),
-  };
-}
-
-function truncate(text: string, max: number, source: string): string {
-  if (text.length <= max) return text;
-  return (
-    text.slice(0, max) +
-    `\n\n[truncated at ${max} bytes; original ${text.length} bytes from ${source}]`
-  );
-}
-
-function isUrl(source: string): boolean {
-  return /^https?:\/\//i.test(source);
-}
-
-function docIdFromSource(source: string): string {
-  const base = isUrl(source)
-    ? new URL(source).hostname + new URL(source).pathname.replace(/\W+/g, "-")
-    : path.basename(source);
-  return base
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 60);
-}
-
-async function defaultFetchUrl(
-  url: string,
-): Promise<{ content: string; contentType?: string }> {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`fetch ${url} failed: HTTP ${response.status}`);
-  }
-  const content = await response.text();
-  const contentType = response.headers.get("content-type") ?? undefined;
-  return contentType !== undefined ? { content, contentType } : { content };
-}
