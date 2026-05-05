@@ -9,6 +9,10 @@ import {
   type PlanRecord,
 } from "../../orchestrator/plan-store.ts";
 import type { Plan } from "../../orchestrator/plan.ts";
+import {
+  listPendingSetupTasks,
+  type SetupTask,
+} from "../../orchestrator/setup-tasks.ts";
 import { isSuppressed } from "../../orchestrator/suppressions.ts";
 import type { SignalSeverity } from "../../tools/scanners/types.ts";
 import { dbFile, triageDir } from "../../cli/paths.ts";
@@ -20,6 +24,7 @@ import {
   buildPlanReviewBlocks,
   buildOutcomeContext,
 } from "./blocks/plan-review.ts";
+import { buildSetupTaskBlocks } from "./blocks/setup-task.ts";
 import { buildSignalAlertBlocks } from "./blocks/signal-alert.ts";
 import { buildTriageReportBlocks } from "./blocks/triage-report.ts";
 
@@ -760,6 +765,113 @@ export async function runTriageDeliveryTick(
     } catch (err) {
       result.errors.push({
         date: candidate.date,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Slice 4 — setup-task delivery to #jarvis-inbox
+// ---------------------------------------------------------------------------
+
+export interface UnsurfacedSetupTask {
+  task: SetupTask;
+}
+
+/**
+ * Pending setup tasks that don't yet have a `slack-setup-task-surfaced`
+ * event. Most-recent-first by `createdAt`.
+ */
+export function findUnsurfacedSetupTasks(
+  dataDir: string,
+  dbFilePath: string,
+): UnsurfacedSetupTask[] {
+  const tasks = listPendingSetupTasks(dataDir);
+  if (tasks.length === 0) return [];
+
+  const surfaced = new Set<string>();
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    const rows = db
+      .prepare(
+        "SELECT payload FROM events WHERE kind = 'slack-setup-task-surfaced'",
+      )
+      .all() as Array<{ payload: string }>;
+    for (const r of rows) {
+      try {
+        const p = JSON.parse(r.payload) as { taskId?: string };
+        if (typeof p.taskId === "string") surfaced.add(p.taskId);
+      } catch {
+        // skip malformed
+      }
+    }
+  } finally {
+    db.close();
+  }
+
+  return tasks
+    .filter((t) => !surfaced.has(t.id))
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+    .map((task) => ({ task }));
+}
+
+/**
+ * Posts a setup task and records a `slack-setup-task-surfaced` event.
+ * Idempotent at the tick layer (caller filters via `findUnsurfacedSetupTasks`).
+ */
+export async function surfaceSetupTask(
+  ctx: SurfaceContext,
+  task: SetupTask,
+): Promise<{ posted: boolean }> {
+  const blocks = buildSetupTaskBlocks({ task });
+  const result = await ctx.client.chat.postMessage({
+    channel: ctx.inboxChannelId,
+    blocks,
+    text: `Setup task: ${task.title}`,
+  });
+  if (!result.ok || !result.ts) {
+    throw new Error(
+      `chat.postMessage failed (setup-task): ${result.error ?? "unknown"}`,
+    );
+  }
+  const conn = new Database(dbFile(ctx.dataDir));
+  try {
+    appendEvent(conn, {
+      appId: "jarvis",
+      vaultId: "personal",
+      kind: "slack-setup-task-surfaced",
+      payload: {
+        taskId: task.id,
+        title: task.title,
+        channel: ctx.inboxChannelId,
+        messageTs: result.ts,
+      },
+    });
+  } finally {
+    conn.close();
+  }
+  return { posted: true };
+}
+
+export interface RunSetupTaskDeliveryTickResult {
+  posted: string[];
+  errors: Array<{ taskId: string; error: string }>;
+}
+
+export async function runSetupTaskDeliveryTick(
+  ctx: SurfaceContext,
+): Promise<RunSetupTaskDeliveryTickResult> {
+  const result: RunSetupTaskDeliveryTickResult = { posted: [], errors: [] };
+  const candidates = findUnsurfacedSetupTasks(ctx.dataDir, dbFile(ctx.dataDir));
+  for (const candidate of candidates) {
+    try {
+      await surfaceSetupTask(ctx, candidate.task);
+      result.posted.push(candidate.task.id);
+    } catch (err) {
+      result.errors.push({
+        taskId: candidate.task.id,
         error: err instanceof Error ? err.message : String(err),
       });
     }

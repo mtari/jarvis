@@ -12,6 +12,7 @@ import {
 import { registerHandlers } from "./handlers.ts";
 import {
   runAlertTick,
+  runSetupTaskDeliveryTick,
   runSurfaceTick,
   runTriageDeliveryTick,
   type AlertContext,
@@ -40,6 +41,12 @@ export interface SlackServiceOptions {
    * `true`. Set `false` to keep triage CLI-only.
    */
   triageDeliveryEnabled?: boolean;
+  /**
+   * Whether the surface tick should also deliver pending setup tasks
+   * to `#jarvis-inbox`. Default `true`. Set `false` to keep setup
+   * tasks CLI-only.
+   */
+  setupTaskDeliveryEnabled?: boolean;
   /** Allow tests to inject a fake client (skip the real Bolt connection). */
   buildBoltApp?: (opts: {
     botToken: string;
@@ -82,6 +89,7 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
   const alertThreshold: SignalSeverity | null =
     opts.alertThreshold === undefined ? "high" : opts.alertThreshold;
   const triageDeliveryEnabled = opts.triageDeliveryEnabled ?? true;
+  const setupTaskDeliveryEnabled = opts.setupTaskDeliveryEnabled ?? true;
 
   return {
     name: "slack",
@@ -190,6 +198,22 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
             }
           } catch (err) {
             ctx.logger.error("triage delivery tick errored", err);
+          }
+        }
+        if (setupTaskDeliveryEnabled) {
+          try {
+            const setup = await runSetupTaskDeliveryTick(surfaceCtxFor());
+            if (setup.posted.length > 0) {
+              ctx.logger.info("delivered setup tasks to slack", {
+                count: setup.posted.length,
+                taskIds: setup.posted,
+              });
+            }
+            for (const e of setup.errors) {
+              ctx.logger.error("setup-task delivery failed", null, e);
+            }
+          } catch (err) {
+            ctx.logger.error("setup-task delivery tick errored", err);
           }
         }
       };

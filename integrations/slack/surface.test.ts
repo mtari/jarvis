@@ -13,6 +13,7 @@ import { findPlan } from "../../orchestrator/plan-store.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { triageDir } from "../../cli/paths.ts";
+import { appendSetupTask } from "../../orchestrator/setup-tasks.ts";
 import { suppress } from "../../orchestrator/suppressions.ts";
 import {
   findAmendmentSurfaceRecord,
@@ -20,11 +21,14 @@ import {
   findSurfaceRecord,
   findUnpostedAlertableSignals,
   findUnpostedTriageReports,
+  findUnsurfacedSetupTasks,
   runAlertTick,
+  runSetupTaskDeliveryTick,
   runSurfaceTick,
   runTriageDeliveryTick,
   surfaceAmendmentReview,
   surfacePlan,
+  surfaceSetupTask,
   surfaceSignalAlert,
   surfaceTriageReport,
   updateSurfacedPlan,
@@ -1060,5 +1064,205 @@ describe("runTriageDeliveryTick", () => {
     expect(result.posted).toEqual(["2026-04-30"]);
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]?.date).toBe("2026-05-04");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Slice 4: setup-task delivery
+// ---------------------------------------------------------------------------
+
+describe("findUnsurfacedSetupTasks", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function recordSurfaced(taskId: string): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: "jarvis",
+        vaultId: "personal",
+        kind: "slack-setup-task-surfaced",
+        payload: { taskId },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("returns empty when there are no pending tasks", () => {
+    expect(
+      findUnsurfacedSetupTasks(sandbox.dataDir, dbFile(sandbox.dataDir)),
+    ).toEqual([]);
+  });
+
+  it("returns pending tasks most-recent-first", () => {
+    appendSetupTask(sandbox.dataDir, {
+      id: "old",
+      title: "older",
+      createdAt: "2026-05-01T00:00:00Z",
+    });
+    appendSetupTask(sandbox.dataDir, {
+      id: "new",
+      title: "newer",
+      createdAt: "2026-05-05T00:00:00Z",
+    });
+    const found = findUnsurfacedSetupTasks(
+      sandbox.dataDir,
+      dbFile(sandbox.dataDir),
+    );
+    expect(found.map((u) => u.task.id)).toEqual(["new", "old"]);
+  });
+
+  it("filters out tasks with a slack-setup-task-surfaced event", () => {
+    appendSetupTask(sandbox.dataDir, {
+      id: "shown",
+      title: "x",
+      createdAt: "2026-05-05T00:00:00Z",
+    });
+    appendSetupTask(sandbox.dataDir, {
+      id: "fresh",
+      title: "y",
+      createdAt: "2026-05-05T00:00:00Z",
+    });
+    recordSurfaced("shown");
+    const found = findUnsurfacedSetupTasks(
+      sandbox.dataDir,
+      dbFile(sandbox.dataDir),
+    );
+    expect(found.map((u) => u.task.id)).toEqual(["fresh"]);
+  });
+});
+
+describe("surfaceSetupTask", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("posts to the inbox channel and records a slack-setup-task-surfaced event", async () => {
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const result = await surfaceSetupTask(ctx, {
+      id: "stripe",
+      title: "Set the Stripe key",
+      createdAt: "2026-05-05T10:00:00Z",
+    });
+    expect(result.posted).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.channel).toBe("C-INBOX");
+    expect(posts[0]?.text).toContain("Set the Stripe key");
+
+    const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const events = conn
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'slack-setup-task-surfaced'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(events).toHaveLength(1);
+      expect(JSON.parse(events[0]!.payload)).toMatchObject({
+        taskId: "stripe",
+        title: "Set the Stripe key",
+        channel: "C-INBOX",
+      });
+    } finally {
+      conn.close();
+    }
+  });
+});
+
+describe("runSetupTaskDeliveryTick", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("posts each pending task exactly once across two ticks", async () => {
+    appendSetupTask(sandbox.dataDir, {
+      id: "a",
+      title: "first",
+      createdAt: "2026-05-05T09:00:00Z",
+    });
+    appendSetupTask(sandbox.dataDir, {
+      id: "b",
+      title: "second",
+      createdAt: "2026-05-05T10:00:00Z",
+    });
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const t1 = await runSetupTaskDeliveryTick(ctx);
+    expect(t1.posted.sort()).toEqual(["a", "b"]);
+    expect(posts).toHaveLength(2);
+
+    const t2 = await runSetupTaskDeliveryTick(ctx);
+    expect(t2.posted).toEqual([]);
+    expect(posts).toHaveLength(2);
+  });
+
+  it("isolates per-task errors", async () => {
+    appendSetupTask(sandbox.dataDir, {
+      id: "ok",
+      title: "ok-task",
+      createdAt: "2026-05-05T09:00:00Z",
+    });
+    appendSetupTask(sandbox.dataDir, {
+      id: "fail",
+      title: "fail-task",
+      createdAt: "2026-05-05T10:00:00Z",
+    });
+    let i = 0;
+    const client = {
+      chat: {
+        async postMessage(p: { text?: string; blocks: unknown[] }) {
+          i += 1;
+          if (p.text?.includes("fail-task")) {
+            return { ok: false, error: "channel_not_found" };
+          }
+          return { ok: true, ts: `1.${i}` };
+        },
+      },
+    } as never;
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const result = await runSetupTaskDeliveryTick(ctx);
+    expect(result.posted).toEqual(["ok"]);
+    expect(result.errors.map((e) => e.taskId)).toEqual(["fail"]);
   });
 });
