@@ -79,11 +79,17 @@ Plans are drafted by the Strategist via two paths, both converging on the same r
 
 ### Open channels (no plan commitment)
 
-Two modes operate outside the plan-review flow. Both feed the feedback store (§7) so they still inform learning.
+Four modes operate outside the plan-review flow. All feed the feedback store (§7) so they still inform learning.
 
-- **Discussion / chat.** Share a half-formed idea, ask "should I X?", or think out loud with the right agent (Strategist for plan-shaped thinking, Scout for opportunities, Marketer for content angles, Analyst for stats interpretation). Possible outcomes: a refined brief you submit later, an automatic plan draft if intent solidifies, an updated entry in the idea pool, or just a closed conversation.
-  - CLI: `yarn jarvis chat --app <name> "<thought>"`
-  - Slack: DM the bot, or thread a reply on any plan/inbox message.
+- **Discussion (`discuss`).** Multi-turn, multi-agent, multi-output conversation — the way two co-owners talk in a meeting. Strategist leads, Scout pulled in for ideation, Analyst pulled in for facts, Marketer pulled in for content angles. Possible outcomes: a refined brief, an auto-drafted plan, an idea added to `Business_Ideas.md`, a note appended (see below), a setup task created, or just "we talked it through." Each conversation is logged as a `conversation` event. Turn cap 20 with an explicit "wrap this up" exit at any point.
+  - CLI: `yarn jarvis discuss --app <name>`
+  - Slack: `/jarvis discuss <app> "<topic>"` opens a thread; replies in the thread continue the conversation.
+- **Free-text notes.** Each app has a `notes.md` at `<dataDir>/vaults/<vault>/brains/<app>/notes.md` — a free-text whiteboard the user appends to whenever, that Strategist / Scout / Developer all read into their context. Mental model: the meeting whiteboard for the project; the brain (§7) stays the structured spec.
+  - CLI: `yarn jarvis notes <app> [--append "..."]` (no `--append` opens `$EDITOR`)
+  - Slack: `/jarvis notes <app> <text>` appends with timestamp + author.
+- **Natural-language commands (`ask`).** Translate free-text requests like "what's on fire?" or "show me last week's signals for erdei-fahazak" into the underlying CLI commands. Single LLM call routes the intent; ambiguous requests get a clarifying question rather than a guess. Destructive ops (approve / reject / cancel) require an explicit button confirm before execution.
+  - CLI: `yarn jarvis ask "<text>"`
+  - Slack: `/jarvis ask "<text>"`
 - **Content review.** Hand Jarvis a draft (post, blog, video script, newsletter) for critique — voice, structure, persuasion, accuracy, alignment with brand + user-profile voice. Marketer (with Strategist where relevant) returns annotated feedback or a proposed rewrite (humanized per §13). No plan is created; the result is a critique you act on yourself.
   - CLI: `yarn jarvis review-content --app <name> [--file <path> | --inline "<text>"] [--format post|blog|video-script|newsletter]`
   - Slack: paste content in DM with `/jarvis review`, or react to a Slack message with the `:jarvis-review:` emoji.
@@ -145,7 +151,7 @@ Earlier drafts considered up to 10 agents with a dedicated scrum master, busines
 
 ## 4. The plan artifact
 
-Every plan is a one-page markdown file. Three sub-templates — one per plan type — share a common envelope (front-matter + closing sections) and differ in the body. Longer plans silently cap your review throughput, so one-page is enforced.
+Every plan is a markdown file. Three sub-templates — one per plan type — share a common envelope (front-matter + closing sections) and differ in the body. Plans run as long as the work needs: every subsystem named, rollback at a level a different engineer could execute against, every call-site or interface that the change touches enumerated. The earlier "one-page max" cap was relaxed in Phase 2.5 (§16) — short plans hide detail and miss subsystems; long plans surface them, even if review takes longer. The voice rules (terse, active, no padding, no rule-of-three) still apply at every length.
 
 Plans live in `jarvis-data/plans/[app]/[plan-id].md` (git-tracked in the data repo). Template files live in `jarvis/plan-templates/` (git-tracked in the code repo — they ship with Jarvis).
 
@@ -1263,6 +1269,28 @@ Once the code-repo structure is in place, write `jarvis/CLAUDE.md` (the repo-lev
 
 **Exit (met):** Slack is the primary inbox. Every plan review, amendment, signal alert, triage report, setup task, and runtime escalation reaches the user in `#jarvis-inbox` or `#jarvis-alerts` with enough context to decide approve / revise / reject / acknowledge without dropping into the CLI. The original Phase 2 exit (Monday triage report influencing what plan gets drafted next) shipped via the Analyst + Scout tracks; the Slack-primary buildout makes that surface the default channel.
 
+### Phase 2.5 — Conversational interface (between Phase 2 and Phase 3)
+
+**Goal:** make Jarvis feel like a peer, not a CLI. Lower the friction on three axes: free-form context capture, plan size, and how the user gives direction.
+
+**Scope:**
+
+1. **Plan size cap relaxation** — prompts in `prompts/strategist-*.md` drop "one page max" / "3-5 lines per section". Plans run as long as needed for clarity (see §4): every subsystem named, rollback at a level a different engineer could execute, but no padding. Trade-off: the original cap guarded against rambling plans; we accept that risk to recover detail.
+
+2. **Free-text notes** — each app gets a `notes.md` at `<dataDir>/vaults/<vault>/brains/<app>/notes.md`. The user appends free-form thoughts whenever, and Strategist / Scout / Developer all read it into their context. Mental model: the meeting whiteboard for the project; the brain (§7) stays the structured spec. New CLI: `yarn jarvis notes <app> [--append "..."]`. New Slack: `/jarvis notes <app> <text>`.
+
+3. **Natural language → commands** — single LLM call routes free-text requests like "what's on fire?" into existing commands (here: `triage`). Ambiguous requests get a clarifying question rather than a guess. Destructive ops (approve / reject / cancel) require an explicit button confirm. New CLI: `yarn jarvis ask "<text>"`. New Slack: `/jarvis ask "<text>"`. Removes the "memorize every subcommand" burden — `--help` becomes a fallback, not a daily tool.
+
+4. **Discussion mode** — multi-turn, multi-agent, multi-output conversation in a Slack thread or a CLI loop. Strategist leads; Scout / Analyst / Marketer pulled in by topic. Outputs include a plan draft, a `Business_Ideas.md` entry, a note appended (per #2), a setup task, or just a closed conversation. Logged as `conversation` events. New CLI: `yarn jarvis discuss --app <name>`. Slack: `/jarvis discuss <app> "<topic>"` opens a thread. Turn cap 20 with explicit "wrap this up" exit. Replaces the original `chat` command (which was specced but unbuilt — see §17).
+
+**Recommended order:** 1 → 2 → 3 → 4. #1 is a tiny prompt edit; #2 is foundational (other features read notes); #3 removes the memorize-every-command burden; #4 lands last because it's the biggest and benefits from #2 (notes as one possible output) and the docs system below (notes alone aren't enough for grounded discussion).
+
+**Companion track — docs system** (`docs add / list / refresh / reabsorb / remove`). Already specified in §10 + §17 but unbuilt. Lands as part of Phase 2.5 since adding a URL / PDF / file is a natural extension of adding a note. Two modes:
+- **Cache mode** (`docs add --keep <path-or-url>`) — retains full content, refreshes on TTL. Useful for living references (a partner's API docs, an evolving brand guide).
+- **Absorb mode** (`docs add <path-or-url>`) — drafts a brain-update plan from doc content. Useful for one-shot artifacts (a kickoff brief, a competitor PDF).
+
+**Exit:** the user can run a full daily session in Slack — open a discussion, drop a note, ask a natural-language question, see the output — without remembering any specific command name. Plans are detailed enough to execute against.
+
 ### Phase 3 — Marketer + marketing plan loop (Week 7–8)
 - Marketer agent
 - Facebook + Instagram tools (requires setup tasks)
@@ -1352,6 +1380,8 @@ All commands prefixed `yarn jarvis ...`. Grouped by purpose.
 | `docs reabsorb --app <name> <id> <path-or-url>` | Re-supply an absorbed doc (or its replacement) for deeper re-extraction; drafts a new brain-update plan. |
 | `profile` | Show a summary of the current user profile. |
 | `profile edit` | Open `jarvis-data/user-profile.json` in `$EDITOR`. |
+| `notes <app>` | Open `<dataDir>/vaults/<vault>/brains/<app>/notes.md` in `$EDITOR` for free-text project notes. Read by Strategist / Scout / Developer when constructing context. Mental model: meeting whiteboard. The brain stays the structured spec; notes are where you drop in-flight thoughts. |
+| `notes <app> --append "<text>"` | Append a timestamped line to the app's `notes.md` without opening the editor. Slack equivalent: `/jarvis notes <app> <text>`. |
 
 ### Plan workflow
 | Command | Purpose |
@@ -1405,7 +1435,8 @@ All commands prefixed `yarn jarvis ...`. Grouped by purpose.
 ### Open channels (no plan commitment)
 | Command | Purpose |
 |---------|---------|
-| `chat --app <name> "<thought>"` | Open a discussion thread with the appropriate agent (Strategist / Scout / Marketer / Analyst). May produce a refined brief, an auto-drafted plan, an idea-pool entry, or just a closed conversation. Logged to feedback store. |
+| `discuss --app <name>` | Multi-turn, multi-agent, multi-output conversation — the way two co-owners talk in a meeting. Strategist leads; Scout / Analyst / Marketer pulled in by topic. Outputs include a plan draft, a `Business_Ideas.md` entry, a note appended (see `notes`), a setup task, or just a closed conversation. Logged as `conversation` events. Turn cap 20; explicit "wrap this up" exit at any point. Slack: `/jarvis discuss <app> "<topic>"` opens a thread. Replaces the original `chat` command (specced but unbuilt). |
+| `ask "<text>"` | Translate a natural-language request into one or more Jarvis commands and run them (with button confirm gate for destructive ops). Useful when you don't remember the exact subcommand. Slack: `/jarvis ask "<text>"`. |
 | `review-content --app <name> [--file <path> \| --inline "<text>"] [--format post\|blog\|video-script\|newsletter]` | Hand Jarvis a draft for critique. Marketer (and Strategist where relevant) return annotated feedback or proposed rewrite. No plan is created. |
 
 ### Observability
