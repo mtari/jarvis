@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import type { KnownBlock } from "@slack/types";
 import type { WebClient } from "@slack/web-api";
 import {
   buildDiscussInitialContext,
@@ -286,11 +287,14 @@ export async function startDiscussConversation(
   });
 
   // Step 3: render + post Jarvis's reply in the thread.
-  const renderedReply = renderTurnForSlack(first.turn);
+  const renderedReply = renderTurnForSlack(first.turn, threadTs);
   await input.ctx.client.chat.postMessage({
     channel: input.channel,
     thread_ts: threadTs,
     text: renderedReply.text,
+    ...(renderedReply.blocks !== undefined && {
+      blocks: renderedReply.blocks as never,
+    }),
   });
 
   // Step 4: persist the conversation start event.
@@ -456,11 +460,14 @@ async function processNextTurn(
     client: input.ctx.anthropic,
     conversation,
   });
-  const rendered = renderTurnForSlack(result.turn);
+  const rendered = renderTurnForSlack(result.turn, input.threadTs);
   await input.ctx.client.chat.postMessage({
     channel: input.channel,
     thread_ts: input.threadTs,
     text: rendered.text,
+    ...(rendered.blocks !== undefined && {
+      blocks: rendered.blocks as never,
+    }),
   });
 
   const db = new Database(dbFile(input.ctx.dataDir));
@@ -513,9 +520,68 @@ async function processNextTurn(
 
 interface RenderedTurn {
   text: string;
+  /**
+   * Block Kit blocks for proposal turns (so the user can click Accept
+   * or Drop instead of typing y/n). Continue / close turns are
+   * text-only — undefined.
+   */
+  blocks?: KnownBlock[];
 }
 
-function renderTurnForSlack(turn: DiscussTurnResult): RenderedTurn {
+/**
+ * Builds Block Kit blocks for a proposal turn — header / section /
+ * actions row with two buttons (Accept primary, Drop danger). The
+ * action `value` is the thread_ts so the handler can route by
+ * `(channel, thread_ts)` via `findDiscussConversation`.
+ *
+ * Refinement text is still supported via plain replies in the thread —
+ * the buttons are an additional fast path for the common y/n case.
+ */
+function buildProposalBlocks(args: {
+  threadTs: string;
+  headerText: string;
+  bodyText: string;
+}): KnownBlock[] {
+  return [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `*${args.headerText}*\n${args.bodyText}` },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Accept", emoji: true },
+          style: "primary",
+          action_id: "discuss_accept",
+          value: args.threadTs,
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Drop", emoji: true },
+          style: "danger",
+          action_id: "discuss_drop",
+          value: args.threadTs,
+        },
+      ],
+    },
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: "_Or reply with refinement text to keep the conversation going._",
+        },
+      ],
+    },
+  ];
+}
+
+function renderTurnForSlack(
+  turn: DiscussTurnResult,
+  threadTs: string,
+): RenderedTurn {
   switch (turn.kind) {
     case "continue":
       return { text: turn.text };
@@ -523,39 +589,39 @@ function renderTurnForSlack(turn: DiscussTurnResult): RenderedTurn {
       return { text: `_(closing thread)_ ${turn.text}` };
     case "propose-plan":
       return {
-        text: [
-          "*Proposed plan*",
-          turn.brief,
-          "",
-          "Reply *y* to accept, *n* to drop, or anything else to refine.",
-        ].join("\n"),
+        text: `Proposed plan — ${turn.brief.slice(0, 80)}`,
+        blocks: buildProposalBlocks({
+          threadTs,
+          headerText: "Proposed plan",
+          bodyText: turn.brief,
+        }),
       };
     case "propose-idea":
       return {
-        text: [
-          `*Proposed idea: ${turn.title}*`,
-          turn.brief,
-          "",
-          "Reply *y* to save to `Business_Ideas.md`, *n* to drop, or text to refine.",
-        ].join("\n"),
+        text: `Proposed idea: ${turn.title}`,
+        blocks: buildProposalBlocks({
+          threadTs,
+          headerText: `Proposed idea: ${turn.title}`,
+          bodyText: turn.brief,
+        }),
       };
     case "propose-note":
       return {
-        text: [
-          "*Proposed note*",
-          turn.text,
-          "",
-          "Reply *y* to append to the app's `notes.md`, *n* to drop, or text to refine.",
-        ].join("\n"),
+        text: `Proposed note — ${turn.text.slice(0, 80)}`,
+        blocks: buildProposalBlocks({
+          threadTs,
+          headerText: "Proposed note",
+          bodyText: turn.text,
+        }),
       };
     case "propose-setup-task":
       return {
-        text: [
-          `*Proposed setup task: ${turn.title}*`,
-          turn.detail,
-          "",
-          "Reply *y* to create, *n* to drop, or text to refine.",
-        ].join("\n"),
+        text: `Proposed setup task: ${turn.title}`,
+        blocks: buildProposalBlocks({
+          threadTs,
+          headerText: `Proposed setup task: ${turn.title}`,
+          bodyText: turn.detail,
+        }),
       };
   }
 }

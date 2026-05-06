@@ -58,7 +58,10 @@ interface Harness {
   ctx: HandlerContext;
 }
 
-function setupHarness(sandbox: InstallSandbox): Harness {
+function setupHarness(
+  sandbox: InstallSandbox,
+  opts: { anthropic?: AnthropicClient } = {},
+): Harness {
   const recording = recordingClient();
   const surfaceCtx: SurfaceContext = {
     dataDir: sandbox.dataDir,
@@ -72,7 +75,7 @@ function setupHarness(sandbox: InstallSandbox): Harness {
   const ctx: HandlerContext = {
     dataDir: sandbox.dataDir,
     surfaceCtx,
-    getAnthropicClient: () => fakeAnthropicClient(),
+    getAnthropicClient: () => opts.anthropic ?? fakeAnthropicClient(),
     log: (msg) => {
       logs.push(msg);
     },
@@ -116,6 +119,8 @@ describe("registerHandlers", () => {
         "escalation_acknowledge",
         "post_approve",
         "post_skip",
+        "discuss_accept",
+        "discuss_drop",
       ]),
     );
     expect(new Set(fake.registeredViewIds())).toEqual(
@@ -461,5 +466,194 @@ describe("escalation_acknowledge action", () => {
     expect(recording.updates).toHaveLength(1);
     const blocks = recording.updates[0]?.blocks as Array<{ type: string }>;
     expect(blocks.find((b) => b.type === "actions")).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// discuss_accept / discuss_drop action handlers
+// ---------------------------------------------------------------------------
+
+describe("discuss action handlers", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  /**
+   * Pre-seeds the events that `findDiscussConversation` needs:
+   * `discuss-conversation-started` (with raw assistant text containing
+   * a propose-note proposal). Returns the threadTs the buttons would
+   * carry as their value.
+   */
+  function seedConversationWithProposal(): {
+    threadTs: string;
+    conversationId: string;
+  } {
+    const threadTs = "1700000000.999";
+    const conversationId = "discuss-2026-04-08-abcd1234";
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: "demo",
+        vaultId: "personal",
+        kind: "discuss-conversation-started",
+        payload: {
+          conversationId,
+          app: "demo",
+          vault: "personal",
+          channel: "C-INBOX",
+          threadTs,
+          topic: "x",
+          rawAssistantText:
+            "<propose-note>address-step is the funnel killer</propose-note>",
+        },
+      });
+    } finally {
+      conn.close();
+    }
+    return { threadTs, conversationId };
+  }
+
+  it("discuss_accept fires the outcome (note appended) + closes conversation", async () => {
+    const { threadTs } = seedConversationWithProposal();
+    const { fake, recording } = setupHarness(sandbox);
+    await fake.invokeAction("discuss_accept", {
+      action: { type: "button", value: threadTs },
+      body: {
+        type: "block_actions",
+        user: { id: "U-rev" },
+        channel: { id: "C-INBOX" },
+        message: { ts: "1700000000.998", blocks: [{ type: "actions" }] },
+      },
+      client: recording.client,
+    });
+    // Note appended via the outcome.
+    const notesPath = path.join(
+      sandbox.dataDir,
+      "vaults",
+      "personal",
+      "brains",
+      "demo",
+      "notes.md",
+    );
+    expect(fs.existsSync(notesPath)).toBe(true);
+    expect(fs.readFileSync(notesPath, "utf8")).toContain("address-step");
+
+    // closed event recorded.
+    const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const closed = conn
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'discuss-conversation-closed'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(closed).toHaveLength(1);
+    } finally {
+      conn.close();
+    }
+
+    // Buttons stripped from the original proposal message.
+    expect(recording.updates).toHaveLength(1);
+    expect(recording.updates[0]?.text).toContain("Accepted by <@U-rev>");
+  });
+
+  it("discuss_drop folds rejection into next turn (continues, doesn't close)", async () => {
+    const { threadTs } = seedConversationWithProposal();
+    const { fake, recording } = setupHarness(sandbox, {
+      anthropic: {
+        async chat() {
+          const text = "<continue>OK what would you change?</continue>";
+          return {
+            text,
+            blocks: [{ type: "text", text }],
+            stopReason: "end_turn",
+            model: "claude-sonnet-4-6",
+            usage: {
+              inputTokens: 0,
+              outputTokens: 0,
+              cachedInputTokens: 0,
+              cacheCreationTokens: 0,
+            },
+            redactions: [],
+          };
+        },
+      },
+    });
+    await fake.invokeAction("discuss_drop", {
+      action: { type: "button", value: threadTs },
+      body: {
+        type: "block_actions",
+        user: { id: "U-rev" },
+        channel: { id: "C-INBOX" },
+        message: { ts: "1700000000.998", blocks: [{ type: "actions" }] },
+      },
+      client: recording.client,
+    });
+
+    // Conversation continues — message events recorded, no closed.
+    const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const closed = conn
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'discuss-conversation-closed'",
+        )
+        .all() as Array<unknown>;
+      expect(closed).toEqual([]);
+      const messages = conn
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'discuss-conversation-message'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(messages.length).toBeGreaterThanOrEqual(2);
+      const userMsg = JSON.parse(messages[0]!.payload).content as string;
+      expect(userMsg).toContain("Not yet");
+    } finally {
+      conn.close();
+    }
+
+    // Buttons stripped; thread reply posted with the LLM's continue.
+    expect(recording.updates).toHaveLength(1);
+    expect(recording.updates[0]?.text).toContain("Dropped by <@U-rev>");
+    expect(
+      recording.posts.some((p) =>
+        (p.text ?? "").includes("OK what would you change"),
+      ),
+    ).toBe(true);
+  });
+
+  it("discuss_accept on an unknown thread is a no-op (not-our-thread)", async () => {
+    const { fake, recording } = setupHarness(sandbox);
+    await fake.invokeAction("discuss_accept", {
+      action: { type: "button", value: "1700000000.404" },
+      body: {
+        type: "block_actions",
+        user: { id: "U-rev" },
+        channel: { id: "C-INBOX" },
+        message: { ts: "1700000000.998", blocks: [{ type: "actions" }] },
+      },
+      client: recording.client,
+    });
+    // Buttons still stripped (best-effort; we strip on every click)
+    expect(recording.updates).toHaveLength(1);
+    // No outcome events recorded
+    const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const closed = conn
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'discuss-conversation-closed'",
+        )
+        .all() as Array<unknown>;
+      expect(closed).toEqual([]);
+    } finally {
+      conn.close();
+    }
   });
 });

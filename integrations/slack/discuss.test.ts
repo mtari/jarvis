@@ -52,6 +52,7 @@ interface SlackPostCall {
   channel: string;
   thread_ts?: string;
   text?: string;
+  blocks?: unknown[];
 }
 
 function fakeSlackClient(): {
@@ -128,6 +129,53 @@ describe("startDiscussConversation", () => {
     } finally {
       db.close();
     }
+  });
+
+  it("renders proposals with Accept/Drop action blocks", async () => {
+    const slack = fakeSlackClient();
+    const anthropic = scriptedClient([
+      "<propose-note>address-step is the funnel killer</propose-note>",
+    ]);
+    const result = await startDiscussConversation({
+      ctx: { dataDir: sandbox.dataDir, client: slack.client, anthropic },
+      channel: "C-INBOX",
+      app: "demo",
+      vault: "personal",
+      topic: "x",
+      invokedBy: "U123",
+    });
+    // The thread reply (second postMessage) carries blocks for the proposal.
+    const proposalPost = slack.posts[1];
+    expect(proposalPost?.blocks).toBeDefined();
+    const blocks = (proposalPost?.blocks ?? []) as Array<{
+      type?: string;
+      elements?: Array<{ action_id?: string; value?: string }>;
+    }>;
+    const actions = blocks.find((b) => b.type === "actions");
+    expect(actions).toBeDefined();
+    const actionIds = (actions?.elements ?? []).map((e) => e.action_id);
+    expect(actionIds).toContain("discuss_accept");
+    expect(actionIds).toContain("discuss_drop");
+    // Each button's value is the threadTs for the routing handler.
+    expect(
+      (actions?.elements ?? []).every((e) => e.value === result.threadTs),
+    ).toBe(true);
+  });
+
+  it("non-proposal turns do NOT include action blocks", async () => {
+    const slack = fakeSlackClient();
+    const anthropic = scriptedClient([
+      "<continue>What's the goal?</continue>",
+    ]);
+    await startDiscussConversation({
+      ctx: { dataDir: sandbox.dataDir, client: slack.client, anthropic },
+      channel: "C-INBOX",
+      app: "demo",
+      vault: "personal",
+      topic: "x",
+      invokedBy: "U123",
+    });
+    expect(slack.posts[1]?.blocks).toBeUndefined();
   });
 
   it("first turn that closes immediately writes a closed event", async () => {
