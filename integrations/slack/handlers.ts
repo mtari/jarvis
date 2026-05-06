@@ -94,15 +94,25 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
     ctx.log("approved via slack", { planId, userId });
     const updatedRecord = findPlan(ctx.dataDir, planId);
     if (updatedRecord) {
-      await updateSurfacedPlan(
-        ctx.surfaceCtx,
-        updatedRecord,
-        `✓ Approved by <@${userId}>${
-          result.parentTransitioned
-            ? ` — parent ${result.parentTransitioned.id} now executing`
-            : ""
-        }`,
-      );
+      const parts: string[] = [`✓ Approved by <@${userId}>`];
+      if (result.parentTransitioned) {
+        parts.push(`parent ${result.parentTransitioned.id} now executing`);
+      }
+      const brain = result.brainChangesApplied;
+      if (brain && brain.hasChanges) {
+        const segs: string[] = [];
+        if (brain.applied.length > 0) {
+          segs.push(`brain updated: ${brain.applied.length}`);
+        }
+        if (brain.skipped.length > 0) {
+          segs.push(`skipped: ${brain.skipped.length}`);
+        }
+        if (brain.errors.length > 0) {
+          segs.push(`errors: ${brain.errors.length}`);
+        }
+        if (segs.length > 0) parts.push(segs.join(", "));
+      }
+      await updateSurfacedPlan(ctx.surfaceCtx, updatedRecord, parts.join(" — "));
     }
   });
 

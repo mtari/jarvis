@@ -50,5 +50,24 @@ export async function runApprove(rawArgs: string[]): Promise<number> {
       `  Parent ${result.parentTransitioned.id} transitioned approved → executing.`,
     );
   }
+  const brain = result.brainChangesApplied;
+  if (brain && brain.hasChanges) {
+    console.log("");
+    console.log("  Brain updates:");
+    for (const a of brain.applied) {
+      console.log(`    ✓ ${a.path} (${a.op}) — set`);
+    }
+    for (const s of brain.skipped) {
+      console.log(`    – ${s.path} (${s.op}) — skipped: ${s.reason}`);
+    }
+    for (const e of brain.errors) {
+      console.log(`    ✗ ${e.path} (${e.op}) — error: ${e.reason}`);
+    }
+    if (brain.skipped.length > 0 || brain.errors.length > 0) {
+      console.log(
+        "  Some changes weren't applied; review the plan body and edit brain.json by hand if needed.",
+      );
+    }
+  }
   return 0;
 }
