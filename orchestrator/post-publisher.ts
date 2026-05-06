@@ -13,6 +13,21 @@ import type {
 export const DEFAULT_STALE_GRACE_MS = 60 * 60 * 1000; // 1 hour
 
 /**
+ * Default exponential backoff schedule for transient adapter failures.
+ * Index = retry number after a transient miss; value = ms to wait.
+ * Matches §10 ("up to 3 retries with exponential backoff"):
+ *   1st retry: ~1 minute
+ *   2nd retry: ~5 minutes
+ *   3rd retry: ~15 minutes
+ *   beyond:    no more retries — row → failed
+ */
+export const DEFAULT_RETRY_BACKOFF_MS: ReadonlyArray<number> = [
+  60_000,
+  5 * 60_000,
+  15 * 60_000,
+];
+
+/**
  * Post publisher — picks up due `pending` rows from `scheduled_posts`,
  * dispatches each to the right channel adapter, updates the row's
  * status. Runs from the daemon's post-scheduler tick (every ~60s) and
@@ -46,6 +61,13 @@ export interface PublishDuePostsInput {
   now?: Date;
   /** Hard cap on rows handled per tick. Default 50. */
   maxPerTick?: number;
+  /**
+   * Backoff schedule for transient adapter failures. Length = max
+   * retries; index `retryCount` is the wait before the (retryCount+1)th
+   * attempt. After exhausting the schedule the row flips to `failed`.
+   * Default: see DEFAULT_RETRY_BACKOFF_MS.
+   */
+  retryBackoffMs?: ReadonlyArray<number>;
 }
 
 export interface PublishedRow {
@@ -66,6 +88,16 @@ export interface SkippedRow {
   reason: string;
 }
 
+export interface RetriedRow {
+  postId: string;
+  channel: string;
+  /** Retry attempt number that just failed (1-indexed). */
+  attempt: number;
+  reason: string;
+  /** ISO datetime of the next attempt. */
+  nextRetryAt: string;
+}
+
 export interface PublishDuePostsResult {
   /** Total candidate rows examined (pending + due before cap). */
   examined: number;
@@ -73,6 +105,8 @@ export interface PublishDuePostsResult {
   failed: FailedRow[];
   /** Rows skipped because no adapter is registered for the channel. */
   skipped: SkippedRow[];
+  /** Transient failures that were rescheduled — NOT counted in `failed`. */
+  retrying: RetriedRow[];
 }
 
 export async function publishDuePosts(
@@ -80,9 +114,11 @@ export async function publishDuePosts(
 ): Promise<PublishDuePostsResult> {
   const now = input.now ?? new Date();
   const maxPerTick = input.maxPerTick ?? 50;
+  const backoff = input.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS;
   const candidates = listScheduledPosts(input.db, {
     status: "pending",
     dueBefore: now.toISOString(),
+    retryReadyAt: now.toISOString(),
     limit: maxPerTick,
   });
 
@@ -91,11 +127,14 @@ export async function publishDuePosts(
     published: [],
     failed: [],
     skipped: [],
+    retrying: [],
   };
 
   for (const row of candidates) {
     const adapter = input.adapters.get(row.channel, row.appId);
     if (!adapter) {
+      // Missing adapter is a config error, not a transient one — fail
+      // immediately so the operator notices.
       const reason = `no adapter registered for channel "${row.channel}" + app "${row.appId}"`;
       markFailed(input.db, row, reason);
       result.failed.push({
@@ -116,9 +155,11 @@ export async function publishDuePosts(
         channel: row.channel,
       });
     } catch (err) {
+      // Adapter threw → treat as transient (network glitch, etc.). The
+      // contract asks adapters to return ok:false transient:true for
+      // these, but defense in depth.
       const reason = `adapter threw: ${err instanceof Error ? err.message : String(err)}`;
-      markFailed(input.db, row, reason);
-      result.failed.push({ postId: row.id, channel: row.channel, reason });
+      handleTransient(input.db, row, reason, now, backoff, result);
       continue;
     }
     if (publishResult.ok) {
@@ -128,6 +169,17 @@ export async function publishDuePosts(
         channel: row.channel,
         publishedId: publishResult.publishedId,
       });
+      continue;
+    }
+    if (publishResult.transient === true) {
+      handleTransient(
+        input.db,
+        row,
+        publishResult.reason,
+        now,
+        backoff,
+        result,
+      );
     } else {
       markFailed(input.db, row, publishResult.reason);
       result.failed.push({
@@ -139,6 +191,40 @@ export async function publishDuePosts(
   }
 
   return result;
+}
+
+function handleTransient(
+  db: Database,
+  row: ScheduledPost,
+  reason: string,
+  now: Date,
+  backoff: ReadonlyArray<number>,
+  result: PublishDuePostsResult,
+): void {
+  // retryCount = how many retries already happened. The next attempt
+  // would be retry #(retryCount+1). If that's beyond the schedule, the
+  // row's done retrying.
+  const nextAttempt = row.retryCount + 1;
+  if (nextAttempt > backoff.length) {
+    const reasonWithCounter = `${reason} (after ${row.retryCount} retr${row.retryCount === 1 ? "y" : "ies"})`;
+    markFailed(db, row, reasonWithCounter);
+    result.failed.push({
+      postId: row.id,
+      channel: row.channel,
+      reason: reasonWithCounter,
+    });
+    return;
+  }
+  const waitMs = backoff[nextAttempt - 1]!;
+  const nextRetryAt = new Date(now.getTime() + waitMs).toISOString();
+  scheduleRetry(db, row, reason, nextRetryAt, nextAttempt);
+  result.retrying.push({
+    postId: row.id,
+    channel: row.channel,
+    attempt: nextAttempt,
+    reason,
+    nextRetryAt,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +367,8 @@ function markPublished(
           SET status = 'published',
               published_at = ?,
               published_id = ?,
-              failure_reason = NULL
+              failure_reason = NULL,
+              next_retry_at = NULL
         WHERE id = ?`,
     ).run(now.toISOString(), publishedId, row.id);
     appendEvent(db, {
@@ -294,6 +381,44 @@ function markPublished(
         channel: row.channel,
         publishedId,
         publishedAt: now.toISOString(),
+        ...(row.retryCount > 0 && { retriesSpent: row.retryCount }),
+      },
+    });
+  })();
+}
+
+/**
+ * Bumps `retry_count`, sets `next_retry_at`, keeps status='pending'
+ * so the row stays in the publisher's queue. Records a
+ * `post-publish-retry` event for audit. failure_reason holds the
+ * latest reason so operators can see why retries are happening.
+ */
+function scheduleRetry(
+  db: Database,
+  row: ScheduledPost,
+  reason: string,
+  nextRetryAt: string,
+  attempt: number,
+): void {
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE scheduled_posts
+          SET retry_count = ?,
+              next_retry_at = ?,
+              failure_reason = ?
+        WHERE id = ?`,
+    ).run(attempt, nextRetryAt, reason, row.id);
+    appendEvent(db, {
+      appId: row.appId,
+      vaultId: "personal",
+      kind: "post-publish-retry",
+      payload: {
+        postId: row.id,
+        planId: row.planId,
+        channel: row.channel,
+        attempt,
+        reason,
+        nextRetryAt,
       },
     });
   })();
@@ -308,7 +433,8 @@ function markFailed(
     db.prepare(
       `UPDATE scheduled_posts
           SET status = 'failed',
-              failure_reason = ?
+              failure_reason = ?,
+              next_retry_at = NULL
         WHERE id = ?`,
     ).run(reason, row.id);
     appendEvent(db, {
@@ -320,6 +446,7 @@ function markFailed(
         planId: row.planId,
         channel: row.channel,
         reason,
+        ...(row.retryCount > 0 && { retriesSpent: row.retryCount }),
       },
     });
   })();

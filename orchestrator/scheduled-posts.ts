@@ -52,6 +52,14 @@ export interface ScheduledPost {
   publishedId: string | null;
   failureReason: string | null;
   editHistory: unknown[];
+  /** How many transient retries have been spent on this row (0 = never retried). */
+  retryCount: number;
+  /**
+   * Earliest moment the publisher should re-attempt. Null when no
+   * retry is pending. The publisher's "due" filter requires
+   * (next_retry_at IS NULL OR next_retry_at <= now).
+   */
+  nextRetryAt: string | null;
 }
 
 interface RawRow {
@@ -67,6 +75,8 @@ interface RawRow {
   published_id: string | null;
   failure_reason: string | null;
   edit_history: string;
+  retry_count: number;
+  next_retry_at: string | null;
 }
 
 export class ScheduledPostsError extends Error {
@@ -108,6 +118,13 @@ export interface ListScheduledPostsFilter {
   status?: ScheduledPostStatus;
   /** ISO datetime; rows with `scheduled_at <= dueBefore` only. */
   dueBefore?: string;
+  /**
+   * ISO datetime; when set, rows must satisfy
+   * `next_retry_at IS NULL OR next_retry_at <= retryReadyAt`.
+   * Used by the publisher to skip rows whose retry backoff hasn't
+   * elapsed.
+   */
+  retryReadyAt?: string;
   limit?: number;
 }
 
@@ -132,6 +149,10 @@ export function listScheduledPosts(
   if (filter.dueBefore !== undefined) {
     where.push("scheduled_at <= ?");
     params.push(filter.dueBefore);
+  }
+  if (filter.retryReadyAt !== undefined) {
+    where.push("(next_retry_at IS NULL OR next_retry_at <= ?)");
+    params.push(filter.retryReadyAt);
   }
   let sql =
     "SELECT * FROM scheduled_posts" +
@@ -209,6 +230,8 @@ function toScheduledPost(row: RawRow): ScheduledPost {
     publishedId: row.published_id,
     failureReason: row.failure_reason,
     editHistory,
+    retryCount: typeof row.retry_count === "number" ? row.retry_count : 0,
+    nextRetryAt: row.next_retry_at,
   };
 }
 

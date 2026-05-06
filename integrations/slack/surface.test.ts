@@ -1594,6 +1594,8 @@ describe("surfaceAwaitingReviewPost", () => {
       publishedId: null,
       failureReason: null,
       editHistory: [],
+    retryCount: 0,
+    nextRetryAt: null,
     });
     expect(result.posted).toBe(true);
     expect(posts).toHaveLength(1);
@@ -1628,6 +1630,8 @@ describe("surfaceAwaitingReviewPost", () => {
       publishedId: null,
       failureReason: null,
       editHistory: [],
+    retryCount: 0,
+    nextRetryAt: null,
     };
     const first = await surfaceAwaitingReviewPost(ctx, fakePost);
     const second = await surfaceAwaitingReviewPost(ctx, fakePost);
@@ -1718,6 +1722,8 @@ describe("updateSurfacedPost", () => {
       publishedId: null,
       failureReason: null,
       editHistory: [],
+    retryCount: 0,
+    nextRetryAt: null,
     };
     await surfaceAwaitingReviewPost(ctx, fakePost);
     await updateSurfacedPost(ctx, fakePost, "✓ Approved by <@U123>");
@@ -1749,6 +1755,8 @@ describe("updateSurfacedPost", () => {
         publishedId: null,
         failureReason: null,
         editHistory: [],
+    retryCount: 0,
+    nextRetryAt: null,
       },
       "irrelevant",
     );
