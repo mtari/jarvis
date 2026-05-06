@@ -107,6 +107,77 @@ describe("runPostSchedulerTick", () => {
     }
   });
 
+  it("flags stale-window rows then publishes them on the same tick", async () => {
+    const db = new Database(dbFile(sandbox.dataDir));
+    try {
+      insertScheduledPost(db, row("stale", {
+        scheduledAt: "2026-04-08T09:00:00.000Z",
+      }));
+    } finally {
+      db.close();
+    }
+    const ctx = buildCtx(sandbox);
+    try {
+      // 5 hours past scheduled time — past 1h grace AND due for publishing.
+      await runPostSchedulerTick({
+        dataDir: sandbox.dataDir,
+        adapters: new Map([["facebook", alwaysOkAdapter(["facebook"])]]),
+        ctx,
+        now: new Date("2026-04-08T14:00:00.000Z"),
+      });
+    } finally {
+      ctx.logger.close();
+    }
+    const verifyDb = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      // Row published.
+      expect(listScheduledPosts(verifyDb)[0]?.status).toBe("published");
+      // Missed event recorded.
+      const events = verifyDb
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'post-window-missed'",
+        )
+        .all() as Array<unknown>;
+      expect(events).toHaveLength(1);
+    } finally {
+      verifyDb.close();
+    }
+  });
+
+  it("staleGraceMs: null disables stale flagging entirely", async () => {
+    const db = new Database(dbFile(sandbox.dataDir));
+    try {
+      insertScheduledPost(db, row("stale", {
+        scheduledAt: "2026-04-08T09:00:00.000Z",
+      }));
+    } finally {
+      db.close();
+    }
+    const ctx = buildCtx(sandbox);
+    try {
+      await runPostSchedulerTick({
+        dataDir: sandbox.dataDir,
+        adapters: new Map([["facebook", alwaysOkAdapter(["facebook"])]]),
+        ctx,
+        now: new Date("2026-04-08T14:00:00.000Z"),
+        staleGraceMs: null,
+      });
+    } finally {
+      ctx.logger.close();
+    }
+    const verifyDb = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const events = verifyDb
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'post-window-missed'",
+        )
+        .all() as Array<unknown>;
+      expect(events).toEqual([]);
+    } finally {
+      verifyDb.close();
+    }
+  });
+
   it("is silent when no rows are due", async () => {
     const db = new Database(dbFile(sandbox.dataDir));
     try {

@@ -17,7 +17,11 @@ import {
   listScheduledPosts,
   type ScheduledPostInput,
 } from "./scheduled-posts.ts";
-import { publishDuePosts } from "./post-publisher.ts";
+import {
+  DEFAULT_STALE_GRACE_MS,
+  flagStaleWindowPosts,
+  publishDuePosts,
+} from "./post-publisher.ts";
 
 function row(
   id: string,
@@ -237,5 +241,162 @@ describe("publishDuePosts", () => {
     expect(result.examined).toBe(0);
     expect(result.published).toEqual([]);
     expect(result.failed).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// flagStaleWindowPosts
+// ---------------------------------------------------------------------------
+
+describe("flagStaleWindowPosts", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  let db: Database.Database;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    db = new Database(dbFile(sandbox.dataDir));
+  });
+
+  afterEach(() => {
+    db.close();
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("DEFAULT_STALE_GRACE_MS is 1 hour", () => {
+    expect(DEFAULT_STALE_GRACE_MS).toBe(60 * 60 * 1000);
+  });
+
+  it("flags rows past scheduled_at + grace + emits one event each", () => {
+    insertScheduledPost(db, row("p1", {
+      scheduledAt: "2026-04-08T09:00:00.000Z",
+    }));
+    insertScheduledPost(db, row("p2", {
+      scheduledAt: "2026-04-08T10:00:00.000Z",
+    }));
+    // 5 hours later, both should be stale
+    const result = flagStaleWindowPosts({
+      db,
+      now: new Date("2026-04-08T14:00:00.000Z"),
+    });
+    expect(result.flagged).toHaveLength(2);
+    expect(result.alreadyFlagged).toBe(0);
+    expect(result.flagged[0]?.postId).toBe("p1");
+    expect(result.flagged[0]?.hoursLate).toBeGreaterThan(4.9);
+
+    const events = db
+      .prepare("SELECT payload FROM events WHERE kind = 'post-window-missed'")
+      .all() as Array<{ payload: string }>;
+    expect(events).toHaveLength(2);
+    expect(JSON.parse(events[0]!.payload)).toMatchObject({
+      postId: "p1",
+      channel: "facebook",
+    });
+  });
+
+  it("does not flag rows within the grace window", () => {
+    insertScheduledPost(db, row("recent", {
+      scheduledAt: "2026-04-08T09:30:00.000Z",
+    }));
+    // 30 minutes later — within the default 1h grace
+    const result = flagStaleWindowPosts({
+      db,
+      now: new Date("2026-04-08T10:00:00.000Z"),
+    });
+    expect(result.flagged).toEqual([]);
+  });
+
+  it("does not flag future rows", () => {
+    insertScheduledPost(db, row("future", {
+      scheduledAt: "2027-01-01T09:00:00.000Z",
+    }));
+    const result = flagStaleWindowPosts({
+      db,
+      now: new Date("2026-04-08T09:00:00.000Z"),
+    });
+    expect(result.flagged).toEqual([]);
+  });
+
+  it("only flags pending rows — published / skipped / failed are ignored", () => {
+    insertScheduledPost(db, row("done", {
+      status: "published",
+      scheduledAt: "2026-04-08T09:00:00.000Z",
+    }));
+    insertScheduledPost(db, row("nope", {
+      status: "skipped",
+      scheduledAt: "2026-04-08T09:00:00.000Z",
+    }));
+    insertScheduledPost(db, row("err", {
+      status: "failed",
+      scheduledAt: "2026-04-08T09:00:00.000Z",
+    }));
+    const result = flagStaleWindowPosts({
+      db,
+      now: new Date("2026-04-08T14:00:00.000Z"),
+    });
+    expect(result.flagged).toEqual([]);
+  });
+
+  it("is idempotent — re-running on already-flagged rows is a no-op", () => {
+    insertScheduledPost(db, row("p1", {
+      scheduledAt: "2026-04-08T09:00:00.000Z",
+    }));
+    const first = flagStaleWindowPosts({
+      db,
+      now: new Date("2026-04-08T14:00:00.000Z"),
+    });
+    expect(first.flagged).toHaveLength(1);
+
+    const second = flagStaleWindowPosts({
+      db,
+      now: new Date("2026-04-08T15:00:00.000Z"),
+    });
+    expect(second.flagged).toEqual([]);
+    expect(second.alreadyFlagged).toBe(1);
+
+    const events = db
+      .prepare("SELECT payload FROM events WHERE kind = 'post-window-missed'")
+      .all() as Array<unknown>;
+    expect(events).toHaveLength(1);
+  });
+
+  it("respects a custom graceMs", () => {
+    insertScheduledPost(db, row("recent", {
+      scheduledAt: "2026-04-08T09:00:00.000Z",
+    }));
+    // 5 minutes later — within default 1h, but past 1-minute grace
+    const result = flagStaleWindowPosts({
+      db,
+      now: new Date("2026-04-08T09:05:00.000Z"),
+      graceMs: 60 * 1000,
+    });
+    expect(result.flagged).toHaveLength(1);
+  });
+
+  it("respects maxPerCall", () => {
+    for (let i = 0; i < 5; i += 1) {
+      insertScheduledPost(db, row(`p${i}`, {
+        scheduledAt: `2026-04-0${i + 1}T09:00:00.000Z`,
+      }));
+    }
+    const result = flagStaleWindowPosts({
+      db,
+      now: new Date("2027-01-01T00:00:00.000Z"),
+      maxPerCall: 2,
+    });
+    expect(result.flagged).toHaveLength(2);
+  });
+
+  it("hoursLate is well-formed", () => {
+    insertScheduledPost(db, row("p1", {
+      scheduledAt: "2026-04-08T09:00:00.000Z",
+    }));
+    const result = flagStaleWindowPosts({
+      db,
+      now: new Date("2026-04-08T13:00:00.000Z"),
+    });
+    expect(result.flagged[0]?.hoursLate).toBeCloseTo(4, 1);
   });
 });
