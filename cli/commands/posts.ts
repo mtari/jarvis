@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { publishDuePosts } from "../../orchestrator/post-publisher.ts";
 import {
+  approveScheduledPost,
   editScheduledPost,
   findScheduledPost,
   listScheduledPosts,
@@ -32,6 +33,7 @@ import { dbFile, getDataDir } from "../paths.ts";
  */
 
 const VALID_STATUSES: ReadonlyArray<ScheduledPostStatus> = [
+  "awaiting-review",
   "pending",
   "published",
   "failed",
@@ -60,14 +62,16 @@ export async function runPosts(
       return runPostsSkip(rest);
     case "publish-due":
       return runPostsPublishDue(rest, deps);
+    case "approve":
+      return runPostsApprove(rest);
     case undefined:
       console.error(
-        "posts: missing subcommand. Usage: yarn jarvis posts <list|edit|skip|publish-due> ...",
+        "posts: missing subcommand. Usage: yarn jarvis posts <list|edit|skip|approve|publish-due> ...",
       );
       return 1;
     default:
       console.error(
-        `posts: unknown subcommand "${subcommand}". Available: list, edit, skip, publish-due.`,
+        `posts: unknown subcommand "${subcommand}". Available: list, edit, skip, approve, publish-due.`,
       );
       return 1;
   }
@@ -332,6 +336,71 @@ async function runPostsSkip(rest: string[]): Promise<number> {
 
 function isStatus(s: string): s is ScheduledPostStatus {
   return (VALID_STATUSES as ReadonlyArray<string>).includes(s);
+}
+
+// ---------------------------------------------------------------------------
+// posts approve
+// ---------------------------------------------------------------------------
+
+async function runPostsApprove(rest: string[]): Promise<number> {
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args: rest,
+      options: {},
+      allowPositionals: true,
+    });
+  } catch (err) {
+    console.error(`posts approve: ${(err as Error).message}`);
+    return 1;
+  }
+  const id = parsed.positionals[0];
+  if (!id) {
+    console.error(
+      "posts approve: <post-id> required. Usage: yarn jarvis posts approve <post-id>",
+    );
+    return 1;
+  }
+  if (parsed.positionals.length > 1) {
+    console.error(
+      `posts approve: unexpected extra positional: ${parsed.positionals.slice(1).join(" ")}`,
+    );
+    return 1;
+  }
+
+  const dataDir = getDataDir();
+  const db = new Database(dbFile(dataDir));
+  try {
+    let updated: ScheduledPost;
+    try {
+      updated = approveScheduledPost(db, id, { actor: "cli" });
+    } catch (err) {
+      if (err instanceof ScheduledPostMutationError) {
+        console.error(`posts approve: ${err.message}`);
+        return 1;
+      }
+      throw err;
+    }
+    appendEvent(db, {
+      appId: updated.appId,
+      vaultId: "personal",
+      kind: "post-approved",
+      payload: {
+        postId: id,
+        planId: updated.planId,
+        actor: "cli",
+      },
+    });
+    console.log(`✓ Approved ${id}`);
+    console.log(`  Status: ${updated.status}`);
+    console.log(`  Scheduled: ${updated.scheduledAt}`);
+    console.log(
+      "  The daemon will publish at scheduled_at (or sooner if the daemon was off).",
+    );
+    return 0;
+  } finally {
+    db.close();
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -119,13 +119,24 @@ async function runMarketerPrepare(
     for (const p of result.prepared) {
       const tag = p.unchanged ? "(no humanizer changes)" : "(humanized)";
       console.log(
-        `  ${p.postId}  [${p.entry.channel}]  ${p.scheduledAt}  ${tag}`,
+        `  ${p.postId}  [${p.entry.channel} ${p.status}]  ${p.scheduledAt}  ${tag}`,
       );
     }
     console.log("");
-    console.log(
-      "  Rows persisted as 'pending' in scheduled_posts. The daemon scheduler will publish once the FB/IG tools land.",
+    const anyAwaitingReview = result.prepared.some(
+      (p) => p.status === "awaiting-review",
     );
+    if (anyAwaitingReview) {
+      console.log(
+        "  Single-post plan: rows are awaiting-review. Approve each with",
+      );
+      console.log("    yarn jarvis posts approve <post-id>");
+      console.log("  before the daemon will publish.");
+    } else {
+      console.log(
+        "  Campaign rows persisted as 'pending'. The daemon scheduler picks them up at scheduled_at.",
+      );
+    }
     return 0;
   } catch (err) {
     recorder.flush();

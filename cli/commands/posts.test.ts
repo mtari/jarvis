@@ -280,6 +280,69 @@ describe("posts edit", () => {
   });
 });
 
+describe("posts approve", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+    errSpy.mockRestore();
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("requires <post-id>", async () => {
+    expect(await runPosts(["approve"])).toBe(1);
+  });
+
+  it("flips awaiting-review → pending + records post-approved event", async () => {
+    const db = new Database(dbFile(sandbox.dataDir));
+    try {
+      insertScheduledPost(db, row("p1", { status: "awaiting-review" }));
+    } finally {
+      db.close();
+    }
+    const code = await runPosts(["approve", "p1"]);
+    expect(code).toBe(0);
+    const verifyDb = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      expect(listScheduledPosts(verifyDb)[0]?.status).toBe("pending");
+      const events = verifyDb
+        .prepare("SELECT payload FROM events WHERE kind = 'post-approved'")
+        .all() as Array<{ payload: string }>;
+      expect(events).toHaveLength(1);
+    } finally {
+      verifyDb.close();
+    }
+  });
+
+  it("returns 1 when row is not found", async () => {
+    expect(await runPosts(["approve", "ghost"])).toBe(1);
+    expect(
+      errSpy.mock.calls.map((c: unknown[]) => String(c[0])).join("\n"),
+    ).toContain("not found");
+  });
+
+  it("refuses on published rows", async () => {
+    const db = new Database(dbFile(sandbox.dataDir));
+    try {
+      insertScheduledPost(db, row("pub", { status: "published" }));
+    } finally {
+      db.close();
+    }
+    expect(await runPosts(["approve", "pub"])).toBe(1);
+  });
+});
+
 describe("posts publish-due", () => {
   let sandbox: InstallSandbox;
   let silencer: ConsoleSilencer;

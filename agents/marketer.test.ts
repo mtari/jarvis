@@ -479,4 +479,56 @@ describe("prepareMarketingPlan", () => {
     expect(result.alreadyPrepared).toBe(false);
     expect(result.prepared.length).toBeGreaterThan(0);
   });
+
+  it("campaign rows persist as 'pending'", async () => {
+    dropPlan(sandbox, "campaign-status", marketingPlanText());
+    const { client } = passthroughHumanizerClient();
+    const result = await prepareMarketingPlan({
+      client,
+      planId: "campaign-status",
+      dataDir: sandbox.dataDir,
+    });
+    expect(result.prepared.every((p) => p.status === "pending")).toBe(true);
+    const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const rows = listScheduledPosts(db, { planId: "campaign-status" });
+      expect(rows.every((r) => r.status === "pending")).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("single-post rows persist as 'awaiting-review' (per §10 review gate)", async () => {
+    dropPlan(
+      sandbox,
+      "single-post-review-gate",
+      marketingPlanText({
+        subtype: "single-post",
+        calendar: [
+          "### Post 1",
+          "Date: 2026-04-08",
+          "Channel: facebook",
+          "Assets: -",
+          "Text:",
+          "Reactive single post.",
+        ].join("\n"),
+      }),
+    );
+    const { client } = passthroughHumanizerClient();
+    const result = await prepareMarketingPlan({
+      client,
+      planId: "single-post-review-gate",
+      dataDir: sandbox.dataDir,
+    });
+    expect(result.prepared[0]?.status).toBe("awaiting-review");
+    const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const rows = listScheduledPosts(db, {
+        planId: "single-post-review-gate",
+      });
+      expect(rows[0]?.status).toBe("awaiting-review");
+    } finally {
+      db.close();
+    }
+  });
 });
