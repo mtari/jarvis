@@ -125,10 +125,12 @@ Utilities:
                               Read by Strategist / Scout / Developer for context.
   docs list --app <name> [--vault <v>] [--format table|json]
                               List registered docs for an app.
-  docs add --app <name> --keep <path-or-url> [--title <t>] [--tags <a,b,c>]
-                              Cache a doc (full content kept on disk for
-                              on-demand reference). Absorb mode (without
-                              --keep) lands in a follow-up.
+  docs add --app <name> [--keep] <path-or-url> [--title <t>] [--tags <a,b,c>]
+                              Without --keep (absorb mode): Strategist drafts
+                              an improvement/meta plan proposing brain changes
+                              from the doc; review via the standard plan flow.
+                              With --keep (cache mode): full content kept on
+                              disk for on-demand reference.
   docs remove --app <name> <id> [--vault <v>]
                               Unregister a doc. Cache files are removed;
                               anything already absorbed into the brain stays.
