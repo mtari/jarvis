@@ -20,10 +20,19 @@ import { appendEvent } from "../../orchestrator/event-log.ts";
 import { interpretAsk } from "../../cli/commands/ask.ts";
 import { appendNote } from "../../orchestrator/notes.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
+import {
+  approveScheduledPost,
+  findScheduledPost,
+  skipScheduledPost,
+  ScheduledPostMutationError,
+} from "../../orchestrator/scheduled-posts.ts";
 import { resolveSetupTask } from "../../orchestrator/setup-tasks.ts";
 import { suppress } from "../../orchestrator/suppressions.ts";
 import { dbFile } from "../../cli/paths.ts";
 import { buildSkipReasonModal } from "./blocks/setup-task.ts";
+import {
+  buildPostSkipReasonModal,
+} from "./blocks/post-review.ts";
 import { buildReviseModal } from "./blocks/plan-review.ts";
 import {
   autoDraftFromIdeas,
@@ -36,7 +45,12 @@ import {
   formatScoreResults,
   parseScoutFlags,
 } from "./slash-commands.ts";
-import { surfacePlan, updateSurfacedPlan, type SurfaceContext } from "./surface.ts";
+import {
+  surfacePlan,
+  updateSurfacedPlan,
+  updateSurfacedPost,
+  type SurfaceContext,
+} from "./surface.ts";
 
 export interface HandlerContext {
   dataDir: string;
@@ -458,6 +472,153 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
           text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`notes\`, \`ask\`.`,
         });
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // Post-review buttons (single-post plans, §10)
+  // -------------------------------------------------------------------------
+
+  app.action("post_approve", async ({ ack, body, action, client }) => {
+    await ack();
+    if (action.type !== "button") return;
+    const postId = action.value;
+    if (!postId) return;
+    const userId = "user" in body && body.user?.id ? body.user.id : "<slack>";
+
+    const conn = new Database(dbFile(ctx.dataDir));
+    try {
+      try {
+        approveScheduledPost(conn, postId, { actor: `slack:${userId}` });
+      } catch (err) {
+        const message =
+          err instanceof ScheduledPostMutationError
+            ? err.message
+            : err instanceof Error
+              ? err.message
+              : String(err);
+        ctx.logError("post approve via slack failed", err, { postId });
+        await postEphemeral(client, body, `✗ Approve failed: ${message}`);
+        return;
+      }
+      appendEvent(conn, {
+        appId: "marketer",
+        vaultId: "personal",
+        kind: "post-approved",
+        payload: { postId, actor: `slack:${userId}` },
+      });
+    } finally {
+      conn.close();
+    }
+    ctx.log("post approved via slack", { postId, userId });
+
+    const updated = (() => {
+      const c = new Database(dbFile(ctx.dataDir), { readonly: true });
+      try {
+        return findScheduledPost(c, postId);
+      } finally {
+        c.close();
+      }
+    })();
+    if (updated) {
+      const planRecord = findPlan(ctx.dataDir, updated.planId);
+      const planTitle = planRecord?.plan.metadata.title;
+      await updateSurfacedPost(
+        ctx.surfaceCtx,
+        updated,
+        `✓ Approved by <@${userId}>`,
+        planTitle !== undefined ? { planTitle } : {},
+      );
+    }
+  });
+
+  app.action("post_skip", async ({ ack, body, action, client }) => {
+    await ack();
+    if (action.type !== "button") return;
+    const postId = action.value;
+    if (!postId) return;
+    if (body.type !== "block_actions" || !body.trigger_id) return;
+    try {
+      await client.views.open({
+        trigger_id: body.trigger_id,
+        view: buildPostSkipReasonModal(postId),
+      });
+    } catch (err) {
+      ctx.logError("opening post skip modal failed", err, { postId });
+    }
+  });
+
+  app.view("post_skip_submit", async ({ ack, body, view, client }) => {
+    const postId = view.private_metadata;
+    const reason =
+      view.state.values["skip_reason_block"]?.["skip_reason_input"]?.value ?? "";
+    if (!postId || !reason || reason.trim().length === 0) {
+      await ack({
+        response_action: "errors",
+        errors: { skip_reason_block: "Reason is required." },
+      });
+      return;
+    }
+    await ack();
+    const userId = body.user.id ?? "<slack>";
+
+    const conn = new Database(dbFile(ctx.dataDir));
+    try {
+      try {
+        skipScheduledPost(conn, postId, {
+          reason: reason.trim(),
+          actor: `slack:${userId}`,
+        });
+      } catch (err) {
+        const message =
+          err instanceof ScheduledPostMutationError
+            ? err.message
+            : err instanceof Error
+              ? err.message
+              : String(err);
+        ctx.logError("post skip via slack failed", err, { postId });
+        await postDmOrEphemeral(
+          client,
+          userId,
+          body.user.id,
+          `✗ Skip failed: ${message}`,
+        );
+        return;
+      }
+      appendEvent(conn, {
+        appId: "marketer",
+        vaultId: "personal",
+        kind: "post-skipped",
+        payload: { postId, actor: `slack:${userId}`, reason: reason.trim() },
+      });
+    } finally {
+      conn.close();
+    }
+    ctx.log("post skipped via slack", { postId, userId });
+
+    const updated = (() => {
+      const c = new Database(dbFile(ctx.dataDir), { readonly: true });
+      try {
+        return findScheduledPost(c, postId);
+      } finally {
+        c.close();
+      }
+    })();
+    if (updated) {
+      const planRecord = findPlan(ctx.dataDir, updated.planId);
+      const planTitle = planRecord?.plan.metadata.title;
+      await updateSurfacedPost(
+        ctx.surfaceCtx,
+        updated,
+        `↪ Skipped by <@${userId}> — ${reason.trim()}`,
+        planTitle !== undefined ? { planTitle } : {},
+      );
+    }
+    await postDmOrEphemeral(
+      client,
+      userId,
+      body.user.id,
+      `↪ Skipped \`${postId}\`.`,
+    );
   });
 }
 

@@ -114,10 +114,16 @@ describe("registerHandlers", () => {
         "setup_task_done",
         "setup_task_skip",
         "escalation_acknowledge",
+        "post_approve",
+        "post_skip",
       ]),
     );
     expect(new Set(fake.registeredViewIds())).toEqual(
-      new Set(["plan_revise_submit", "setup_task_skip_submit"]),
+      new Set([
+        "plan_revise_submit",
+        "setup_task_skip_submit",
+        "post_skip_submit",
+      ]),
     );
     expect(fake.registeredCommandIds()).toEqual(["/jarvis"]);
   });

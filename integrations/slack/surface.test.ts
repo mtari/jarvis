@@ -19,6 +19,7 @@ import { suppress } from "../../orchestrator/suppressions.ts";
 import {
   findAmendmentSurfaceRecord,
   findPendingAmendment,
+  findPostSurfaceRecord,
   findSurfaceRecord,
   findUnpostedAlertableSignals,
   findUnpostedEscalations,
@@ -26,19 +27,26 @@ import {
   findUnsurfacedSetupTasks,
   runAlertTick,
   runEscalationDeliveryTick,
+  runPostReviewSurfaceTick,
   runSetupTaskDeliveryTick,
   runSurfaceTick,
   runTriageDeliveryTick,
   surfaceAmendmentReview,
+  surfaceAwaitingReviewPost,
   surfaceEscalation,
   surfacePlan,
   surfaceSetupTask,
   surfaceSignalAlert,
   surfaceTriageReport,
   updateSurfacedPlan,
+  updateSurfacedPost,
   type AlertContext,
   type SurfaceContext,
 } from "./surface.ts";
+import {
+  insertScheduledPost,
+  type ScheduledPostInput,
+} from "../../orchestrator/scheduled-posts.ts";
 
 interface PostMessageCall {
   channel: string;
@@ -1516,5 +1524,234 @@ describe("runEscalationDeliveryTick", () => {
     const result = await runEscalationDeliveryTick(ctx);
     expect(result.posted).toHaveLength(1);
     expect(result.errors).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Post review surface (single-post awaiting-review rows)
+// ---------------------------------------------------------------------------
+
+function postRow(
+  id: string,
+  overrides: Partial<ScheduledPostInput> = {},
+): ScheduledPostInput {
+  return {
+    id,
+    planId: "marketing-plan-1",
+    appId: "demo",
+    channel: "facebook",
+    content: "Hello",
+    assets: [],
+    scheduledAt: "2026-04-08T09:00:00.000Z",
+    status: "awaiting-review",
+    ...overrides,
+  };
+}
+
+describe("surfaceAwaitingReviewPost", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("posts a message + records slack-post-surfaced event", async () => {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      insertScheduledPost(conn, postRow("p1"));
+    } finally {
+      conn.close();
+    }
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const reader = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    const row = reader
+      .prepare("SELECT * FROM scheduled_posts WHERE id = ?")
+      .get("p1") as Record<string, unknown>;
+    reader.close();
+
+    const result = await surfaceAwaitingReviewPost(ctx, {
+      id: row["id"] as string,
+      planId: row["plan_id"] as string,
+      appId: row["app_id"] as string,
+      channel: row["channel"] as string,
+      content: row["content"] as string,
+      assets: [],
+      scheduledAt: row["scheduled_at"] as string,
+      status: "awaiting-review",
+      publishedAt: null,
+      publishedId: null,
+      failureReason: null,
+      editHistory: [],
+    });
+    expect(result.posted).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(findPostSurfaceRecord(dbFile(sandbox.dataDir), "p1")?.channel).toBe(
+      "C-INBOX",
+    );
+  });
+
+  it("is idempotent — second call reuses the surface record", async () => {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      insertScheduledPost(conn, postRow("p2"));
+    } finally {
+      conn.close();
+    }
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const fakePost = {
+      id: "p2",
+      planId: "marketing-plan-1",
+      appId: "demo",
+      channel: "facebook",
+      content: "x",
+      assets: [],
+      scheduledAt: "2026-04-08T09:00:00.000Z",
+      status: "awaiting-review" as const,
+      publishedAt: null,
+      publishedId: null,
+      failureReason: null,
+      editHistory: [],
+    };
+    const first = await surfaceAwaitingReviewPost(ctx, fakePost);
+    const second = await surfaceAwaitingReviewPost(ctx, fakePost);
+    expect(first.posted).toBe(true);
+    expect(second.posted).toBe(false);
+    expect(posts).toHaveLength(1);
+  });
+});
+
+describe("runPostReviewSurfaceTick", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("surfaces awaiting-review posts and skips already-surfaced rows", async () => {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      insertScheduledPost(conn, postRow("a"));
+      insertScheduledPost(conn, postRow("b"));
+      insertScheduledPost(conn, postRow("c", { status: "pending" }));
+    } finally {
+      conn.close();
+    }
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const first = await runPostReviewSurfaceTick(ctx);
+    expect(first.posted).toEqual(expect.arrayContaining(["a", "b"]));
+    expect(first.posted).not.toContain("c");
+    expect(posts).toHaveLength(2);
+
+    // Second tick is a no-op
+    const second = await runPostReviewSurfaceTick(ctx);
+    expect(second.posted).toEqual([]);
+    expect(posts).toHaveLength(2);
+  });
+});
+
+describe("updateSurfacedPost", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("strips action buttons + appends an outcome context line", async () => {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      insertScheduledPost(conn, postRow("p1"));
+    } finally {
+      conn.close();
+    }
+    const { client, updates } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const fakePost = {
+      id: "p1",
+      planId: "marketing-plan-1",
+      appId: "demo",
+      channel: "facebook",
+      content: "x",
+      assets: [],
+      scheduledAt: "2026-04-08T09:00:00.000Z",
+      status: "awaiting-review" as const,
+      publishedAt: null,
+      publishedId: null,
+      failureReason: null,
+      editHistory: [],
+    };
+    await surfaceAwaitingReviewPost(ctx, fakePost);
+    await updateSurfacedPost(ctx, fakePost, "✓ Approved by <@U123>");
+    expect(updates).toHaveLength(1);
+    const blocks = updates[0]?.blocks as Array<{ type?: string }>;
+    expect(blocks.find((b) => b.type === "actions")).toBeUndefined();
+    expect(updates[0]?.text).toContain("Approved");
+  });
+
+  it("is a no-op when the post has not been surfaced", async () => {
+    const { client, updates } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    await updateSurfacedPost(
+      ctx,
+      {
+        id: "ghost",
+        planId: "x",
+        appId: "demo",
+        channel: "facebook",
+        content: "x",
+        assets: [],
+        scheduledAt: "2026-04-08T09:00:00.000Z",
+        status: "awaiting-review",
+        publishedAt: null,
+        publishedId: null,
+        failureReason: null,
+        editHistory: [],
+      },
+      "irrelevant",
+    );
+    expect(updates).toHaveLength(0);
   });
 });

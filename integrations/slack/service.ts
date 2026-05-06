@@ -13,6 +13,7 @@ import { registerHandlers } from "./handlers.ts";
 import {
   runAlertTick,
   runEscalationDeliveryTick,
+  runPostReviewSurfaceTick,
   runSetupTaskDeliveryTick,
   runSurfaceTick,
   runTriageDeliveryTick,
@@ -224,6 +225,20 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
           } catch (err) {
             ctx.logger.error("setup-task delivery tick errored", err);
           }
+        }
+        try {
+          const postReview = await runPostReviewSurfaceTick(surfaceCtxFor());
+          if (postReview.posted.length > 0) {
+            ctx.logger.info("surfaced posts to slack", {
+              count: postReview.posted.length,
+              postIds: postReview.posted,
+            });
+          }
+          for (const e of postReview.errors) {
+            ctx.logger.error("post-review surface failed", null, e);
+          }
+        } catch (err) {
+          ctx.logger.error("post-review surface tick errored", err);
         }
         if (escalationDeliveryEnabled) {
           try {
