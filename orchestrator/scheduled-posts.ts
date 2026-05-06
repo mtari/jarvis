@@ -225,3 +225,146 @@ function assertStatus(s: string): ScheduledPostStatus {
       return "pending";
   }
 }
+
+// ---------------------------------------------------------------------------
+// Mutations: edit + skip
+// ---------------------------------------------------------------------------
+
+/**
+ * One entry in `scheduled_posts.edit_history`. Captures the previous
+ * content so the learning loop (§5) can study repeated edits.
+ */
+export interface EditHistoryEntry {
+  /** ISO datetime of the edit. */
+  at: string;
+  /** Free-form actor tag, e.g. "cli", "slack:U-xyz". */
+  actor: string;
+  /** Content as it stood before this edit. */
+  previousContent: string;
+}
+
+export interface EditScheduledPostInput {
+  newContent: string;
+  actor: string;
+  /** Test seam — fixed clock for the history entry. */
+  now?: Date;
+}
+
+export class ScheduledPostMutationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ScheduledPostMutationError";
+  }
+}
+
+/**
+ * Replaces the row's content and appends a `pre-edit` snapshot to
+ * `edit_history`. Refuses to edit rows that have already published —
+ * post-publish edits go through the platform's edit API in a
+ * separate flow (see §10 "Edit before publish"). Refuses empty
+ * content too; an empty post means "skip" and should use that path.
+ *
+ * Side-effect: status flips to `edited` so the rolling diff in
+ * `edit_history` is visible without joining tables. Pending rows
+ * remain pending after edit (status: edited is treated as ready-to-
+ * publish by the scheduler — same as pending — until we ship the
+ * publishing tick).
+ */
+export function editScheduledPost(
+  db: Database,
+  id: string,
+  input: EditScheduledPostInput,
+): ScheduledPost {
+  const current = findScheduledPost(db, id);
+  if (!current) {
+    throw new ScheduledPostMutationError(`scheduled post "${id}" not found`);
+  }
+  if (current.status === "published") {
+    throw new ScheduledPostMutationError(
+      `scheduled post "${id}" is already published; use the platform's post-publish edit API instead`,
+    );
+  }
+  if (current.status === "skipped") {
+    throw new ScheduledPostMutationError(
+      `scheduled post "${id}" is skipped; unskip first if you want to edit and re-queue`,
+    );
+  }
+  const trimmed = input.newContent.trim();
+  if (trimmed.length === 0) {
+    throw new ScheduledPostMutationError(
+      "edit content is empty; use `posts skip` to drop a post instead",
+    );
+  }
+  if (trimmed === current.content) {
+    // Idempotent no-op — return the existing row untouched.
+    return current;
+  }
+
+  const at = (input.now ?? new Date()).toISOString();
+  const entry: EditHistoryEntry = {
+    at,
+    actor: input.actor,
+    previousContent: current.content,
+  };
+  const nextHistory = [...current.editHistory, entry];
+
+  db.prepare(
+    `UPDATE scheduled_posts
+        SET content = ?, status = 'edited', edit_history = ?
+      WHERE id = ?`,
+  ).run(trimmed, JSON.stringify(nextHistory), id);
+
+  const updated = findScheduledPost(db, id);
+  if (!updated) {
+    // Shouldn't happen — the row existed a moment ago.
+    throw new ScheduledPostMutationError(
+      `internal: row "${id}" disappeared after update`,
+    );
+  }
+  return updated;
+}
+
+export interface SkipScheduledPostInput {
+  reason: string;
+  actor: string;
+}
+
+/**
+ * Marks the row as `skipped` so the scheduler tick won't publish it.
+ * `failure_reason` carries the user's reason for audit. Idempotent on
+ * already-skipped rows; refuses on already-published rows.
+ */
+export function skipScheduledPost(
+  db: Database,
+  id: string,
+  input: SkipScheduledPostInput,
+): ScheduledPost {
+  const current = findScheduledPost(db, id);
+  if (!current) {
+    throw new ScheduledPostMutationError(`scheduled post "${id}" not found`);
+  }
+  if (current.status === "published") {
+    throw new ScheduledPostMutationError(
+      `scheduled post "${id}" is already published; cannot skip after publish`,
+    );
+  }
+  if (current.status === "skipped") {
+    return current;
+  }
+  const trimmedReason = input.reason.trim();
+  if (trimmedReason.length === 0) {
+    throw new ScheduledPostMutationError("skip reason cannot be empty");
+  }
+  db.prepare(
+    `UPDATE scheduled_posts
+        SET status = 'skipped', failure_reason = ?
+      WHERE id = ?`,
+  ).run(`skipped by ${input.actor}: ${trimmedReason}`, id);
+  const updated = findScheduledPost(db, id);
+  if (!updated) {
+    throw new ScheduledPostMutationError(
+      `internal: row "${id}" disappeared after skip`,
+    );
+  }
+  return updated;
+}

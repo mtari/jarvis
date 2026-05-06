@@ -9,9 +9,12 @@ import {
 } from "../cli/commands/_test-helpers.ts";
 import {
   countScheduledPosts,
+  editScheduledPost,
   findScheduledPost,
   insertScheduledPost,
   listScheduledPosts,
+  ScheduledPostMutationError,
+  skipScheduledPost,
 } from "./scheduled-posts.ts";
 
 describe("scheduled-posts store", () => {
@@ -117,5 +120,120 @@ describe("scheduled-posts store", () => {
       "bad",
     );
     expect(findScheduledPost(db, "bad")?.assets).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  // editScheduledPost
+  // -------------------------------------------------------------------------
+
+  describe("editScheduledPost", () => {
+    const FIXED_NOW = new Date("2026-04-08T12:00:00.000Z");
+
+    it("replaces content + appends an edit_history entry + flips status", () => {
+      insertScheduledPost(db, row("e1", { content: "old" }));
+      const updated = editScheduledPost(db, "e1", {
+        newContent: "new",
+        actor: "cli",
+        now: FIXED_NOW,
+      });
+      expect(updated.content).toBe("new");
+      expect(updated.status).toBe("edited");
+      expect(updated.editHistory).toHaveLength(1);
+      const entry = updated.editHistory[0] as Record<string, unknown>;
+      expect(entry["previousContent"]).toBe("old");
+      expect(entry["actor"]).toBe("cli");
+      expect(entry["at"]).toBe(FIXED_NOW.toISOString());
+    });
+
+    it("appends across multiple edits", () => {
+      insertScheduledPost(db, row("e2", { content: "v1" }));
+      editScheduledPost(db, "e2", { newContent: "v2", actor: "cli" });
+      const final = editScheduledPost(db, "e2", {
+        newContent: "v3",
+        actor: "slack:U-x",
+      });
+      expect(final.editHistory).toHaveLength(2);
+      expect(final.content).toBe("v3");
+    });
+
+    it("is a no-op when content is unchanged", () => {
+      insertScheduledPost(db, row("e3", { content: "same" }));
+      const r = editScheduledPost(db, "e3", {
+        newContent: "same",
+        actor: "cli",
+      });
+      expect(r.editHistory).toHaveLength(0);
+      expect(r.status).toBe("pending");
+    });
+
+    it("rejects edit on a published row", () => {
+      insertScheduledPost(db, row("e4", { status: "published" }));
+      expect(() =>
+        editScheduledPost(db, "e4", { newContent: "x", actor: "cli" }),
+      ).toThrow(ScheduledPostMutationError);
+    });
+
+    it("rejects edit on a skipped row", () => {
+      insertScheduledPost(db, row("e5", { status: "skipped" }));
+      expect(() =>
+        editScheduledPost(db, "e5", { newContent: "x", actor: "cli" }),
+      ).toThrow(/skipped/);
+    });
+
+    it("rejects empty content", () => {
+      insertScheduledPost(db, row("e6"));
+      expect(() =>
+        editScheduledPost(db, "e6", { newContent: "   ", actor: "cli" }),
+      ).toThrow(/empty/);
+    });
+
+    it("throws on unknown id", () => {
+      expect(() =>
+        editScheduledPost(db, "ghost", { newContent: "x", actor: "cli" }),
+      ).toThrow(/not found/);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // skipScheduledPost
+  // -------------------------------------------------------------------------
+
+  describe("skipScheduledPost", () => {
+    it("flips status to skipped and records the reason", () => {
+      insertScheduledPost(db, row("s1"));
+      const updated = skipScheduledPost(db, "s1", {
+        reason: "off-brand after second pass",
+        actor: "cli",
+      });
+      expect(updated.status).toBe("skipped");
+      expect(updated.failureReason).toContain("off-brand");
+      expect(updated.failureReason).toContain("cli");
+    });
+
+    it("is idempotent on already-skipped rows", () => {
+      insertScheduledPost(db, row("s2", { status: "skipped" }));
+      const r = skipScheduledPost(db, "s2", { reason: "x", actor: "cli" });
+      expect(r.status).toBe("skipped");
+    });
+
+    it("rejects skip on a published row", () => {
+      insertScheduledPost(db, row("s3", { status: "published" }));
+      expect(() =>
+        skipScheduledPost(db, "s3", { reason: "x", actor: "cli" }),
+      ).toThrow(/published/);
+    });
+
+    it("rejects empty reason", () => {
+      insertScheduledPost(db, row("s4"));
+      expect(() =>
+        skipScheduledPost(db, "s4", { reason: "  ", actor: "cli" }),
+      ).toThrow(/empty/);
+    });
+
+    it("throws on unknown id", () => {
+      expect(() =>
+        skipScheduledPost(db, "ghost", { reason: "x", actor: "cli" }),
+      ).toThrow(/not found/);
+    });
   });
 });
