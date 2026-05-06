@@ -4,6 +4,10 @@ import {
   publishDuePosts,
 } from "../../orchestrator/post-publisher.ts";
 import { dbFile } from "../../cli/paths.ts";
+import {
+  createFacebookAdapter,
+  readFacebookEnv,
+} from "../../tools/channels/facebook.ts";
 import { createFileStubAdapter } from "../../tools/channels/file-stub.ts";
 import {
   buildAdapterMap,
@@ -32,9 +36,11 @@ export interface PostSchedulerServiceOptions {
   /** Tick interval. Default 60s. */
   tickMs?: number;
   /**
-   * Override the adapter set. Defaults to a single file-stub adapter
-   * serving every SUPPORTED_CHANNELS. Real FB/IG adapters land in
-   * follow-up PRs and replace specific channels.
+   * Override the adapter set. When omitted, the service builds the
+   * default set: file-stub catch-all + Facebook adapter (when
+   * `FB_PAGE_ID` + `FB_PAGE_ACCESS_TOKEN` are present in the
+   * environment). Real FB/IG/X adapters override specific channels
+   * in the order given via `buildAdapterMap`'s last-wins rule.
    */
   adapters?: ReadonlyArray<ChannelAdapter>;
   /** Test seam — fixed clock for the publisher's `dueBefore` cutoff. */
@@ -45,17 +51,40 @@ export interface PostSchedulerServiceOptions {
    * disable stale-window flagging entirely.
    */
   staleGraceMs?: number | null;
+  /** Test seam — overrides process.env when reading channel credentials. */
+  env?: NodeJS.ProcessEnv;
   /** @internal */
   _tickBody?: (ctx: DaemonContext) => Promise<void>;
+}
+
+/**
+ * Builds the default channel adapter set based on environment:
+ *   - file-stub adapter (catch-all, always registered first)
+ *   - Facebook adapter (registered last when `FB_PAGE_ID` +
+ *     `FB_PAGE_ACCESS_TOKEN` are present in env, overriding stub for
+ *     `facebook` channel via the last-wins rule)
+ *
+ * Future: Instagram, LinkedIn, X adapters slot in here the same way.
+ */
+export function buildDefaultAdapters(
+  dataDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ChannelAdapter[] {
+  const adapters: ChannelAdapter[] = [createFileStubAdapter({ dataDir })];
+  const fbConfig = readFacebookEnv(env);
+  if (fbConfig) {
+    adapters.push(createFacebookAdapter(fbConfig));
+  }
+  return adapters;
 }
 
 export function createPostSchedulerService(
   opts: PostSchedulerServiceOptions,
 ): DaemonService {
   const tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
-  const adapters: ChannelAdapterMap = buildAdapterMap(
-    opts.adapters ?? [createFileStubAdapter({ dataDir: opts.dataDir })],
-  );
+  const adapterList: ReadonlyArray<ChannelAdapter> =
+    opts.adapters ?? buildDefaultAdapters(opts.dataDir, opts.env);
+  const adapters: ChannelAdapterMap = buildAdapterMap(adapterList);
   const staleGraceMs =
     opts.staleGraceMs === undefined ? undefined : opts.staleGraceMs;
 
@@ -65,6 +94,10 @@ export function createPostSchedulerService(
   return {
     name: "post-scheduler",
     start(ctx: DaemonContext): void {
+      ctx.logger.info("post-scheduler: adapter coverage", {
+        adapterCount: adapterList.length,
+        channels: Array.from(adapters.keys()),
+      });
       const tickFn = async (): Promise<void> => {
         if (tickInFlight) return;
         tickInFlight = true;

@@ -16,6 +16,7 @@ import { createDaemonLogger } from "../../orchestrator/daemon-logger.ts";
 import type { PublishResult, ChannelAdapter } from "../../tools/channels/types.ts";
 import type { DaemonContext } from "../../cli/commands/daemon.ts";
 import {
+  buildDefaultAdapters,
   createPostSchedulerService,
   runPostSchedulerTick,
 } from "./service.ts";
@@ -288,5 +289,44 @@ describe("createPostSchedulerService", () => {
     }
     // The service must have caught the error; if not, the test already failed.
     expect(true).toBe(true);
+  });
+});
+
+describe("buildDefaultAdapters", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("returns just the file-stub when FB env vars are missing", () => {
+    const adapters = buildDefaultAdapters(sandbox.dataDir, {});
+    expect(adapters).toHaveLength(1);
+    expect(adapters[0]?.channels).toContain("facebook");
+    expect(adapters[0]?.channels).toContain("instagram");
+  });
+
+  it("appends the FB adapter when both env vars are present", () => {
+    const adapters = buildDefaultAdapters(sandbox.dataDir, {
+      FB_PAGE_ID: "123",
+      FB_PAGE_ACCESS_TOKEN: "tok",
+    });
+    expect(adapters).toHaveLength(2);
+    // Last adapter overrides via buildAdapterMap last-wins.
+    expect(adapters[1]?.channels).toEqual(["facebook"]);
+  });
+
+  it("skips the FB adapter when one env var is missing", () => {
+    const adapters = buildDefaultAdapters(sandbox.dataDir, {
+      FB_PAGE_ID: "123",
+    });
+    expect(adapters).toHaveLength(1);
   });
 });
