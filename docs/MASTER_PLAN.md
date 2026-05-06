@@ -1430,13 +1430,20 @@ Once the code-repo structure is in place, write `jarvis/CLAUDE.md` (the repo-lev
 ### Phase 3 — Marketer + marketing plan loop (Week 7–8)
 
 - Marketer agent
-- Facebook + Instagram tools (requires setup tasks)
+- Facebook tool (requires setup task per Page; per-app credentials via `brain.connections.facebook`)
 - **Extend Strategist** to draft marketing plans, including subtype detection from the brief (campaign vs single-post)
 - Marketing plan templates (both subtypes) + execution routing
 - **Humanizer tool** (`jarvis/tools/humanizer.ts`) — loads style rules from the Wikipedia "Signs of AI writing" guide; Marketer calls it as a final pass on every post draft, Developer calls it when a plan modifies user-facing text
+- Retry / backoff in the post-publisher for transient adapter failures (5xx / 429 / network) before marking a row failed
 - First marketing campaign shipped
 
 **Exit:** a real marketing plan approved, executed, with posts live and tracked.
+
+**Deferred to post-Phase-3 (nice-to-have, not blocking exit):**
+
+- **Instagram adapter** — mirrors the FB adapter shape, but IG Graph API has a two-step flow (create container, then publish). Same per-app `brain.connections.instagram` pattern as FB. Lands when an IG-first project arrives.
+- **Image / video uploads on Facebook** — `/photos` + `/videos` endpoints. Today posts with non-empty `Assets:` fail loud rather than silently text-publishing.
+- **Schedule rules consultation** (`brain.marketing.scheduleRules` per §10) — preferredHours / allowedDays / blackoutDates to pick `scheduledAt` automatically. Today posts use the entry's `Date:` + a fixed 09:00 UTC default.
 
 ### Phase 4 — Full self-improvement flywheel (Week 9+)
 
