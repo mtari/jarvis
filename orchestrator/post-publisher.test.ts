@@ -27,6 +27,7 @@ import {
   type ScheduledPostInput,
 } from "./scheduled-posts.ts";
 import {
+  DEFAULT_RETRY_BACKOFF_MS,
   DEFAULT_STALE_GRACE_MS,
   flagStaleWindowPosts,
   publishDuePosts,
@@ -182,17 +183,6 @@ describe("publishDuePosts", () => {
     expect(events).toHaveLength(1);
   });
 
-  it("marks rows failed when adapter throws", async () => {
-    insertScheduledPost(db, row("p1"));
-    const result = await publishDuePosts({
-      db,
-      adapters: fallbackRegistry([throwingAdapter(["facebook"], "boom")]),
-      now: new Date("2026-04-09T00:00:00.000Z"),
-    });
-    expect(result.failed[0]?.reason).toContain("boom");
-    expect(listScheduledPosts(db)[0]?.status).toBe("failed");
-  });
-
   it("marks rows failed when no adapter is registered for the channel", async () => {
     insertScheduledPost(db, row("p1", { channel: "tiktok" }));
     const result = await publishDuePosts({
@@ -281,6 +271,252 @@ describe("publishDuePosts", () => {
     expect(result.examined).toBe(0);
     expect(result.published).toEqual([]);
     expect(result.failed).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  // Retry / backoff on transient failures
+  // -------------------------------------------------------------------------
+
+  it("DEFAULT_RETRY_BACKOFF_MS is 1m / 5m / 15m", () => {
+    expect(DEFAULT_RETRY_BACKOFF_MS).toEqual([
+      60_000,
+      5 * 60_000,
+      15 * 60_000,
+    ]);
+  });
+
+  it("transient failure schedules a retry — row stays pending with next_retry_at set", async () => {
+    insertScheduledPost(db, row("p1"));
+    const { adapter } = recordingAdapter(["facebook"], {
+      ok: false,
+      reason: "rate-limited",
+      transient: true,
+    });
+    const now = new Date("2026-04-09T12:00:00.000Z");
+    const result = await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([adapter]),
+      now,
+      retryBackoffMs: [60_000],
+    });
+    expect(result.examined).toBe(1);
+    expect(result.published).toEqual([]);
+    expect(result.failed).toEqual([]);
+    expect(result.retrying).toHaveLength(1);
+    expect(result.retrying[0]?.attempt).toBe(1);
+    expect(result.retrying[0]?.nextRetryAt).toBe(
+      "2026-04-09T12:01:00.000Z",
+    );
+
+    const updated = listScheduledPosts(db, { planId: "plan-1" })[0];
+    expect(updated?.status).toBe("pending");
+    expect(updated?.retryCount).toBe(1);
+    expect(updated?.nextRetryAt).toBe("2026-04-09T12:01:00.000Z");
+    expect(updated?.failureReason).toBe("rate-limited");
+
+    const events = db
+      .prepare("SELECT payload FROM events WHERE kind = 'post-publish-retry'")
+      .all() as Array<{ payload: string }>;
+    expect(events).toHaveLength(1);
+    expect(JSON.parse(events[0]!.payload)).toMatchObject({
+      postId: "p1",
+      attempt: 1,
+    });
+  });
+
+  it("publisher skips rows whose next_retry_at hasn't elapsed", async () => {
+    insertScheduledPost(db, row("p1"));
+    const { adapter, calls } = recordingAdapter(["facebook"], {
+      ok: false,
+      reason: "down",
+      transient: true,
+    });
+    // First attempt — schedules retry with 60s backoff.
+    await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([adapter]),
+      now: new Date("2026-04-09T12:00:00.000Z"),
+      retryBackoffMs: [60_000, 300_000],
+    });
+    // 30s later — backoff window not elapsed; row should be skipped.
+    const result = await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([adapter]),
+      now: new Date("2026-04-09T12:00:30.000Z"),
+      retryBackoffMs: [60_000, 300_000],
+    });
+    expect(result.examined).toBe(0);
+    // Adapter only called once (the original attempt)
+    expect(calls).toHaveLength(1);
+  });
+
+  it("publisher re-attempts after next_retry_at elapses — eventual success clears retry state", async () => {
+    insertScheduledPost(db, row("p1"));
+    let i = 0;
+    const adapter = {
+      channels: ["facebook"],
+      async publish() {
+        i += 1;
+        if (i === 1) {
+          return {
+            ok: false,
+            reason: "rate-limited",
+            transient: true,
+          } as const;
+        }
+        return { ok: true, publishedId: "fb-ok" } as const;
+      },
+    };
+    // Attempt 1 fails transiently.
+    await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([adapter]),
+      now: new Date("2026-04-09T12:00:00.000Z"),
+      retryBackoffMs: [60_000],
+    });
+    // Attempt 2, 90s later, succeeds.
+    const result = await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([adapter]),
+      now: new Date("2026-04-09T12:01:30.000Z"),
+      retryBackoffMs: [60_000],
+    });
+    expect(result.published).toHaveLength(1);
+    expect(result.published[0]?.publishedId).toBe("fb-ok");
+
+    const updated = listScheduledPosts(db, { planId: "plan-1" })[0];
+    expect(updated?.status).toBe("published");
+    expect(updated?.nextRetryAt).toBeNull();
+
+    const publishedEvent = db
+      .prepare("SELECT payload FROM events WHERE kind = 'post-published'")
+      .get() as { payload: string };
+    expect(JSON.parse(publishedEvent.payload)).toMatchObject({
+      postId: "p1",
+      retriesSpent: 1,
+    });
+  });
+
+  it("transient → transient → ... → exhausts retries → marked failed with retry counter", async () => {
+    insertScheduledPost(db, row("p1"));
+    const { adapter } = recordingAdapter(["facebook"], {
+      ok: false,
+      reason: "still down",
+      transient: true,
+    });
+    const backoff = [60_000, 120_000];
+    // Attempt 1 → retry 1 scheduled
+    await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([adapter]),
+      now: new Date("2026-04-09T12:00:00.000Z"),
+      retryBackoffMs: backoff,
+    });
+    // Attempt 2 (retry 1) → retry 2 scheduled
+    await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([adapter]),
+      now: new Date("2026-04-09T12:01:30.000Z"),
+      retryBackoffMs: backoff,
+    });
+    // Attempt 3 (retry 2) → retries exhausted → failed
+    const final = await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([adapter]),
+      now: new Date("2026-04-09T12:05:00.000Z"),
+      retryBackoffMs: backoff,
+    });
+    expect(final.failed).toHaveLength(1);
+    expect(final.failed[0]?.reason).toContain("after 2 retries");
+    expect(final.retrying).toHaveLength(0);
+
+    const updated = listScheduledPosts(db, { planId: "plan-1" })[0];
+    expect(updated?.status).toBe("failed");
+    expect(updated?.nextRetryAt).toBeNull();
+    expect(updated?.retryCount).toBe(2);
+
+    const failedEvent = db
+      .prepare("SELECT payload FROM events WHERE kind = 'post-publish-failed'")
+      .get() as { payload: string };
+    expect(JSON.parse(failedEvent.payload)).toMatchObject({
+      postId: "p1",
+      retriesSpent: 2,
+    });
+  });
+
+  it("non-transient failure goes straight to failed (no retry)", async () => {
+    insertScheduledPost(db, row("p1"));
+    const { adapter } = recordingAdapter(["facebook"], {
+      ok: false,
+      reason: "bad token",
+      // transient: undefined → treated as non-transient
+    });
+    const result = await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([adapter]),
+      now: new Date("2026-04-09T12:00:00.000Z"),
+    });
+    expect(result.failed).toHaveLength(1);
+    expect(result.retrying).toEqual([]);
+    expect(listScheduledPosts(db)[0]?.status).toBe("failed");
+    expect(listScheduledPosts(db)[0]?.retryCount).toBe(0);
+  });
+
+  it("non-transient failure even after prior transient retries goes to failed (no further retry)", async () => {
+    insertScheduledPost(db, row("p1"));
+    let i = 0;
+    const adapter = {
+      channels: ["facebook"],
+      async publish() {
+        i += 1;
+        if (i === 1) {
+          return { ok: false, reason: "down", transient: true } as const;
+        }
+        // Second call comes back non-transient (e.g. token revoked)
+        return { ok: false, reason: "bad token" } as const;
+      },
+    };
+    await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([adapter]),
+      now: new Date("2026-04-09T12:00:00.000Z"),
+      retryBackoffMs: [60_000],
+    });
+    const result = await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([adapter]),
+      now: new Date("2026-04-09T12:02:00.000Z"),
+      retryBackoffMs: [60_000],
+    });
+    expect(result.failed).toHaveLength(1);
+    expect(result.failed[0]?.reason).toBe("bad token");
+    expect(listScheduledPosts(db)[0]?.status).toBe("failed");
+  });
+
+  it("adapter throwing is treated as transient (defense in depth)", async () => {
+    insertScheduledPost(db, row("p1"));
+    const result = await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([throwingAdapter(["facebook"], "boom")]),
+      now: new Date("2026-04-09T12:00:00.000Z"),
+      retryBackoffMs: [60_000],
+    });
+    expect(result.retrying).toHaveLength(1);
+    expect(result.failed).toEqual([]);
+    expect(listScheduledPosts(db)[0]?.status).toBe("pending");
+    expect(listScheduledPosts(db)[0]?.retryCount).toBe(1);
+  });
+
+  it("missing adapter is NOT retried — fails immediately", async () => {
+    insertScheduledPost(db, row("p1", { channel: "tiktok" }));
+    const result = await publishDuePosts({
+      db,
+      adapters: fallbackRegistry([]),
+      now: new Date("2026-04-09T12:00:00.000Z"),
+    });
+    expect(result.failed).toHaveLength(1);
+    expect(result.retrying).toEqual([]);
+    expect(listScheduledPosts(db)[0]?.retryCount).toBe(0);
   });
 });
 

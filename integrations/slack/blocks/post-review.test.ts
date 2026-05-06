@@ -20,6 +20,8 @@ function post(overrides: Partial<ScheduledPost> = {}): ScheduledPost {
     publishedId: null,
     failureReason: null,
     editHistory: [],
+    retryCount: 0,
+    nextRetryAt: null,
     ...overrides,
   };
 }
