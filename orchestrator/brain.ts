@@ -50,6 +50,49 @@ const repoSchema = z.object({
   monorepoPath: z.string().optional(),
 });
 
+/**
+ * Per-app marketing schedule rules consulted by the Marketer when
+ * preparing posts. Optional — apps without rules fall back to a fixed
+ * 09:00 UTC default for every post. See §10 of MASTER_PLAN.md.
+ *
+ * v1 honors `preferredHours[0]`, `timezone`, `allowedDays`, and
+ * `blackoutDates`. Cross-post coordination (`timesPerDay`,
+ * `minSpacingMinutes`) requires inspecting the existing scheduled
+ * queue and is deferred — the schema accepts the fields but the
+ * resolver doesn't enforce them yet.
+ */
+const dayOfWeekSchema = z.enum([
+  "mon",
+  "tue",
+  "wed",
+  "thu",
+  "fri",
+  "sat",
+  "sun",
+]);
+const scheduleRuleSchema = z.object({
+  /** HH:MM 24h, e.g. "09:00", "13:30". v1 uses preferredHours[0]. */
+  preferredHours: z.array(z.string()).min(1),
+  /** IANA timezone like "Europe/Budapest" or "UTC". */
+  timezone: z.string().min(1),
+  /** Days a post is allowed to publish. Posts on disallowed days push forward. */
+  allowedDays: z.array(dayOfWeekSchema).optional(),
+  /** ISO date strings (YYYY-MM-DD) — posts on these dates push forward. */
+  blackoutDates: z.array(z.string()).optional(),
+  /** Reserved for v2 cross-post coordination. Not enforced yet. */
+  timesPerDay: z.number().int().min(1).optional(),
+  /** Reserved for v2 cross-post coordination. Not enforced yet. */
+  minSpacingMinutes: z.number().int().min(0).optional(),
+});
+const marketingSchema = z.object({
+  /** Default rule applied to every post unless overridden per-channel. */
+  scheduleRules: z
+    .object({
+      default: scheduleRuleSchema.optional(),
+    })
+    .optional(),
+});
+
 export const brainSchema = z.object({
   schemaVersion: z.literal(1),
   projectName: z.string().min(1),
@@ -73,6 +116,7 @@ export const brainSchema = z.object({
   connections: z.record(z.string(), looseObjectSchema).default({}),
   priorities: z.array(prioritySchema).default([]),
   alertThresholds: looseObjectSchema.optional(),
+  marketing: marketingSchema.optional(),
   wip: wipSchema.default({}),
   metrics: z
     .object({
@@ -84,6 +128,8 @@ export const brainSchema = z.object({
 
 export type Brain = z.infer<typeof brainSchema>;
 export type BrainInput = z.input<typeof brainSchema>;
+export type ScheduleRule = z.infer<typeof scheduleRuleSchema>;
+export type DayOfWeek = z.infer<typeof dayOfWeekSchema>;
 
 export function loadBrain(filePath: string): Brain {
   const text = fs.readFileSync(filePath, "utf8");

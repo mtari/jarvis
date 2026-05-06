@@ -1,6 +1,9 @@
 import Database from "better-sqlite3";
 import type { AnthropicClient } from "../orchestrator/agent-sdk-runtime.ts";
+import { loadBrain } from "../orchestrator/brain.ts";
+import type { ScheduleRule } from "../orchestrator/brain.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
+import { resolveScheduledAt } from "../orchestrator/marketing-schedule.ts";
 import { findPlan } from "../orchestrator/plan-store.ts";
 import type { Plan, PlanSection } from "../orchestrator/plan.ts";
 import {
@@ -9,7 +12,7 @@ import {
   type ScheduledPostInput,
 } from "../orchestrator/scheduled-posts.ts";
 import { humanize } from "../tools/humanizer.ts";
-import { dbFile } from "../cli/paths.ts";
+import { brainFile, dbFile } from "../cli/paths.ts";
 
 /**
  * Marketer agent — Phase 3 v1.
@@ -88,9 +91,6 @@ export class MarketerError extends Error {
   }
 }
 
-/** Default time-of-day applied when entries don't specify one. UTC. */
-const DEFAULT_POST_TIME_UTC = "09:00:00.000Z";
-
 export async function prepareMarketingPlan(
   input: PrepareMarketingPlanInput,
 ): Promise<PrepareMarketingPlanResult> {
@@ -118,6 +118,18 @@ export async function prepareMarketingPlan(
     throw new MarketerError(
       `plan ${input.planId} has no parseable Content calendar entries`,
     );
+  }
+
+  // Pull the optional scheduling rule from the brain. When present,
+  // resolveScheduledAt applies preferredHours / timezone / allowedDays
+  // / blackoutDates per §10. When absent, every post defaults to
+  // 09:00 UTC on its declared Date.
+  let scheduleRule: ScheduleRule | undefined;
+  try {
+    const brain = loadBrain(brainFile(input.dataDir, record.vault, record.app));
+    scheduleRule = brain.marketing?.scheduleRules?.default;
+  } catch {
+    // No brain or unreadable — fall through to default scheduling.
   }
 
   const db = new Database(dbFile(input.dataDir));
@@ -149,7 +161,11 @@ export async function prepareMarketingPlan(
         { client: input.client },
       );
       const postId = makePostId(input.planId, entry.index);
-      const scheduledAt = `${entry.date}T${DEFAULT_POST_TIME_UTC}`;
+      const resolved = resolveScheduledAt({
+        date: entry.date,
+        ...(scheduleRule !== undefined && { rule: scheduleRule }),
+      });
+      const scheduledAt = resolved.scheduledAt;
 
       const row: ScheduledPostInput = {
         id: postId,
