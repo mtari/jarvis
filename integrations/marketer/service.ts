@@ -8,6 +8,7 @@ import {
   type AnthropicClient,
 } from "../../orchestrator/agent-sdk-runtime.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
+import { reconcileMarketingPlanState } from "../../orchestrator/marketing-plan-lifecycle.ts";
 import { listPlans, type PlanRecord } from "../../orchestrator/plan-store.ts";
 import {
   countScheduledPosts,
@@ -159,6 +160,29 @@ export async function runMarketerTick(
         postCount: fired.prepared.length,
       });
       writeFireEvent(input.dataDir, record, fired.prepared.length);
+
+      // Move plan approved → executing (and possibly → done if every row
+      // already terminal, e.g. a plan with all skipped posts; rare but
+      // safe). Reconcile is idempotent and per-plan-scoped.
+      try {
+        const reconcile = reconcileMarketingPlanState({
+          dataDir: input.dataDir,
+          dbFilePath: dbFile(input.dataDir),
+          planId: record.id,
+          actor: "marketer",
+        });
+        for (const t of reconcile.transitioned) {
+          input.ctx.logger.info("plan transitioned", {
+            planId: record.id,
+            from: t.from,
+            to: t.to,
+          });
+        }
+      } catch (err) {
+        input.ctx.logger.error("plan reconcile failed", err, {
+          planId: record.id,
+        });
+      }
     } catch (err) {
       const reason =
         err instanceof MarketerError

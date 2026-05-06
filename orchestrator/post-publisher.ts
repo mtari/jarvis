@@ -72,24 +72,28 @@ export interface PublishDuePostsInput {
 
 export interface PublishedRow {
   postId: string;
+  planId: string;
   channel: string;
   publishedId: string;
 }
 
 export interface FailedRow {
   postId: string;
+  planId: string;
   channel: string;
   reason: string;
 }
 
 export interface SkippedRow {
   postId: string;
+  planId: string;
   channel: string;
   reason: string;
 }
 
 export interface RetriedRow {
   postId: string;
+  planId: string;
   channel: string;
   /** Retry attempt number that just failed (1-indexed). */
   attempt: number;
@@ -139,6 +143,7 @@ export async function publishDuePosts(
       markFailed(input.db, row, reason);
       result.failed.push({
         postId: row.id,
+        planId: row.planId,
         channel: row.channel,
         reason,
       });
@@ -166,6 +171,7 @@ export async function publishDuePosts(
       markPublished(input.db, row, publishResult.publishedId, now);
       result.published.push({
         postId: row.id,
+        planId: row.planId,
         channel: row.channel,
         publishedId: publishResult.publishedId,
       });
@@ -184,6 +190,7 @@ export async function publishDuePosts(
       markFailed(input.db, row, publishResult.reason);
       result.failed.push({
         postId: row.id,
+        planId: row.planId,
         channel: row.channel,
         reason: publishResult.reason,
       });
@@ -210,6 +217,7 @@ function handleTransient(
     markFailed(db, row, reasonWithCounter);
     result.failed.push({
       postId: row.id,
+      planId: row.planId,
       channel: row.channel,
       reason: reasonWithCounter,
     });
@@ -220,6 +228,7 @@ function handleTransient(
   scheduleRetry(db, row, reason, nextRetryAt, nextAttempt);
   result.retrying.push({
     postId: row.id,
+    planId: row.planId,
     channel: row.channel,
     attempt: nextAttempt,
     reason,

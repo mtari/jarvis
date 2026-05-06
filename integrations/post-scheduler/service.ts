@@ -4,6 +4,7 @@ import {
   publishDuePosts,
 } from "../../orchestrator/post-publisher.ts";
 import { listOnboardedApps } from "../../orchestrator/brain.ts";
+import { reconcileMarketingPlanState } from "../../orchestrator/marketing-plan-lifecycle.ts";
 import { dbFile } from "../../cli/paths.ts";
 import {
   createFacebookAdapter,
@@ -368,6 +369,31 @@ export async function runPostSchedulerTick(
         channel: f.channel,
         reason: f.reason,
       });
+    }
+
+    // Reconcile every plan whose rows changed state this tick. Best-effort:
+    // a reconcile failure for one plan doesn't block the others.
+    const touchedPlanIds = new Set<string>();
+    for (const r of result.published) touchedPlanIds.add(r.planId);
+    for (const r of result.failed) touchedPlanIds.add(r.planId);
+    for (const planId of touchedPlanIds) {
+      try {
+        const reconcile = reconcileMarketingPlanState({
+          dataDir: input.dataDir,
+          dbFilePath: dbFile(input.dataDir),
+          planId,
+          actor: "post-scheduler",
+        });
+        for (const t of reconcile.transitioned) {
+          input.ctx.logger.info("plan transitioned", {
+            planId,
+            from: t.from,
+            to: t.to,
+          });
+        }
+      } catch (err) {
+        input.ctx.logger.error("plan reconcile failed", err, { planId });
+      }
     }
   } finally {
     db.close();
