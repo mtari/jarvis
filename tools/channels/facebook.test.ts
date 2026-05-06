@@ -232,10 +232,8 @@ describe("createFacebookAdapter", () => {
     expect(result.ok).toBe(false);
   });
 
-  it("rejects posts with assets in v1 (text-only)", async () => {
-    const { fetcher, calls } = fakeFetch([
-      { ok: true, body: { id: "x" } },
-    ]);
+  it("rejects local file assets — multipart upload not supported in v1", async () => {
+    const { fetcher, calls } = fakeFetch([]);
     const a = createFacebookAdapter({
       pageId: "p",
       accessToken: "t",
@@ -244,10 +242,117 @@ describe("createFacebookAdapter", () => {
     const result = await a.publish(input({ assets: ["hero.jpg"] }));
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.reason).toContain("text-only");
+      expect(result.reason).toContain("HTTP(S) asset URLs");
     }
-    // Ensure we did NOT make a Graph API call when assets present.
     expect(calls).toHaveLength(0);
+  });
+
+  it("rejects multi-asset posts in v1 — attached_media flow not supported", async () => {
+    const { fetcher, calls } = fakeFetch([]);
+    const a = createFacebookAdapter({
+      pageId: "p",
+      accessToken: "t",
+      fetcher,
+    });
+    const result = await a.publish(
+      input({
+        assets: [
+          "https://cdn.example.com/a.jpg",
+          "https://cdn.example.com/b.jpg",
+        ],
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("single asset");
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it("routes a single image URL to /photos with caption + url", async () => {
+    const { fetcher, calls } = fakeFetch([
+      { ok: true, body: { id: "photo_42", post_id: "page_42" } },
+    ]);
+    const a = createFacebookAdapter({
+      pageId: "12345",
+      accessToken: "secret",
+      fetcher,
+    });
+    const result = await a.publish(
+      input({
+        content: "Beautiful sunset",
+        assets: ["https://cdn.example.com/sunset.jpg"],
+      }),
+    );
+    expect(result).toEqual({ ok: true, publishedId: "page_42" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe(
+      `https://graph.facebook.com/${DEFAULT_GRAPH_API_VERSION}/12345/photos`,
+    );
+    const params = calls[0]?.init?.body as URLSearchParams;
+    expect(params.get("url")).toBe("https://cdn.example.com/sunset.jpg");
+    expect(params.get("caption")).toBe("Beautiful sunset");
+    expect(params.get("access_token")).toBe("secret");
+    // Should NOT have the feed-shape `message` field.
+    expect(params.has("message")).toBe(false);
+  });
+
+  it("routes a single video URL to /videos with description + file_url", async () => {
+    const { fetcher, calls } = fakeFetch([
+      { ok: true, body: { id: "video_99" } },
+    ]);
+    const a = createFacebookAdapter({
+      pageId: "12345",
+      accessToken: "t",
+      fetcher,
+    });
+    const result = await a.publish(
+      input({
+        content: "Watch this",
+        assets: ["https://cdn.example.com/clip.mp4"],
+      }),
+    );
+    expect(result).toEqual({ ok: true, publishedId: "video_99" });
+    expect(calls[0]?.url).toBe(
+      `https://graph.facebook.com/${DEFAULT_GRAPH_API_VERSION}/12345/videos`,
+    );
+    const params = calls[0]?.init?.body as URLSearchParams;
+    expect(params.get("file_url")).toBe(
+      "https://cdn.example.com/clip.mp4",
+    );
+    expect(params.get("description")).toBe("Watch this");
+  });
+
+  it("treats unknown URL extension as image (FB default)", async () => {
+    const { fetcher, calls } = fakeFetch([
+      { ok: true, body: { id: "x", post_id: "p" } },
+    ]);
+    const a = createFacebookAdapter({
+      pageId: "p",
+      accessToken: "t",
+      fetcher,
+    });
+    await a.publish(
+      input({ assets: ["https://cdn.example.com/no-extension"] }),
+    );
+    expect(calls[0]?.url).toContain("/photos");
+  });
+
+  it("ignores query string + fragment when classifying URL extension", async () => {
+    const { fetcher, calls } = fakeFetch([
+      { ok: true, body: { id: "v", post_id: "v" } },
+    ]);
+    const a = createFacebookAdapter({
+      pageId: "p",
+      accessToken: "t",
+      fetcher,
+    });
+    await a.publish(
+      input({
+        assets: ["https://cdn.example.com/clip.mp4?token=abc#t=10"],
+      }),
+    );
+    expect(calls[0]?.url).toContain("/videos");
   });
 
   it("dryRun returns synthetic id without calling fetch", async () => {

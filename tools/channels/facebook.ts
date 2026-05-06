@@ -10,16 +10,22 @@ import type { ChannelAdapter, PublishInput, PublishResult } from "./types.ts";
  * the target Page id. See `tools/channels/README.md` for the
  * step-by-step setup.
  *
- * v1 publishes text-only posts via `POST /{page-id}/feed`. Image/video
- * uploads (separate `/photos` / `/videos` endpoints with attached
- * binary) land when the first plan needs them — the parser already
- * captures `Assets:` so the adapter can read them.
+ * Routing by asset count + type:
+ *   - 0 assets       → POST /{page-id}/feed   { message }
+ *   - 1 image URL    → POST /{page-id}/photos { url, caption }
+ *   - 1 video URL    → POST /{page-id}/videos { file_url, description }
+ *   - 1 unknown URL  → POST /{page-id}/photos (image is the FB default)
+ *   - >1 asset       → fail loud (multi-image attached_media flow lands later)
+ *   - non-URL asset  → fail loud (multipart upload of local files lands later)
  *
  * Errors map to `PublishResult`:
  *   - 2xx → `ok: true`, `publishedId: response.id`
  *   - 5xx, 429, network → `ok: false`, `transient: true` (caller may retry)
  *   - 4xx (token, permission, invalid Page id) → `ok: false`, `transient: false`
  */
+
+const IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".gif", ".webp"] as const;
+const VIDEO_EXTS = [".mp4", ".mov", ".webm", ".m4v"] as const;
 
 export const DEFAULT_GRAPH_API_VERSION = "v19.0";
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -62,14 +68,9 @@ export function createFacebookAdapter(
   return {
     channels: ["facebook"],
     async publish(input: PublishInput): Promise<PublishResult> {
-      if (input.assets.length > 0) {
-        // v1 doesn't yet upload assets. Fail loud rather than silently
-        // posting a text-only version of something that should have
-        // images.
-        return {
-          ok: false,
-          reason: `Facebook adapter v1 supports text-only posts; got ${input.assets.length} asset(s). Image/video upload lands in a follow-up.`,
-        };
+      const route = chooseEndpoint(input.assets);
+      if (!route.ok) {
+        return { ok: false, reason: route.reason };
       }
       if (opts.dryRun === true) {
         return {
@@ -77,16 +78,21 @@ export function createFacebookAdapter(
           publishedId: `fb-dryrun-${input.postId}`,
         };
       }
-      const url = `https://graph.facebook.com/${version}/${encodeURIComponent(opts.pageId)}/feed`;
+      const baseUrl = `https://graph.facebook.com/${version}/${encodeURIComponent(opts.pageId)}/${route.endpoint}`;
       const body = new URLSearchParams({
-        message: input.content,
         access_token: opts.accessToken,
+        ...route.fields,
       });
+      // The user's authored caption / description / message goes on
+      // the field that matches the endpoint. Keep the content trimmed
+      // — Graph API rejects oversized URL-encoded posts.
+      body.set(route.contentField, input.content);
+
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       let response: Response;
       try {
-        response = await fetcher(url, {
+        response = await fetcher(baseUrl, {
           method: "POST",
           body,
           signal: controller.signal,
@@ -103,9 +109,16 @@ export function createFacebookAdapter(
 
       if (response.ok) {
         try {
-          const json = (await response.json()) as { id?: string };
-          if (typeof json.id === "string") {
-            return { ok: true, publishedId: json.id };
+          const json = (await response.json()) as {
+            id?: string;
+            post_id?: string;
+          };
+          // /photos returns both `id` (photo id) and `post_id` (the
+          // post the photo was attached to). Prefer `post_id` since
+          // that's what the operator sees as a post in FB.
+          const publishedId = json.post_id ?? json.id;
+          if (typeof publishedId === "string") {
+            return { ok: true, publishedId };
           }
           return {
             ok: false,
@@ -135,6 +148,76 @@ export function createFacebookAdapter(
       };
     },
   };
+}
+
+interface RouteOk {
+  ok: true;
+  /** Graph API endpoint suffix — `feed`, `photos`, or `videos`. */
+  endpoint: "feed" | "photos" | "videos";
+  /** Field name carrying the user's content (`message` / `caption` / `description`). */
+  contentField: "message" | "caption" | "description";
+  /** Extra fields to include in the POST body (e.g. `url`, `file_url`). */
+  fields: Record<string, string>;
+}
+interface RouteFail {
+  ok: false;
+  reason: string;
+}
+
+/**
+ * Pure routing: picks the Graph API endpoint + body fields based on
+ * the asset list. See module header for the full table.
+ */
+export function chooseEndpoint(
+  assets: ReadonlyArray<string>,
+): RouteOk | RouteFail {
+  if (assets.length === 0) {
+    return { ok: true, endpoint: "feed", contentField: "message", fields: {} };
+  }
+  if (assets.length > 1) {
+    return {
+      ok: false,
+      reason: `Facebook adapter v1 supports a single asset; got ${assets.length}. Multi-image attached_media lands in a follow-up.`,
+    };
+  }
+  const asset = assets[0]!;
+  if (!isHttpUrl(asset)) {
+    return {
+      ok: false,
+      reason: `Facebook adapter v1 only accepts HTTP(S) asset URLs; got "${asset}". Multipart upload of local files lands in a follow-up.`,
+    };
+  }
+  const kind = classifyAsset(asset);
+  if (kind === "video") {
+    return {
+      ok: true,
+      endpoint: "videos",
+      contentField: "description",
+      fields: { file_url: asset },
+    };
+  }
+  // Default to image for known image extensions AND unknown extensions
+  // (FB's default attachment is a photo; using /photos for an unknown
+  // URL fails clean rather than silently dropping the asset).
+  return {
+    ok: true,
+    endpoint: "photos",
+    contentField: "caption",
+    fields: { url: asset },
+  };
+}
+
+function isHttpUrl(s: string): boolean {
+  return /^https?:\/\//i.test(s);
+}
+
+function classifyAsset(url: string): "image" | "video" | "unknown" {
+  const lower = url.toLowerCase();
+  // Strip query string + fragment before extension match.
+  const cleaned = lower.split("?")[0]!.split("#")[0]!;
+  if (VIDEO_EXTS.some((ext) => cleaned.endsWith(ext))) return "video";
+  if (IMAGE_EXTS.some((ext) => cleaned.endsWith(ext))) return "image";
+  return "unknown";
 }
 
 /**

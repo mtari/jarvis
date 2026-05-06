@@ -97,11 +97,21 @@ If the post lands on the Page, verify `posts list --status published` shows the 
 
 ### What v1 supports
 
-- Text-only posts via `POST /{page-id}/feed`.
+The adapter routes by asset list:
+
+| `Assets:` | Endpoint | Body fields | Use when |
+|-----------|----------|-------------|----------|
+| empty | `POST /{page-id}/feed` | `message` | text-only post |
+| 1 image URL | `POST /{page-id}/photos` | `url`, `caption` | single image (`.jpg`/`.jpeg`/`.png`/`.gif`/`.webp`) |
+| 1 video URL | `POST /{page-id}/videos` | `file_url`, `description` | single video (`.mp4`/`.mov`/`.webm`/`.m4v`) |
+| 1 unknown URL | `POST /{page-id}/photos` | `url`, `caption` | URL with no recognized extension — defaults to image |
+
+Asset values must be HTTP(S) URLs (the adapter doesn't host or upload binaries). Marketer's content-calendar parser accepts them as-is from the plan.
 
 ### What v1 does NOT support yet
 
-- **Image / video uploads**. Posts with non-empty `Assets:` rows get returned as `ok: false` with an explanatory reason — the row goes to `failed` until the assets-upload follow-up ships.
+- **Multi-image posts** (`Assets:` with more than one entry). The `attached_media` flow uploads each photo with `published=false`, then attaches them to a single feed post. Lands in a follow-up.
+- **Multipart upload of local files**. Today the asset must be a URL the FB Graph API can fetch — local file paths fail loud with an explanatory reason.
 - **Token rotation**. When the Page Access Token eventually expires, the adapter starts returning 4xx; you regenerate and replace it.
 - **Webhook ingestion** (comments, replies, engagement metrics). The Analyst track will absorb that signal once it lands.
 
