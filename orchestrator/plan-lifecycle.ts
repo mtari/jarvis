@@ -2,7 +2,12 @@
 // action handlers. Each function returns a structured result; callers handle
 // I/O (stdout, Slack post, etc.).
 
+import fs from "node:fs";
 import Database from "better-sqlite3";
+import {
+  applyBrainUpdates,
+  type ApplyBrainUpdatesResult,
+} from "./brain-update-applier.ts";
 import { appendEvent } from "./event-log.ts";
 import { recordFeedback } from "./feedback-store.ts";
 import {
@@ -30,6 +35,14 @@ export interface ApproveResult {
   record: PlanRecord;
   next: Plan;
   parentTransitioned?: { id: string; from: string; to: "executing" };
+  /**
+   * Set when the approved plan was an improvement/meta plan that
+   * carried a parseable `## Brain changes (proposed)` section. The
+   * applier mutates `brain.json` in place; the result reports each
+   * applied / skipped / errored change so the CLI / Slack surface
+   * can render it for the operator.
+   */
+  brainChangesApplied?: ApplyBrainUpdatesResult;
 }
 
 export interface ApproveOptions {
@@ -134,6 +147,71 @@ export function approvePlan(
 
   const result: ApproveResult = { ok: true, record, next };
   if (parentChain) result.parentTransitioned = parentChain.transition;
+
+  // Auto-apply brain updates for meta plans. Best-effort: the
+  // approval has already landed; an applier failure is reported in
+  // `brainChangesApplied.errors` rather than rolling back the
+  // approve.
+  if (
+    next.metadata.type === "improvement" &&
+    next.metadata.subtype === "meta"
+  ) {
+    try {
+      const planMarkdown = fs.readFileSync(record.path, "utf8");
+      const applyResult = applyBrainUpdates({
+        dataDir,
+        vault: record.vault,
+        app: record.app,
+        planMarkdown,
+      });
+      if (applyResult.hasChanges) {
+        result.brainChangesApplied = applyResult;
+        const writeDb = new Database(dbFilePath);
+        try {
+          appendEvent(writeDb, {
+            appId: record.app,
+            vaultId: record.vault,
+            kind: "brain-updated",
+            payload: {
+              planId,
+              applied: applyResult.applied.map((a) => ({
+                path: a.path,
+                op: a.op,
+              })),
+              skipped: applyResult.skipped.map((s) => ({
+                path: s.path,
+                op: s.op,
+                reason: s.reason,
+              })),
+              errors: applyResult.errors.map((e) => ({
+                path: e.path,
+                op: e.op,
+                reason: e.reason,
+              })),
+              actor,
+            },
+          });
+        } finally {
+          writeDb.close();
+        }
+      }
+    } catch (err) {
+      result.brainChangesApplied = {
+        hasChanges: true,
+        applied: [],
+        skipped: [],
+        errors: [
+          {
+            path: "*",
+            op: "refine",
+            reason: `applier crashed: ${err instanceof Error ? err.message : String(err)}`,
+            rawValueText: "",
+          },
+        ],
+      };
+    }
+  }
+
   return result;
 }
 

@@ -1,7 +1,9 @@
 import fs from "node:fs";
+import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { dbFile } from "../cli/paths.ts";
+import { brainFile, dbFile } from "../cli/paths.ts";
+import { loadBrain, saveBrain } from "./brain.ts";
 import {
   dropPlan,
   makeInstallSandbox,
@@ -104,6 +106,129 @@ describe("plan-lifecycle", () => {
       expect(findPlan(sandbox.dataDir, parentId)?.plan.metadata.status).toBe(
         "executing",
       );
+    });
+
+    it("auto-applies brain updates from a meta plan on approval", () => {
+      const planPath = path.join(
+        sandbox.dataDir,
+        "vaults",
+        "personal",
+        "plans",
+        "demo",
+        "absorb-brand.md",
+      );
+      fs.mkdirSync(path.dirname(planPath), { recursive: true });
+      fs.writeFileSync(
+        planPath,
+        [
+          "# Plan: Absorb brand voice",
+          "Type: improvement",
+          "Subtype: meta",
+          "ImplementationReview: skip",
+          "App: demo",
+          "Priority: normal",
+          "Destructive: false",
+          "Status: awaiting-review",
+          "Author: strategist",
+          "Confidence: 75 — fixture",
+          "",
+          "## Problem",
+          "x",
+          "",
+          "## Build plan",
+          "- Apply.",
+          "",
+          "## Brain changes (proposed)",
+          '- `brand.voice`: refine — "warm, factual"',
+          '- `stack.framework`: conflict — disagree',
+          "",
+          "## Doc summary",
+          "x",
+          "",
+          "## Testing strategy",
+          "Manual diff.",
+          "",
+          "## Acceptance criteria",
+          "- ok",
+          "",
+          "## Success metric",
+          "- Metric: x",
+          "- Baseline: x",
+          "- Target: x",
+          "- Data source: x",
+          "",
+          "## Observation window",
+          "N/A.",
+          "",
+          "## Connections required",
+          "- None: present",
+          "",
+          "## Rollback",
+          "Revert.",
+          "",
+          "## Estimated effort",
+          "- Claude calls: 1",
+          "- Your review time: 5 min",
+          "- Wall-clock to ship: minutes",
+          "",
+          "## Amendment clauses",
+          "Pause if conflicting.",
+          "",
+        ].join("\n"),
+      );
+
+      // Seed a minimal brain for the demo app
+      const brainPath = brainFile(sandbox.dataDir, "personal", "demo");
+      fs.mkdirSync(path.dirname(brainPath), { recursive: true });
+      saveBrain(brainPath, {
+        schemaVersion: 1,
+        projectName: "demo",
+        projectType: "app",
+        projectStatus: "active",
+        projectPriority: 3,
+        userPreferences: {},
+        connections: {},
+        priorities: [],
+        wip: {},
+      });
+
+      const result = approvePlan(
+        sandbox.dataDir,
+        dbFile(sandbox.dataDir),
+        "absorb-brand",
+      );
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.brainChangesApplied?.hasChanges).toBe(true);
+      expect(result.brainChangesApplied?.applied).toHaveLength(1);
+      expect(result.brainChangesApplied?.skipped).toHaveLength(1);
+
+      const after = loadBrain(brainPath);
+      expect(after.brand?.["voice"]).toBe("warm, factual");
+
+      // brain-updated event recorded
+      const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+      try {
+        const events = db
+          .prepare("SELECT payload FROM events WHERE kind = 'brain-updated'")
+          .all() as Array<{ payload: string }>;
+        expect(events).toHaveLength(1);
+      } finally {
+        db.close();
+      }
+    });
+
+    it("non-meta plans don't trigger brain applier", () => {
+      dropPlan(sandbox, "ordinary", { status: "awaiting-review" });
+      const result = approvePlan(
+        sandbox.dataDir,
+        dbFile(sandbox.dataDir),
+        "ordinary",
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.brainChangesApplied).toBeUndefined();
+      }
     });
   });
 
