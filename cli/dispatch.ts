@@ -15,6 +15,7 @@ import { runObserveImpact } from "./commands/observe-impact.ts";
 import { runOnboard } from "./commands/onboard.ts";
 import { runPlan } from "./commands/plan.ts";
 import { runPlans } from "./commands/plans.ts";
+import { runPosts } from "./commands/posts.ts";
 import { runProfile } from "./commands/profile.ts";
 import { runReject } from "./commands/reject.ts";
 import { runReprioritize } from "./commands/reprioritize.ts";
@@ -82,6 +83,13 @@ Utilities:
   marketer prepare <plan-id>  Parse an approved marketing plan's content calendar,
                               humanize each post, persist pending rows to
                               scheduled_posts. Idempotent.
+  posts list [--plan <id>] [--app <name>] [--status <s>] [--limit N] [--format table|json]
+                              Inspect scheduled_posts rows.
+  posts edit <post-id> --inline "<text>" | --file <path>
+                              Replace a pending row's content; appends to
+                              edit_history. Refuses on already-published rows.
+  posts skip <post-id> --reason "<text>"
+                              Mark a row as skipped — scheduler won't publish it.
   scout score [--vault <v>]   Score unscored ideas in Business_Ideas.md. Writes
                               score, scoredAt, rationale back to the file and
                               records an idea-scored event per idea.
@@ -196,6 +204,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runScout(rest);
     case "marketer":
       return runMarketer(rest);
+    case "posts":
+      return runPosts(rest);
     case "observe-impact":
       return runObserveImpact(rest);
     case "status":
