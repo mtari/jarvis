@@ -24,6 +24,12 @@ import type { App as BoltApp } from "@slack/bolt";
 export type ActionHandler = (args: ActionHandlerArgs) => Promise<void>;
 export type ViewHandler = (args: ViewHandlerArgs) => Promise<void>;
 export type CommandHandler = (args: CommandHandlerArgs) => Promise<void>;
+export type MessageHandler = (args: MessageHandlerArgs) => Promise<void>;
+
+export interface MessageHandlerArgs {
+  message: Record<string, unknown>;
+  client?: FakeWebClient;
+}
 
 export interface ActionHandlerArgs {
   ack: () => Promise<void>;
@@ -94,16 +100,21 @@ export interface FakeBoltApp {
   invokeAction(id: string, args: Partial<ActionHandlerArgs>): Promise<void>;
   invokeView(id: string, args: Partial<ViewHandlerArgs>): Promise<void>;
   invokeCommand(id: string, args: Partial<CommandHandlerArgs>): Promise<void>;
+  /** Fires every registered `app.message` handler in order. */
+  invokeMessage(args: Partial<MessageHandlerArgs>): Promise<void>;
   /** Names of registered actions / views / commands — for assertions. */
   registeredActionIds(): string[];
   registeredViewIds(): string[];
   registeredCommandIds(): string[];
+  /** Number of registered message handlers (Bolt allows multiple). */
+  registeredMessageCount(): number;
 }
 
 export function makeFakeBoltApp(): FakeBoltApp {
   const actions = new Map<string, ActionHandler>();
   const views = new Map<string, ViewHandler>();
   const commands = new Map<string, CommandHandler>();
+  const messages: MessageHandler[] = [];
 
   const proxy = {
     action(id: string, handler: ActionHandler) {
@@ -114,6 +125,9 @@ export function makeFakeBoltApp(): FakeBoltApp {
     },
     command(id: string, handler: CommandHandler) {
       commands.set(id, handler);
+    },
+    message(handler: MessageHandler) {
+      messages.push(handler);
     },
   };
 
@@ -140,9 +154,16 @@ export function makeFakeBoltApp(): FakeBoltApp {
       }
       await handler(buildCommandArgs(args));
     },
+    async invokeMessage(args) {
+      const built = buildMessageArgs(args);
+      for (const h of messages) {
+        await h(built);
+      }
+    },
     registeredActionIds: () => [...actions.keys()],
     registeredViewIds: () => [...views.keys()],
     registeredCommandIds: () => [...commands.keys()],
+    registeredMessageCount: () => messages.length,
   };
 }
 
@@ -223,6 +244,13 @@ function buildCommandArgs(p: Partial<CommandHandlerArgs>): CommandHandlerArgs {
     ack: p.ack ?? (async () => {}),
     command: p.command ?? { text: "", channel_id: "C-test" },
     respond: p.respond ?? (async () => {}),
+    ...(p.client !== undefined && { client: p.client }),
+  };
+}
+
+function buildMessageArgs(p: Partial<MessageHandlerArgs>): MessageHandlerArgs {
+  return {
+    message: p.message ?? { type: "message" },
     ...(p.client !== undefined && { client: p.client }),
   };
 }

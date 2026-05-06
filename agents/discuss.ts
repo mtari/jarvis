@@ -76,6 +76,15 @@ export type DiscussTurnResult =
   | { kind: "propose-setup-task"; title: string; detail: string }
   | { kind: "close"; text: string };
 
+/** A `<propose-*>` turn — the discriminated subset that requires an accept/reject decision. */
+export type DiscussProposalTurn = Extract<
+  DiscussTurnResult,
+  | { kind: "propose-plan" }
+  | { kind: "propose-idea" }
+  | { kind: "propose-note" }
+  | { kind: "propose-setup-task" }
+>;
+
 export class DiscussError extends Error {
   constructor(message: string) {
     super(message);
@@ -103,7 +112,7 @@ export async function runDiscuss(
   const systemPrompt = loadDiscussPrompt();
 
   const conversation: Array<{ role: "user" | "assistant"; content: string }> = [
-    { role: "user", content: buildInitialContext(input) },
+    { role: "user", content: buildInitialContextImpl(input) },
   ];
 
   recordEvent(input, conversationId, "conversation-started", {
@@ -179,6 +188,184 @@ export async function runDiscuss(
     `\n(Hit max turns of ${maxTurns}. Closing without an artifact.)\n`,
   );
   return { conversationId, turns, outcome: "closed" };
+}
+
+// ---------------------------------------------------------------------------
+// Stateless turn driver — the per-LLM-call primitive
+// ---------------------------------------------------------------------------
+
+export interface RunDiscussTurnInput {
+  client: AnthropicClient;
+  /** Full conversation so far, ending in a user message. */
+  conversation: ReadonlyArray<{
+    role: "user" | "assistant";
+    content: string;
+  }>;
+}
+
+export interface RunDiscussTurnOutput {
+  /** Raw assistant text — append to the conversation as-is for the next call. */
+  rawAssistantText: string;
+  /** Parsed turn result. */
+  turn: DiscussTurnResult;
+}
+
+/**
+ * One LLM call. Pure function (no event recording, no I/O). The CLI
+ * loop and the Slack thread handler both use this — each is responsible
+ * for state persistence appropriate to its surface.
+ */
+export async function runDiscussTurn(
+  input: RunDiscussTurnInput,
+): Promise<RunDiscussTurnOutput> {
+  const response = await input.client.chat({
+    system: loadDiscussPrompt(),
+    cacheSystem: true,
+    messages: [...input.conversation],
+  });
+  const turn = parseDiscussResponse(response.text);
+  return { rawAssistantText: response.text, turn };
+}
+
+// ---------------------------------------------------------------------------
+// Initial context + canonical helpers (used by CLI + Slack)
+// ---------------------------------------------------------------------------
+
+export interface BuildInitialContextInput {
+  app: string;
+  vault: string;
+  dataDir: string;
+  topic: string;
+}
+
+/**
+ * Renders the first user message that opens a discuss conversation:
+ * project context (brain) + free-text notes + the user's topic. Both
+ * the CLI loop and the Slack thread starter call this.
+ */
+export function buildDiscussInitialContext(
+  input: BuildInitialContextInput,
+): string {
+  return buildInitialContextImpl(input);
+}
+
+/**
+ * Stable, sortable conversation id. Format `discuss-YYYY-MM-DD-<8-hex>`.
+ */
+export function generateDiscussConversationId(now?: Date): string {
+  return generateConversationId(now);
+}
+
+/**
+ * Lifts a user's rejection comment into a next-turn instruction the
+ * model is trained on (don't immediately re-propose; refine first).
+ * Empty comment renders as a generic "not yet" instruction.
+ */
+export function formatDiscussRejection(comment: string): string {
+  return formatRejection(comment);
+}
+
+// ---------------------------------------------------------------------------
+// Outcome executor — surface-agnostic
+// ---------------------------------------------------------------------------
+
+export type DiscussOutcomeKind = Exclude<DiscussOutcome, "closed">;
+
+export interface ExecuteDiscussOutcomeInput {
+  turn: DiscussProposalTurn;
+  client: AnthropicClient;
+  app: string;
+  vault: string;
+  dataDir: string;
+  conversationId: string;
+  /** Test seam — fixed clock for any timestamps the outcome touches. */
+  now?: Date;
+}
+
+export interface ExecuteDiscussOutcomeOutput {
+  /** Plan id, idea id, or setup-task id; undefined for note. */
+  refId?: string;
+  /** Outcome label for events / surfaces. */
+  outcome: DiscussOutcomeKind;
+  /** Human-readable summary lines — CLI prints, Slack posts. */
+  summary: string[];
+}
+
+/**
+ * Executes the side effect for a `<propose-*>` turn. Pure function:
+ * no I/O beyond writing the artifact (plan file / Business_Ideas.md /
+ * notes / setup queue). Returns the result + a list of summary lines
+ * for the calling surface to render.
+ */
+export async function executeDiscussOutcome(
+  input: ExecuteDiscussOutcomeInput,
+): Promise<ExecuteDiscussOutcomeOutput> {
+  switch (input.turn.kind) {
+    case "propose-plan": {
+      const result = await runStrategist({
+        client: input.client,
+        brief: input.turn.brief,
+        app: input.app,
+        vault: input.vault,
+        dataDir: input.dataDir,
+        type: "improvement",
+        challenge: false,
+      });
+      return {
+        refId: result.planId,
+        outcome: "plan",
+        summary: [
+          `✓ Drafted plan ${result.planId}`,
+          `  Path: ${result.planPath}`,
+          `  Review: yarn jarvis plans --pending-review (then approve / revise / reject)`,
+        ],
+      };
+    }
+    case "propose-idea": {
+      const id = saveIdeaFromProposalRaw(
+        input.turn.title,
+        input.turn.brief,
+        input.app,
+        input.dataDir,
+      );
+      return {
+        refId: id,
+        outcome: "idea",
+        summary: [
+          `✓ Saved idea "${input.turn.title}" to Business_Ideas.md`,
+          `  Score it: yarn jarvis scout score`,
+        ],
+      };
+    }
+    case "propose-note": {
+      appendNote(input.dataDir, input.vault, input.app, {
+        text: input.turn.text,
+        actor: `discuss:${input.conversationId}`,
+        ...(input.now !== undefined && { now: input.now }),
+      });
+      return {
+        outcome: "note",
+        summary: [`✓ Appended note to ${input.app}'s notes.md`],
+      };
+    }
+    case "propose-setup-task": {
+      const id = createSetupTaskRaw(
+        input.turn.title,
+        input.turn.detail,
+        input.dataDir,
+        input.conversationId,
+        input.now,
+      );
+      return {
+        refId: id,
+        outcome: "setup-task",
+        summary: [
+          `✓ Created setup task "${input.turn.title}"`,
+          `  See: yarn jarvis inbox`,
+        ],
+      };
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,78 +545,40 @@ function formatRejection(comment: string): string {
 // ---------------------------------------------------------------------------
 
 async function executeOutcome(
-  turn: Exclude<DiscussTurnResult, { kind: "continue" } | { kind: "close" }>,
+  turn: DiscussProposalTurn,
   input: DiscussInput,
   conversationId: string,
 ): Promise<string | undefined> {
-  switch (turn.kind) {
-    case "propose-plan": {
-      const result = await runStrategistFromBrief(turn.brief, input);
-      input.prompter.print(`\n✓ Drafted plan ${result.planId}`);
-      input.prompter.print(`  Path: ${result.planPath}`);
-      input.prompter.print(
-        `  Review: yarn jarvis plans --pending-review (then approve / revise / reject)`,
-      );
-      return result.planId;
-    }
-    case "propose-idea": {
-      const id = saveIdeaFromProposal(turn.title, turn.brief, input);
-      input.prompter.print(`\n✓ Saved idea "${turn.title}" to Business_Ideas.md`);
-      input.prompter.print(
-        `  Score it: yarn jarvis scout score`,
-      );
-      return id;
-    }
-    case "propose-note": {
-      appendNote(input.dataDir, input.vault, input.app, {
-        text: turn.text,
-        actor: `discuss:${conversationId}`,
-        ...(input.now !== undefined && { now: input.now }),
-      });
-      input.prompter.print(
-        `\n✓ Appended note to ${input.app}'s notes.md`,
-      );
-      return undefined;
-    }
-    case "propose-setup-task": {
-      const id = createSetupTask(turn.title, turn.detail, input, conversationId);
-      input.prompter.print(`\n✓ Created setup task "${turn.title}"`);
-      input.prompter.print(`  See: yarn jarvis inbox`);
-      return id;
-    }
-  }
-}
-
-async function runStrategistFromBrief(
-  brief: string,
-  input: DiscussInput,
-): Promise<StrategistResult> {
-  return runStrategist({
+  const result = await executeDiscussOutcome({
+    turn,
     client: input.client,
-    brief,
     app: input.app,
     vault: input.vault,
     dataDir: input.dataDir,
-    type: "improvement",
-    challenge: false,
+    conversationId,
+    ...(input.now !== undefined && { now: input.now }),
   });
+  for (const line of result.summary) {
+    input.prompter.print(`\n${line}`);
+  }
+  return result.refId;
 }
 
-function saveIdeaFromProposal(
+function saveIdeaFromProposalRaw(
   title: string,
   brief: string,
-  input: DiscussInput,
+  app: string,
+  dataDir: string,
 ): string {
-  const file = loadBusinessIdeas(input.dataDir);
+  const file = loadBusinessIdeas(dataDir);
   const newIdea: BusinessIdea = {
     id: slugifyTitle(title),
     title,
-    app: input.app,
+    app,
     brief,
     tags: [],
     body: "",
   };
-  // Disambiguate against existing ids.
   let id = newIdea.id;
   if (file.ideas.some((i) => i.id === id)) {
     let suffix = 2;
@@ -437,19 +586,20 @@ function saveIdeaFromProposal(
     id = `${id}-${suffix}`;
   }
   file.ideas.push({ ...newIdea, id });
-  saveBusinessIdeas(input.dataDir, file);
+  saveBusinessIdeas(dataDir, file);
   return id;
 }
 
-function createSetupTask(
+function createSetupTaskRaw(
   title: string,
   detail: string,
-  input: DiscussInput,
+  dataDir: string,
   conversationId: string,
+  now?: Date,
 ): string {
   const id = `${slugifyTitle(title)}-${conversationId.slice(0, 8)}`;
-  const createdAt = (input.now ?? new Date()).toISOString();
-  appendSetupTask(input.dataDir, {
+  const createdAt = (now ?? new Date()).toISOString();
+  appendSetupTask(dataDir, {
     id,
     title,
     detail,
@@ -463,7 +613,7 @@ function createSetupTask(
 // Context + helpers
 // ---------------------------------------------------------------------------
 
-function buildInitialContext(input: DiscussInput): string {
+function buildInitialContextImpl(input: BuildInitialContextInput): string {
   const lines: string[] = [];
   lines.push(`App: ${input.app}`);
   lines.push(`Vault: ${input.vault}`);

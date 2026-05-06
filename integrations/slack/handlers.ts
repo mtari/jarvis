@@ -51,6 +51,12 @@ import {
   updateSurfacedPost,
   type SurfaceContext,
 } from "./surface.ts";
+import {
+  continueDiscussConversation,
+  findDiscussConversation,
+  startDiscussConversation,
+  type SlackDiscussContext,
+} from "./discuss.ts";
 
 export interface HandlerContext {
   dataDir: string;
@@ -428,6 +434,76 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // Discuss thread replies — drive the conversation forward
+  // -------------------------------------------------------------------------
+
+  app.message(async ({ message, client }) => {
+    // Filter: only thread replies (need thread_ts), not the bot's own
+    // messages, and not edits/deletes (we ignore those entirely).
+    const m = message as {
+      type?: string;
+      subtype?: string;
+      bot_id?: string;
+      user?: string;
+      text?: string;
+      channel?: string;
+      ts?: string;
+      thread_ts?: string;
+    };
+    if (m.type !== "message") return;
+    if (m.subtype !== undefined) return; // skip message_changed, file_share, etc.
+    if (m.bot_id !== undefined) return; // skip bot messages
+    if (!m.thread_ts || m.thread_ts === m.ts) return; // not a thread reply
+    if (!m.channel || !m.user || !m.text) return;
+
+    // Quick check: is this thread one of ours? findDiscussConversation
+    // returns null for unowned threads — much cheaper than the full
+    // continueDiscussConversation path.
+    const lookup = findDiscussConversation(
+      ctx.dataDir,
+      m.channel,
+      m.thread_ts,
+    );
+    if (!lookup) return; // not our thread
+
+    try {
+      const result = await continueDiscussConversation({
+        ctx: {
+          dataDir: ctx.dataDir,
+          client,
+          anthropic: ctx.getAnthropicClient(),
+        },
+        channel: m.channel,
+        threadTs: m.thread_ts,
+        userText: m.text,
+        userId: m.user,
+      });
+      ctx.log("discuss thread continued via slack", {
+        channel: m.channel,
+        threadTs: m.thread_ts,
+        status: result.status,
+        ...(result.outcome !== undefined && { outcome: result.outcome }),
+      });
+    } catch (err) {
+      ctx.logError("discuss thread reply failed", err, {
+        channel: m.channel,
+        threadTs: m.thread_ts,
+      });
+      try {
+        await client.chat.postMessage({
+          channel: m.channel,
+          thread_ts: m.thread_ts,
+          text: `✗ Discuss errored: ${
+            err instanceof Error ? err.message : String(err)
+          }. Reply again to retry.`,
+        });
+      } catch {
+        // best-effort
+      }
+    }
+  });
+
   app.command("/jarvis", async ({ ack, command, respond, client }) => {
     await ack();
     const text = (command.text ?? "").trim();
@@ -466,10 +542,12 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
         return runSlashNotes(parts.slice(1), ctx, respond, command);
       case "ask":
         return runSlashAsk(parts.slice(1).join(" "), ctx, respond);
+      case "discuss":
+        return runSlashDiscuss(parts.slice(1), ctx, respond, command, client);
       default:
         await respond({
           response_type: "ephemeral",
-          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`notes\`, \`ask\`.`,
+          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`notes\`, \`ask\`, \`discuss\`.`,
         });
     }
   });
@@ -632,6 +710,7 @@ const SLASH_USAGE = [
   "• `/jarvis scout draft [--threshold N] [--vault <v>]` — auto-draft plans from high-scoring ideas",
   "• `/jarvis notes <app> <text>` — append a free-text note read by Strategist / Scout / Developer",
   "• `/jarvis ask <text>` — natural-language router into the right Jarvis command",
+  "• `/jarvis discuss <app> <topic>` — open a multi-turn co-owner conversation in a thread",
 ].join("\n");
 
 type SlashRespond = (args: {
@@ -889,6 +968,66 @@ async function runSlashAsk(
     await respond({
       response_type: "ephemeral",
       text: `✗ Ask failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    });
+  }
+}
+
+async function runSlashDiscuss(
+  args: string[],
+  ctx: HandlerContext,
+  respond: SlashRespond,
+  command: { user_id?: string; channel_id?: string },
+  client: BoltApp["client"],
+): Promise<void> {
+  const app = args[0];
+  const topic = args.slice(1).join(" ").trim();
+  if (!app || topic.length === 0) {
+    await respond({
+      response_type: "ephemeral",
+      text: 'Usage: `/jarvis discuss <app> "<topic>"`',
+    });
+    return;
+  }
+  const channel = command.channel_id;
+  if (!channel) {
+    await respond({
+      response_type: "ephemeral",
+      text: "Couldn't determine the channel for this thread. Try invoking from a channel rather than a DM.",
+    });
+    return;
+  }
+  const userId = command.user_id ?? "<slack>";
+  await respond({
+    response_type: "ephemeral",
+    text: `:speech_balloon: Opening discuss thread for *${app}*…`,
+  });
+  try {
+    const slackCtx: SlackDiscussContext = {
+      dataDir: ctx.dataDir,
+      client,
+      anthropic: ctx.getAnthropicClient(),
+    };
+    const result = await startDiscussConversation({
+      ctx: slackCtx,
+      channel,
+      app,
+      vault: "personal",
+      topic,
+      invokedBy: userId,
+    });
+    ctx.log("discuss thread opened via slack", {
+      app,
+      userId,
+      conversationId: result.conversationId,
+      threadTs: result.threadTs,
+    });
+  } catch (err) {
+    ctx.logError("/jarvis discuss failed", err, { app, userId });
+    await respond({
+      response_type: "ephemeral",
+      text: `✗ Discuss failed: ${
         err instanceof Error ? err.message : String(err)
       }`,
     });
