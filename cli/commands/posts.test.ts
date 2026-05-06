@@ -280,6 +280,87 @@ describe("posts edit", () => {
   });
 });
 
+describe("posts publish-due", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+    errSpy.mockRestore();
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("publishes due rows + reports counts", async () => {
+    const db = new Database(dbFile(sandbox.dataDir));
+    try {
+      insertScheduledPost(db, row("p1"));
+    } finally {
+      db.close();
+    }
+    const code = await runPosts(["publish-due"], {
+      now: new Date("2026-04-09T00:00:00.000Z"),
+    });
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+    expect(out).toContain("Examined 1 due post(s)");
+    expect(out).toContain("✓ p1 → stub-p1");
+  });
+
+  it("reports nothing when no rows are due", async () => {
+    const db = new Database(dbFile(sandbox.dataDir));
+    try {
+      insertScheduledPost(db, row("future", {
+        scheduledAt: "2027-01-01T00:00:00.000Z",
+      }));
+    } finally {
+      db.close();
+    }
+    const code = await runPosts(["publish-due"], {
+      now: new Date("2026-04-09T00:00:00.000Z"),
+    });
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+    expect(out).toContain("No due pending posts");
+  });
+
+  it("rejects invalid --limit", async () => {
+    expect(
+      await runPosts(["publish-due", "--limit", "abc"], {
+        now: new Date("2026-04-09T00:00:00.000Z"),
+      }),
+    ).toBe(1);
+  });
+
+  it("respects --limit", async () => {
+    const db = new Database(dbFile(sandbox.dataDir));
+    try {
+      for (let i = 0; i < 5; i += 1) {
+        insertScheduledPost(db, row(`p${i}`, {
+          scheduledAt: `2026-04-0${(i % 9) + 1}T09:00:00.000Z`,
+        }));
+      }
+    } finally {
+      db.close();
+    }
+    const code = await runPosts(["publish-due", "--limit", "2"], {
+      now: new Date("2027-01-01T00:00:00.000Z"),
+    });
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+    expect(out).toContain("Examined 2 due post(s)");
+  });
+});
+
 describe("posts skip", () => {
   let sandbox: InstallSandbox;
   let silencer: ConsoleSilencer;

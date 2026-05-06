@@ -90,6 +90,11 @@ Utilities:
                               edit_history. Refuses on already-published rows.
   posts skip <post-id> --reason "<text>"
                               Mark a row as skipped — scheduler won't publish it.
+  posts publish-due [--limit N]
+                              Manually fire one publisher tick: pick up due
+                              pending rows, publish through registered channel
+                              adapters, update statuses. The daemon does this
+                              automatically every ~60s when running.
   scout score [--vault <v>]   Score unscored ideas in Business_Ideas.md. Writes
                               score, scoredAt, rationale back to the file and
                               records an idea-scored event per idea.
