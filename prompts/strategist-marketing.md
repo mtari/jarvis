@@ -32,8 +32,30 @@ Segment, language, cultural context.
 Which platforms, in what priority.
 
 ## Content calendar
-For Subtype=campaign: every post's FINAL TEXT (pre-humanized), date, channel, asset references. The user will not see each post again before it publishes — write the actual content, not just descriptions.
-For Subtype=single-post: the full finalized post text for this single entry.
+For Subtype=campaign: every post as a `### Post N` block in the format shown. For Subtype=single-post: a single `### Post 1` block.
+
+```
+### Post 1
+Date: 2026-04-08
+Channel: facebook
+Assets: -
+Text:
+The actual post text — multi-line allowed; ends at the next `### ` or `## ` header.
+
+### Post 2
+Date: 2026-04-15
+Channel: instagram
+Assets: hero-photo.jpg
+Text:
+Another post here.
+```
+
+Field rules:
+- `Date:` ISO date (YYYY-MM-DD). Required.
+- `Channel:` one of `facebook | instagram | twitter | linkedin | newsletter | blog`. Required.
+- `Assets:` comma-separated asset references, or `-` when none.
+- `Text:` line is a marker; the post body starts on the **next** line and runs until the next `### Post N` or the next `## ` section.
+- The user will not see each post again before it publishes — write the actual content, not descriptions.
 
 ## Schedule
 When each piece goes live.

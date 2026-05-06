@@ -9,6 +9,7 @@ import { runDoctor } from "./commands/doctor.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
 import { runLogs } from "./commands/logs.ts";
+import { runMarketer } from "./commands/marketer.ts";
 import { runNotes } from "./commands/notes.ts";
 import { runObserveImpact } from "./commands/observe-impact.ts";
 import { runOnboard } from "./commands/onboard.ts";
@@ -78,6 +79,9 @@ Utilities:
   signals [filters]           Browse recorded signal events. Filters: --app,
                               --vault, --kind, --severity, --since <iso>,
                               --limit N, --format table|json
+  marketer prepare <plan-id>  Parse an approved marketing plan's content calendar,
+                              humanize each post, persist pending rows to
+                              scheduled_posts. Idempotent.
   scout score [--vault <v>]   Score unscored ideas in Business_Ideas.md. Writes
                               score, scoredAt, rationale back to the file and
                               records an idea-scored event per idea.
@@ -190,6 +194,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runSignals(rest);
     case "scout":
       return runScout(rest);
+    case "marketer":
+      return runMarketer(rest);
     case "observe-impact":
       return runObserveImpact(rest);
     case "status":
