@@ -8,10 +8,19 @@ import {
   type InstallSandbox,
 } from "../cli/commands/_test-helpers.ts";
 import {
-  buildAdapterMap,
+  buildAdapterRegistry,
   type ChannelAdapter,
+  type ChannelAdapterRegistry,
   type PublishResult,
 } from "../tools/channels/types.ts";
+
+function fallbackRegistry(
+  adapters: ReadonlyArray<ChannelAdapter>,
+): ChannelAdapterRegistry {
+  return buildAdapterRegistry(
+    adapters.map((adapter, i) => ({ adapter, name: `test-adapter-${i}` })),
+  );
+}
 import {
   insertScheduledPost,
   listScheduledPosts,
@@ -90,7 +99,7 @@ describe("publishDuePosts", () => {
     });
     const result = await publishDuePosts({
       db,
-      adapters: buildAdapterMap([adapter]),
+      adapters: fallbackRegistry([adapter]),
       now: new Date("2026-04-09T00:00:00.000Z"),
     });
     expect(result.examined).toBe(1);
@@ -124,7 +133,7 @@ describe("publishDuePosts", () => {
     });
     const result = await publishDuePosts({
       db,
-      adapters: buildAdapterMap([adapter]),
+      adapters: fallbackRegistry([adapter]),
       now: new Date("2026-04-09T00:00:00.000Z"),
     });
     expect(result.examined).toBe(0);
@@ -142,7 +151,7 @@ describe("publishDuePosts", () => {
     });
     const result = await publishDuePosts({
       db,
-      adapters: buildAdapterMap([adapter]),
+      adapters: fallbackRegistry([adapter]),
       now: new Date("2026-04-09T00:00:00.000Z"),
     });
     expect(result.examined).toBe(0);
@@ -157,7 +166,7 @@ describe("publishDuePosts", () => {
     });
     const result = await publishDuePosts({
       db,
-      adapters: buildAdapterMap([adapter]),
+      adapters: fallbackRegistry([adapter]),
       now: new Date("2026-04-09T00:00:00.000Z"),
     });
     expect(result.failed).toEqual([
@@ -177,7 +186,7 @@ describe("publishDuePosts", () => {
     insertScheduledPost(db, row("p1"));
     const result = await publishDuePosts({
       db,
-      adapters: buildAdapterMap([throwingAdapter(["facebook"], "boom")]),
+      adapters: fallbackRegistry([throwingAdapter(["facebook"], "boom")]),
       now: new Date("2026-04-09T00:00:00.000Z"),
     });
     expect(result.failed[0]?.reason).toContain("boom");
@@ -188,7 +197,7 @@ describe("publishDuePosts", () => {
     insertScheduledPost(db, row("p1", { channel: "tiktok" }));
     const result = await publishDuePosts({
       db,
-      adapters: buildAdapterMap([]),
+      adapters: fallbackRegistry([]),
       now: new Date("2026-04-09T00:00:00.000Z"),
     });
     expect(result.failed[0]?.reason).toContain("no adapter");
@@ -207,12 +216,43 @@ describe("publishDuePosts", () => {
     });
     const result = await publishDuePosts({
       db,
-      adapters: buildAdapterMap([adapter]),
+      adapters: fallbackRegistry([adapter]),
       now: new Date("2027-01-01T00:00:00.000Z"),
       maxPerTick: 3,
     });
     expect(result.examined).toBe(3);
     expect(calls).toHaveLength(3);
+  });
+
+  it("dispatches by (channel, appId) — per-app adapter wins over fallback", async () => {
+    insertScheduledPost(db, row("erdei-post", { appId: "erdei" }));
+    insertScheduledPost(db, row("kuna-post", { appId: "kuna" }));
+    insertScheduledPost(db, row("other-post", { appId: "other" }));
+    const erdeiAdapter = recordingAdapter(["facebook"], {
+      ok: true,
+      publishedId: "fb-erdei",
+    });
+    const kunaAdapter = recordingAdapter(["facebook"], {
+      ok: true,
+      publishedId: "fb-kuna",
+    });
+    const fallback = recordingAdapter(["facebook"], {
+      ok: true,
+      publishedId: "fb-fallback",
+    });
+    const registry = buildAdapterRegistry([
+      { adapter: fallback.adapter, name: "fb-fallback" },
+      { adapter: erdeiAdapter.adapter, appId: "erdei", name: "fb-erdei" },
+      { adapter: kunaAdapter.adapter, appId: "kuna", name: "fb-kuna" },
+    ]);
+    await publishDuePosts({
+      db,
+      adapters: registry,
+      now: new Date("2026-04-09T00:00:00.000Z"),
+    });
+    expect(erdeiAdapter.calls.map((c) => c.postId)).toEqual(["erdei-post"]);
+    expect(kunaAdapter.calls.map((c) => c.postId)).toEqual(["kuna-post"]);
+    expect(fallback.calls.map((c) => c.postId)).toEqual(["other-post"]);
   });
 
   it("dispatches by channel — instagram row goes to instagram adapter", async () => {
@@ -222,7 +262,7 @@ describe("publishDuePosts", () => {
     const ig = recordingAdapter(["instagram"], { ok: true, publishedId: "ig-1" });
     await publishDuePosts({
       db,
-      adapters: buildAdapterMap([fb.adapter, ig.adapter]),
+      adapters: fallbackRegistry([fb.adapter, ig.adapter]),
       now: new Date("2026-04-09T00:00:00.000Z"),
     });
     expect(fb.calls.map((c) => c.postId)).toEqual(["fb"]);
@@ -236,7 +276,7 @@ describe("publishDuePosts", () => {
     });
     const result = await publishDuePosts({
       db,
-      adapters: buildAdapterMap([adapter]),
+      adapters: fallbackRegistry([adapter]),
     });
     expect(result.examined).toBe(0);
     expect(result.published).toEqual([]);

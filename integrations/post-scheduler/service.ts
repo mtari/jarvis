@@ -3,6 +3,7 @@ import {
   flagStaleWindowPosts,
   publishDuePosts,
 } from "../../orchestrator/post-publisher.ts";
+import { listOnboardedApps } from "../../orchestrator/brain.ts";
 import { dbFile } from "../../cli/paths.ts";
 import {
   createFacebookAdapter,
@@ -10,9 +11,9 @@ import {
 } from "../../tools/channels/facebook.ts";
 import { createFileStubAdapter } from "../../tools/channels/file-stub.ts";
 import {
-  buildAdapterMap,
-  type ChannelAdapter,
-  type ChannelAdapterMap,
+  buildAdapterRegistry,
+  type ChannelAdapterRegistry,
+  type RegisteredAdapter,
 } from "../../tools/channels/types.ts";
 import type { DaemonContext, DaemonService } from "../../cli/commands/daemon.ts";
 
@@ -36,13 +37,15 @@ export interface PostSchedulerServiceOptions {
   /** Tick interval. Default 60s. */
   tickMs?: number;
   /**
-   * Override the adapter set. When omitted, the service builds the
-   * default set: file-stub catch-all + Facebook adapter (when
-   * `FB_PAGE_ID` + `FB_PAGE_ACCESS_TOKEN` are present in the
-   * environment). Real FB/IG/X adapters override specific channels
-   * in the order given via `buildAdapterMap`'s last-wins rule.
+   * Override the registry. When omitted, the service walks every
+   * onboarded brain at start, registers a per-app Facebook adapter
+   * for any brain whose `connections.facebook` declares both
+   * `pageId` and `tokenEnvVar` (with the env var resolvable). The
+   * legacy global `FB_PAGE_ID` / `FB_PAGE_ACCESS_TOKEN` env vars
+   * stay supported as a `facebook` fallback. The file-stub catch-all
+   * is always present so unmatched channels still get JSONL output.
    */
-  adapters?: ReadonlyArray<ChannelAdapter>;
+  registry?: ChannelAdapterRegistry;
   /** Test seam — fixed clock for the publisher's `dueBefore` cutoff. */
   now?: () => Date;
   /**
@@ -57,34 +60,119 @@ export interface PostSchedulerServiceOptions {
   _tickBody?: (ctx: DaemonContext) => Promise<void>;
 }
 
+export interface BuildDefaultRegistryOptions {
+  dataDir: string;
+  env?: NodeJS.ProcessEnv;
+  /** Optional logger for diagnostics ("brain X named env var Y but it's unset"). */
+  logger?: {
+    warn: (msg: string, meta?: Record<string, unknown>) => void;
+  };
+}
+
 /**
- * Builds the default channel adapter set based on environment:
- *   - file-stub adapter (catch-all, always registered first)
- *   - Facebook adapter (registered last when `FB_PAGE_ID` +
- *     `FB_PAGE_ACCESS_TOKEN` are present in env, overriding stub for
- *     `facebook` channel via the last-wins rule)
+ * Builds the default channel-adapter registry. Order of registration:
+ *   1. File-stub catch-all (every channel; fallback).
+ *   2. Legacy global FB env vars (`FB_PAGE_ID` + `FB_PAGE_ACCESS_TOKEN`)
+ *      → `facebook` fallback when set. Kept for back-compat with the
+ *      single-Page setup in PR #61.
+ *   3. Per-app FB adapter for every onboarded brain whose
+ *      `connections.facebook` declares both `pageId` and `tokenEnvVar`
+ *      AND the env var resolves. Per-app entries win over fallbacks.
  *
- * Future: Instagram, LinkedIn, X adapters slot in here the same way.
+ * Brains without `connections.facebook` (or with malformed entries)
+ * still publish — they fall through to the legacy fallback or stub.
  */
-export function buildDefaultAdapters(
-  dataDir: string,
-  env: NodeJS.ProcessEnv = process.env,
-): ChannelAdapter[] {
-  const adapters: ChannelAdapter[] = [createFileStubAdapter({ dataDir })];
-  const fbConfig = readFacebookEnv(env);
-  if (fbConfig) {
-    adapters.push(createFacebookAdapter(fbConfig));
+export function buildDefaultRegistry(
+  opts: BuildDefaultRegistryOptions,
+): ChannelAdapterRegistry {
+  const env = opts.env ?? process.env;
+  const registered: RegisteredAdapter[] = [];
+
+  registered.push({
+    adapter: createFileStubAdapter({ dataDir: opts.dataDir }),
+    name: "file-stub",
+  });
+
+  const legacyFb = readFacebookEnv(env);
+  if (legacyFb) {
+    registered.push({
+      adapter: createFacebookAdapter(legacyFb),
+      name: "facebook:legacy-env",
+    });
   }
-  return adapters;
+
+  for (const onboarded of listOnboardedApps(opts.dataDir)) {
+    const fbConn = readFacebookConnection(onboarded.brain.connections, env);
+    if (!fbConn.pageId) continue;
+    if (fbConn.problem) {
+      opts.logger?.warn(
+        "facebook adapter skipped for app — connection misconfigured",
+        { app: onboarded.app, problem: fbConn.problem },
+      );
+      continue;
+    }
+    if (fbConn.accessToken === undefined) {
+      // Legitimate "not configured here yet"; not an error.
+      continue;
+    }
+    registered.push({
+      adapter: createFacebookAdapter({
+        pageId: fbConn.pageId,
+        accessToken: fbConn.accessToken,
+      }),
+      appId: onboarded.app,
+      name: `facebook:${onboarded.app}`,
+    });
+  }
+
+  return buildAdapterRegistry(registered);
+}
+
+interface ResolvedFacebookConnection {
+  /** Set when the brain declares a pageId. */
+  pageId?: string;
+  /** Set when the brain references an env var AND it resolved to a non-empty value. */
+  accessToken?: string;
+  /** Set when the brain config looks malformed and we want to log. */
+  problem?: string;
+}
+
+function readFacebookConnection(
+  connections: Record<string, Record<string, unknown>>,
+  env: NodeJS.ProcessEnv,
+): ResolvedFacebookConnection {
+  const fb = connections["facebook"];
+  if (!fb || typeof fb !== "object") return {};
+  const pageIdRaw = fb["pageId"];
+  const tokenEnvRaw = fb["tokenEnvVar"];
+  if (pageIdRaw === undefined && tokenEnvRaw === undefined) return {};
+  if (typeof pageIdRaw !== "string" || pageIdRaw.trim().length === 0) {
+    return { problem: "connections.facebook.pageId must be a non-empty string" };
+  }
+  if (typeof tokenEnvRaw !== "string" || tokenEnvRaw.trim().length === 0) {
+    return {
+      pageId: pageIdRaw.trim(),
+      problem: "connections.facebook.tokenEnvVar must be a non-empty string",
+    };
+  }
+  const accessToken = env[tokenEnvRaw];
+  if (accessToken === undefined || accessToken.trim().length === 0) {
+    return {
+      pageId: pageIdRaw.trim(),
+      problem: `env var ${tokenEnvRaw} (referenced by brain.connections.facebook.tokenEnvVar) is unset or empty`,
+    };
+  }
+  return {
+    pageId: pageIdRaw.trim(),
+    accessToken: accessToken.trim(),
+  };
 }
 
 export function createPostSchedulerService(
   opts: PostSchedulerServiceOptions,
 ): DaemonService {
   const tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
-  const adapterList: ReadonlyArray<ChannelAdapter> =
-    opts.adapters ?? buildDefaultAdapters(opts.dataDir, opts.env);
-  const adapters: ChannelAdapterMap = buildAdapterMap(adapterList);
+  let registry: ChannelAdapterRegistry | null = opts.registry ?? null;
   const staleGraceMs =
     opts.staleGraceMs === undefined ? undefined : opts.staleGraceMs;
 
@@ -94,9 +182,16 @@ export function createPostSchedulerService(
   return {
     name: "post-scheduler",
     start(ctx: DaemonContext): void {
+      if (!registry) {
+        registry = buildDefaultRegistry({
+          dataDir: opts.dataDir,
+          ...(opts.env !== undefined && { env: opts.env }),
+          logger: { warn: (m, meta) => ctx.logger.warn(m, meta) },
+        });
+      }
       ctx.logger.info("post-scheduler: adapter coverage", {
-        adapterCount: adapterList.length,
-        channels: Array.from(adapters.keys()),
+        registry: registry.describe(),
+        channels: Array.from(registry.channels()),
       });
       const tickFn = async (): Promise<void> => {
         if (tickInFlight) return;
@@ -108,7 +203,7 @@ export function createPostSchedulerService(
           }
           await runPostSchedulerTick({
             dataDir: opts.dataDir,
-            adapters,
+            registry: registry!,
             ctx,
             ...(opts.now !== undefined && { now: opts.now() }),
             ...(staleGraceMs !== undefined && { staleGraceMs }),
@@ -135,7 +230,7 @@ export function createPostSchedulerService(
 
 export interface RunPostSchedulerTickInput {
   dataDir: string;
-  adapters: ChannelAdapterMap;
+  registry: ChannelAdapterRegistry;
   ctx: DaemonContext;
   now?: Date;
   /**
@@ -186,7 +281,7 @@ export async function runPostSchedulerTick(
 
     const result = await publishDuePosts({
       db,
-      adapters: input.adapters,
+      adapters: input.registry,
       ...(input.now !== undefined && { now: input.now }),
     });
     if (

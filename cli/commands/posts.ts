@@ -14,10 +14,11 @@ import {
   type ScheduledPost,
   type ScheduledPostStatus,
 } from "../../orchestrator/scheduled-posts.ts";
-import { createFileStubAdapter } from "../../tools/channels/file-stub.ts";
+import { buildDefaultRegistry } from "../../integrations/post-scheduler/service.ts";
 import {
-  buildAdapterMap,
-  type ChannelAdapter,
+  buildAdapterRegistry,
+  type ChannelAdapterRegistry,
+  type RegisteredAdapter,
 } from "../../tools/channels/types.ts";
 import { dbFile, getDataDir } from "../paths.ts";
 
@@ -44,8 +45,10 @@ const VALID_STATUSES: ReadonlyArray<ScheduledPostStatus> = [
 export interface PostsCommandDeps {
   /** Test seam — fixed clock for edit history + publish-due cutoff. */
   now?: Date;
-  /** Test / advanced seam — override the channel adapters used by publish-due. */
-  adapters?: ReadonlyArray<ChannelAdapter>;
+  /** Test / advanced seam — override the channel registry used by publish-due. */
+  registry?: ChannelAdapterRegistry;
+  /** Test / advanced seam — register additional adapters on top of the default registry. */
+  extraAdapters?: ReadonlyArray<RegisteredAdapter>;
 }
 
 export async function runPosts(
@@ -437,9 +440,11 @@ async function runPostsPublishDue(
   }
 
   const dataDir = getDataDir();
-  const adapters = buildAdapterMap(
-    deps.adapters ?? [createFileStubAdapter({ dataDir })],
-  );
+  const adapters: ChannelAdapterRegistry =
+    deps.registry ??
+    (deps.extraAdapters
+      ? buildAdapterRegistry(deps.extraAdapters)
+      : buildDefaultRegistry({ dataDir }));
   const db = new Database(dbFile(dataDir));
   try {
     const result = await publishDuePosts({

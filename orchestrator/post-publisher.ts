@@ -5,7 +5,7 @@ import {
   type ScheduledPost,
 } from "./scheduled-posts.ts";
 import type {
-  ChannelAdapterMap,
+  ChannelAdapterRegistry,
   PublishResult,
 } from "../tools/channels/types.ts";
 
@@ -38,7 +38,7 @@ export const DEFAULT_STALE_GRACE_MS = 60 * 60 * 1000; // 1 hour
 
 export interface PublishDuePostsInput {
   db: Database;
-  adapters: ChannelAdapterMap;
+  adapters: ChannelAdapterRegistry;
   /**
    * Cutoff for "due" rows — only rows with `scheduled_at <= now` are
    * picked up. Defaults to wall clock.
@@ -94,9 +94,9 @@ export async function publishDuePosts(
   };
 
   for (const row of candidates) {
-    const adapter = input.adapters.get(row.channel);
+    const adapter = input.adapters.get(row.channel, row.appId);
     if (!adapter) {
-      const reason = `no adapter registered for channel "${row.channel}"`;
+      const reason = `no adapter registered for channel "${row.channel}" + app "${row.appId}"`;
       markFailed(input.db, row, reason);
       result.failed.push({
         postId: row.id,

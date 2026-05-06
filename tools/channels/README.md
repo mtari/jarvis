@@ -8,14 +8,51 @@ The post-scheduler service builds an adapter list with the file-stub catch-all f
 
 ## Facebook setup
 
-Two env vars in `<dataDir>/.env`:
+The Facebook adapter supports both **per-app credentials** (recommended for multi-project use — each app posts to its own Page) and a **legacy single-Page setup** (one Page across the whole portfolio).
+
+### Per-app config (recommended)
+
+For each onboarded app that posts to its own Facebook Page, add a `facebook` connection to its brain (`<dataDir>/vaults/<vault>/brains/<app>/brain.json`):
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "projectName": "erdei-fahazak",
+  // ...
+  "connections": {
+    "facebook": {
+      "pageId": "123456789012345",
+      "tokenEnvVar": "FB_TOKEN_ERDEI"
+    }
+  }
+}
+```
+
+Then drop the actual token in `<dataDir>/.env` under the named variable:
+
+```
+FB_TOKEN_ERDEI=EAAJ…
+FB_TOKEN_KUNA=EAAJ…
+```
+
+The daemon walks every onboarded brain at startup, instantiates one Facebook adapter per app whose connection is configured AND whose env var resolves, and registers each as a per-app entry. Per-app entries win over the legacy fallback for the matching app; other apps fall through to the legacy fallback (or stub).
+
+Why this shape:
+- Page id is public — fine to live in the brain (which is in the data repo).
+- Token is sensitive — stays in gitignored `.env`.
+- The brain documents the mapping ("this app's FB Page is X, its token is named Y") in one place. No naming-convention coupling between app slugs and env-var names.
+- New project? Add another connection in its brain + another env var.
+
+### Legacy single-Page setup (back-compat with PR #61)
+
+If you have a single Page across all apps, the older env vars still work as a fallback for any app without a per-app brain config:
 
 ```
 FB_PAGE_ID=123456789012345
 FB_PAGE_ACCESS_TOKEN=EAAJ…
 ```
 
-Both must be present for the adapter to register. Otherwise the daemon falls back to the file-stub for `facebook` posts and the start-up log shows the channels it covers.
+Per-app brain configs override this fallback for their matching app.
 
 ### Generating a Page Access Token
 
