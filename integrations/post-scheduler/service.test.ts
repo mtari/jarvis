@@ -323,7 +323,7 @@ describe("buildDefaultRegistry", () => {
 
   function seedBrain(
     app: string,
-    fbConn?: { pageId: string; tokenEnvVar: string },
+    fbConn?: Record<string, unknown>,
   ): void {
     const dir = path.join(
       sandbox.dataDir,
@@ -473,6 +473,109 @@ describe("buildDefaultRegistry", () => {
     expect(erdei).not.toBeNull();
     expect(other).not.toBeNull();
     expect(erdei).not.toBe(other);
+  });
+
+  // --- Env-ref pageId (preferred shape: both values in .env) -----------------
+
+  it("registers per-app FB when both pageIdEnvVar + tokenEnvVar are set", () => {
+    seedBrain("erdei", {
+      pageIdEnvVar: "FB_PAGE_ID_ERDEI",
+      tokenEnvVar: "FB_TOKEN_ERDEI",
+    });
+    const r = buildDefaultRegistry({
+      dataDir: sandbox.dataDir,
+      env: {
+        FB_PAGE_ID_ERDEI: "123456789012345",
+        FB_TOKEN_ERDEI: "tok-e",
+      },
+    });
+    const desc = r.describe();
+    const perApp = desc.filter(
+      (e) => e.channel === "facebook" && e.appId === "erdei",
+    );
+    expect(perApp).toHaveLength(1);
+    expect(perApp[0]?.adapterName).toBe("facebook:erdei");
+  });
+
+  it("warns + skips when pageIdEnvVar references an unset env var", () => {
+    seedBrain("erdei", {
+      pageIdEnvVar: "FB_PAGE_ID_ERDEI",
+      tokenEnvVar: "FB_TOKEN_ERDEI",
+    });
+    const warnings: string[] = [];
+    const r = buildDefaultRegistry({
+      dataDir: sandbox.dataDir,
+      env: { FB_TOKEN_ERDEI: "tok-e" }, // pageId env var missing
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+    expect(
+      r.describe().some((e) => e.adapterName === "facebook:erdei"),
+    ).toBe(false);
+    expect(warnings.some((w) => w.includes("misconfigured"))).toBe(true);
+  });
+
+  it("rejects pageIdEnvVar when set to a non-string", () => {
+    seedBrain("erdei", {
+      pageIdEnvVar: 12345 as unknown as string,
+      tokenEnvVar: "FB_TOKEN_ERDEI",
+    });
+    const warnings: string[] = [];
+    const r = buildDefaultRegistry({
+      dataDir: sandbox.dataDir,
+      env: { FB_TOKEN_ERDEI: "tok-e" },
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+    expect(
+      r.describe().some((e) => e.adapterName === "facebook:erdei"),
+    ).toBe(false);
+    expect(warnings.length).toBeGreaterThan(0);
+  });
+
+  it("env-ref pageIdEnvVar wins over a legacy literal pageId on the same brain", () => {
+    seedBrain("erdei", {
+      pageId: "stale-literal-id",
+      pageIdEnvVar: "FB_PAGE_ID_ERDEI",
+      tokenEnvVar: "FB_TOKEN_ERDEI",
+    });
+    const r = buildDefaultRegistry({
+      dataDir: sandbox.dataDir,
+      env: {
+        FB_PAGE_ID_ERDEI: "123-from-env",
+        FB_TOKEN_ERDEI: "tok-e",
+      },
+    });
+    // The adapter is registered (so the env-var shape resolved correctly).
+    expect(r.get("facebook", "erdei")).not.toBeNull();
+  });
+
+  it("legacy literal pageId still works when pageIdEnvVar is absent", () => {
+    seedBrain("erdei", {
+      pageId: "literal-id",
+      tokenEnvVar: "FB_TOKEN_ERDEI",
+    });
+    const r = buildDefaultRegistry({
+      dataDir: sandbox.dataDir,
+      env: { FB_TOKEN_ERDEI: "tok-e" },
+    });
+    expect(
+      r.describe().some((e) => e.adapterName === "facebook:erdei"),
+    ).toBe(true);
+  });
+
+  it("missing both pageId and pageIdEnvVar warns + skips", () => {
+    seedBrain("erdei", {
+      tokenEnvVar: "FB_TOKEN_ERDEI",
+    });
+    const warnings: string[] = [];
+    const r = buildDefaultRegistry({
+      dataDir: sandbox.dataDir,
+      env: { FB_TOKEN_ERDEI: "tok-e" },
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+    expect(
+      r.describe().some((e) => e.adapterName === "facebook:erdei"),
+    ).toBe(false);
+    expect(warnings.some((w) => w.includes("misconfigured"))).toBe(true);
   });
 });
 
