@@ -1,5 +1,8 @@
 import Database from "better-sqlite3";
-import { publishDuePosts } from "../../orchestrator/post-publisher.ts";
+import {
+  flagStaleWindowPosts,
+  publishDuePosts,
+} from "../../orchestrator/post-publisher.ts";
 import { dbFile } from "../../cli/paths.ts";
 import { createFileStubAdapter } from "../../tools/channels/file-stub.ts";
 import {
@@ -36,6 +39,12 @@ export interface PostSchedulerServiceOptions {
   adapters?: ReadonlyArray<ChannelAdapter>;
   /** Test seam — fixed clock for the publisher's `dueBefore` cutoff. */
   now?: () => Date;
+  /**
+   * Grace window before a missed scheduled time escalates as
+   * `post-window-missed`. Default 1h (per §10). Set to `null` to
+   * disable stale-window flagging entirely.
+   */
+  staleGraceMs?: number | null;
   /** @internal */
   _tickBody?: (ctx: DaemonContext) => Promise<void>;
 }
@@ -47,6 +56,8 @@ export function createPostSchedulerService(
   const adapters: ChannelAdapterMap = buildAdapterMap(
     opts.adapters ?? [createFileStubAdapter({ dataDir: opts.dataDir })],
   );
+  const staleGraceMs =
+    opts.staleGraceMs === undefined ? undefined : opts.staleGraceMs;
 
   let timer: NodeJS.Timeout | null = null;
   let tickInFlight = false;
@@ -67,6 +78,7 @@ export function createPostSchedulerService(
             adapters,
             ctx,
             ...(opts.now !== undefined && { now: opts.now() }),
+            ...(staleGraceMs !== undefined && { staleGraceMs }),
           });
         } catch (err) {
           ctx.logger.error("post-scheduler tick errored", err);
@@ -93,18 +105,52 @@ export interface RunPostSchedulerTickInput {
   adapters: ChannelAdapterMap;
   ctx: DaemonContext;
   now?: Date;
+  /**
+   * Grace before a missed window escalates. Default 1h. Pass `null`
+   * to skip stale flagging entirely.
+   */
+  staleGraceMs?: number | null;
 }
 
 /**
  * The tick body — exported for direct invocation (tests + the
- * `posts publish-due` CLI). Opens its own DB handle, runs the
- * publisher, logs the outcome, closes.
+ * `posts publish-due` CLI). Opens its own DB handle, flags any
+ * stale-window rows, runs the publisher, logs the outcome, closes.
+ *
+ * Stale flagging happens BEFORE publishing so a row that's both
+ * stale and due gets the missed-window event AND publishes on the
+ * same tick — operator sees the gap, the row still goes out.
  */
 export async function runPostSchedulerTick(
   input: RunPostSchedulerTickInput,
 ): Promise<void> {
   const db = new Database(dbFile(input.dataDir));
   try {
+    if (input.staleGraceMs !== null) {
+      const stale = flagStaleWindowPosts({
+        db,
+        ...(input.staleGraceMs !== undefined && {
+          graceMs: input.staleGraceMs,
+        }),
+        ...(input.now !== undefined && { now: input.now }),
+      });
+      if (stale.flagged.length > 0) {
+        input.ctx.logger.warn("post-scheduler: stale windows", {
+          flagged: stale.flagged.length,
+          oldest: stale.flagged[0]?.postId,
+          maxHoursLate: Math.max(...stale.flagged.map((s) => s.hoursLate)),
+        });
+        for (const row of stale.flagged) {
+          input.ctx.logger.warn("post window missed", {
+            postId: row.postId,
+            channel: row.channel,
+            scheduledAt: row.scheduledAt,
+            hoursLate: row.hoursLate,
+          });
+        }
+      }
+    }
+
     const result = await publishDuePosts({
       db,
       adapters: input.adapters,
