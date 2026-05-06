@@ -25,9 +25,17 @@ import {
   buildOutcomeContext,
 } from "./blocks/plan-review.ts";
 import { buildEscalationBlocks } from "./blocks/escalation.ts";
+import {
+  buildPostOutcomeContext,
+  buildPostReviewBlocks,
+} from "./blocks/post-review.ts";
 import { buildSetupTaskBlocks } from "./blocks/setup-task.ts";
 import { buildSignalAlertBlocks } from "./blocks/signal-alert.ts";
 import { buildTriageReportBlocks } from "./blocks/triage-report.ts";
+import {
+  listScheduledPosts,
+  type ScheduledPost,
+} from "../../orchestrator/scheduled-posts.ts";
 
 export interface SurfaceContext {
   dataDir: string;
@@ -1035,6 +1043,184 @@ export async function runEscalationDeliveryTick(
     } catch (err) {
       result.errors.push({
         escalationEventId: candidate.escalationEventId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Post review surface — single-post awaiting-review rows in #jarvis-inbox
+// ---------------------------------------------------------------------------
+
+interface SlackPostSurfacedPayload {
+  postId: string;
+  channel: string;
+  messageTs: string;
+}
+
+export interface PostSurfaceRecord {
+  channel: string;
+  messageTs: string;
+  surfacedAt: string;
+}
+
+/** Returns the latest surface record for a post, or null if not surfaced. */
+export function findPostSurfaceRecord(
+  dbFilePath: string,
+  postId: string,
+): PostSurfaceRecord | null {
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    const rows = db
+      .prepare(
+        "SELECT payload, created_at FROM events WHERE kind = 'slack-post-surfaced' ORDER BY id DESC",
+      )
+      .all() as Array<{ payload: string; created_at: string }>;
+    for (const r of rows) {
+      try {
+        const payload = JSON.parse(r.payload) as SlackPostSurfacedPayload;
+        if (payload.postId === postId) {
+          return {
+            channel: payload.channel,
+            messageTs: payload.messageTs,
+            surfacedAt: r.created_at,
+          };
+        }
+      } catch {
+        // skip malformed
+      }
+    }
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+export interface SurfacePostResult {
+  posted: boolean;
+  surface: PostSurfaceRecord;
+}
+
+/**
+ * Posts a single awaiting-review post to #jarvis-inbox with Approve /
+ * Skip… buttons. Records `slack-post-surfaced` for idempotency. Caller
+ * is responsible for filtering `awaiting-review` rows.
+ */
+export async function surfaceAwaitingReviewPost(
+  ctx: SurfaceContext,
+  post: ScheduledPost,
+  opts: { planTitle?: string } = {},
+): Promise<SurfacePostResult> {
+  const existing = findPostSurfaceRecord(dbFile(ctx.dataDir), post.id);
+  if (existing) return { posted: false, surface: existing };
+
+  const blocks = buildPostReviewBlocks({
+    post,
+    ...(opts.planTitle !== undefined && { planTitle: opts.planTitle }),
+  });
+  const result = await ctx.client.chat.postMessage({
+    channel: ctx.inboxChannelId,
+    blocks,
+    text: `Post to review: ${post.id}`,
+  });
+  if (!result.ok || !result.ts) {
+    throw new Error(
+      `chat.postMessage failed (post-review): ${result.error ?? "unknown"}`,
+    );
+  }
+
+  const conn = new Database(dbFile(ctx.dataDir));
+  try {
+    appendEvent(conn, {
+      appId: post.appId,
+      vaultId: "personal",
+      kind: "slack-post-surfaced",
+      payload: {
+        postId: post.id,
+        channel: ctx.inboxChannelId,
+        messageTs: result.ts,
+      },
+    });
+  } finally {
+    conn.close();
+  }
+
+  return {
+    posted: true,
+    surface: {
+      channel: ctx.inboxChannelId,
+      messageTs: result.ts,
+      surfacedAt: new Date().toISOString(),
+    },
+  };
+}
+
+/**
+ * Updates a previously-surfaced post message after approve / skip.
+ * Strips action buttons + appends an outcome context line so reviewers
+ * see what was done without losing the post body.
+ */
+export async function updateSurfacedPost(
+  ctx: SurfaceContext,
+  post: ScheduledPost,
+  outcomeContext: string,
+  opts: { planTitle?: string } = {},
+): Promise<void> {
+  const existing = findPostSurfaceRecord(dbFile(ctx.dataDir), post.id);
+  if (!existing) return;
+
+  const blocks = buildPostReviewBlocks({
+    post,
+    ...(opts.planTitle !== undefined && { planTitle: opts.planTitle }),
+  });
+  const noActions: unknown[] = [
+    ...blocks.filter((b) => b.type !== "actions"),
+    buildPostOutcomeContext(outcomeContext),
+  ];
+  await ctx.client.chat.update({
+    channel: existing.channel,
+    ts: existing.messageTs,
+    blocks: noActions as never,
+    text: `Post ${post.id}: ${outcomeContext}`,
+  });
+}
+
+export interface RunPostReviewSurfaceTickResult {
+  posted: string[];
+  errors: Array<{ postId: string; error: string }>;
+}
+
+/**
+ * Scans for `awaiting-review` posts not yet surfaced and posts each
+ * one. The set of awaiting-review rows is the source of truth — there
+ * is no separate review queue. After approve/skip the row's status
+ * changes and it falls out of this query naturally.
+ */
+export async function runPostReviewSurfaceTick(
+  ctx: SurfaceContext,
+): Promise<RunPostReviewSurfaceTickResult> {
+  const result: RunPostReviewSurfaceTickResult = { posted: [], errors: [] };
+  const conn = new Database(dbFile(ctx.dataDir), { readonly: true });
+  let candidates: ScheduledPost[];
+  try {
+    candidates = listScheduledPosts(conn, { status: "awaiting-review" });
+  } finally {
+    conn.close();
+  }
+  for (const post of candidates) {
+    if (findPostSurfaceRecord(dbFile(ctx.dataDir), post.id)) continue;
+    const planRecord = findPlan(ctx.dataDir, post.planId);
+    const planTitle = planRecord?.plan.metadata.title;
+    try {
+      await surfaceAwaitingReviewPost(ctx, post, {
+        ...(planTitle !== undefined && { planTitle }),
+      });
+      result.posted.push(post.id);
+    } catch (err) {
+      result.errors.push({
+        postId: post.id,
         error: err instanceof Error ? err.message : String(err),
       });
     }
