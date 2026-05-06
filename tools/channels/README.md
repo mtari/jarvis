@@ -12,7 +12,19 @@ The Facebook adapter supports both **per-app credentials** (recommended for mult
 
 ### Per-app config (recommended)
 
-For each onboarded app that posts to its own Facebook Page, add a `facebook` connection to its brain (`<dataDir>/vaults/<vault>/brains/<app>/brain.json`):
+Both the page id and the access token live in `<dataDir>/.env`; the brain holds only references (env-var names) to keep the data repo free of deploy-specific values.
+
+**`<dataDir>/.env`** (gitignored — both page id and token live here):
+
+```
+FB_PAGE_ID_ERDEI=123456789012345
+FB_TOKEN_ERDEI=EAAJ…
+
+FB_PAGE_ID_KUNA=987654321098765
+FB_TOKEN_KUNA=EAAJ…
+```
+
+**`<dataDir>/vaults/<vault>/brains/<app>/brain.json`** (in the data repo — only references):
 
 ```jsonc
 {
@@ -21,27 +33,22 @@ For each onboarded app that posts to its own Facebook Page, add a `facebook` con
   // ...
   "connections": {
     "facebook": {
-      "pageId": "123456789012345",
+      "pageIdEnvVar": "FB_PAGE_ID_ERDEI",
       "tokenEnvVar": "FB_TOKEN_ERDEI"
     }
   }
 }
 ```
 
-Then drop the actual token in `<dataDir>/.env` under the named variable:
-
-```
-FB_TOKEN_ERDEI=EAAJ…
-FB_TOKEN_KUNA=EAAJ…
-```
-
-The daemon walks every onboarded brain at startup, instantiates one Facebook adapter per app whose connection is configured AND whose env var resolves, and registers each as a per-app entry. Per-app entries win over the legacy fallback for the matching app; other apps fall through to the legacy fallback (or stub).
+The two env-var names you choose (`FB_PAGE_ID_ERDEI`, `FB_TOKEN_ERDEI` here) are arbitrary — the only rules are that they're valid shell env-var names and that the same string appears in both `.env` and the brain's `*EnvVar` field. The daemon walks every onboarded brain at startup, instantiates one Facebook adapter per app whose connection is configured AND whose env vars resolve, and registers each as a per-app entry. Per-app entries win over the legacy fallback for the matching app; other apps fall through to the legacy fallback (or stub).
 
 Why this shape:
-- Page id is public — fine to live in the brain (which is in the data repo).
-- Token is sensitive — stays in gitignored `.env`.
-- The brain documents the mapping ("this app's FB Page is X, its token is named Y") in one place. No naming-convention coupling between app slugs and env-var names.
-- New project? Add another connection in its brain + another env var.
+- Both deploy-specific values colocated in `.env` — one place to edit when rotating credentials or moving environments.
+- Brain stays in the data repo as project context: it documents that this app posts to a Facebook Page (and what env vars carry the values) without leaking any of the values themselves.
+- No naming-convention coupling between app slugs and env-var names.
+- New project? Add another connection block + another pair of env vars.
+
+> **Back-compat:** an older shape with a literal `pageId` field in the brain (`{ "pageId": "123…", "tokenEnvVar": "FB_TOKEN_ERDEI" }`) is still accepted — only `tokenEnvVar` was required to be in `.env`. Migrate to `pageIdEnvVar` when convenient. When both `pageIdEnvVar` and `pageId` are present, `pageIdEnvVar` wins.
 
 ### Legacy single-Page setup (back-compat with PR #61)
 

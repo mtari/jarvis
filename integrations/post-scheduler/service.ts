@@ -103,16 +103,24 @@ export function buildDefaultRegistry(
 
   for (const onboarded of listOnboardedApps(opts.dataDir)) {
     const fbConn = readFacebookConnection(onboarded.brain.connections, env);
-    if (!fbConn.pageId) continue;
-    if (fbConn.problem) {
+    // Brain has no FB connection block at all → silent skip.
+    if (
+      fbConn.pageId === undefined &&
+      fbConn.accessToken === undefined &&
+      fbConn.problem === undefined
+    ) {
+      continue;
+    }
+    if (fbConn.problem !== undefined) {
       opts.logger?.warn(
         "facebook adapter skipped for app — connection misconfigured",
         { app: onboarded.app, problem: fbConn.problem },
       );
       continue;
     }
-    if (fbConn.accessToken === undefined) {
-      // Legitimate "not configured here yet"; not an error.
+    if (fbConn.pageId === undefined || fbConn.accessToken === undefined) {
+      // Defensive — readFacebookConnection should always return either a
+      // problem or both fields once the brain has a connection block.
       continue;
     }
     registered.push({
@@ -137,33 +145,90 @@ interface ResolvedFacebookConnection {
   problem?: string;
 }
 
+/**
+ * Reads the brain's Facebook connection and resolves both the pageId
+ * and the access token.
+ *
+ * The recommended shape places **both** values in `<dataDir>/.env`
+ * and references them by env-var name in the brain:
+ *
+ *   "facebook": {
+ *     "pageIdEnvVar": "FB_PAGE_ID_ERDEI",
+ *     "tokenEnvVar":  "FB_TOKEN_ERDEI"
+ *   }
+ *
+ * For back-compat with PR #62 (the initial per-app shape), a literal
+ * `pageId` field is still accepted. When both `pageIdEnvVar` and
+ * `pageId` are present, `pageIdEnvVar` wins — encourages migration to
+ * the .env-only shape over time.
+ */
 function readFacebookConnection(
   connections: Record<string, Record<string, unknown>>,
   env: NodeJS.ProcessEnv,
 ): ResolvedFacebookConnection {
   const fb = connections["facebook"];
   if (!fb || typeof fb !== "object") return {};
-  const pageIdRaw = fb["pageId"];
+
+  const pageIdEnvRaw = fb["pageIdEnvVar"];
+  const pageIdLiteral = fb["pageId"];
   const tokenEnvRaw = fb["tokenEnvVar"];
-  if (pageIdRaw === undefined && tokenEnvRaw === undefined) return {};
-  if (typeof pageIdRaw !== "string" || pageIdRaw.trim().length === 0) {
-    return { problem: "connections.facebook.pageId must be a non-empty string" };
+
+  const hasAnyField =
+    pageIdEnvRaw !== undefined ||
+    pageIdLiteral !== undefined ||
+    tokenEnvRaw !== undefined;
+  if (!hasAnyField) return {};
+
+  // ---- pageId resolution ----
+  let pageId: string | undefined;
+  if (pageIdEnvRaw !== undefined) {
+    if (typeof pageIdEnvRaw !== "string" || pageIdEnvRaw.trim().length === 0) {
+      return {
+        problem:
+          "connections.facebook.pageIdEnvVar must be a non-empty string",
+      };
+    }
+    const v = env[pageIdEnvRaw];
+    if (v === undefined || v.trim().length === 0) {
+      return {
+        problem: `env var ${pageIdEnvRaw} (referenced by brain.connections.facebook.pageIdEnvVar) is unset or empty`,
+      };
+    }
+    pageId = v.trim();
+  } else if (pageIdLiteral !== undefined) {
+    if (
+      typeof pageIdLiteral !== "string" ||
+      pageIdLiteral.trim().length === 0
+    ) {
+      return {
+        problem: "connections.facebook.pageId must be a non-empty string",
+      };
+    }
+    pageId = pageIdLiteral.trim();
   }
+
+  // ---- token resolution ----
   if (typeof tokenEnvRaw !== "string" || tokenEnvRaw.trim().length === 0) {
     return {
-      pageId: pageIdRaw.trim(),
+      ...(pageId !== undefined && { pageId }),
       problem: "connections.facebook.tokenEnvVar must be a non-empty string",
     };
   }
   const accessToken = env[tokenEnvRaw];
   if (accessToken === undefined || accessToken.trim().length === 0) {
     return {
-      pageId: pageIdRaw.trim(),
+      ...(pageId !== undefined && { pageId }),
       problem: `env var ${tokenEnvRaw} (referenced by brain.connections.facebook.tokenEnvVar) is unset or empty`,
     };
   }
+  if (pageId === undefined) {
+    return {
+      problem:
+        "connections.facebook missing pageIdEnvVar (or legacy pageId)",
+    };
+  }
   return {
-    pageId: pageIdRaw.trim(),
+    pageId,
     accessToken: accessToken.trim(),
   };
 }
