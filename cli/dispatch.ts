@@ -8,6 +8,7 @@ import { runDocs } from "./commands/docs.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
+import { runLearn } from "./commands/learn.ts";
 import { runLogs } from "./commands/logs.ts";
 import { runMarketer } from "./commands/marketer.ts";
 import { runNotes } from "./commands/notes.ts";
@@ -80,6 +81,11 @@ Utilities:
   signals [filters]           Browse recorded signal events. Filters: --app,
                               --vault, --kind, --severity, --since <iso>,
                               --limit N, --format table|json
+  learn scan [--since <iso>] [--limit N] [--format table|json]
+                              Walk the feedback store + recent plan transitions,
+                              surface recurring rejection / revise themes and
+                              low-approval plan categories. Phase 4 v1: scan
+                              only — auto-drafting meta plans is a follow-up.
   marketer prepare <plan-id>  Parse an approved marketing plan's content calendar,
                               humanize each post, persist pending rows to
                               scheduled_posts. Idempotent.
@@ -211,6 +217,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runSignals(rest);
     case "scout":
       return runScout(rest);
+    case "learn":
+      return runLearn(rest);
     case "marketer":
       return runMarketer(rest);
     case "posts":
