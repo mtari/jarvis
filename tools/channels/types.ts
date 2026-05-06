@@ -6,10 +6,13 @@
  * file under sandbox so the daemon scheduler tick can be exercised
  * end-to-end before the real wrappers ship.
  *
- * The publisher (`orchestrator/post-publisher.ts`) looks up an
- * adapter by channel name. Channels with no registered adapter cause
- * the row to be marked `failed` with a "no adapter" reason — this is
- * how the system fails loud rather than silently dropping posts.
+ * The publisher (`orchestrator/post-publisher.ts`) dispatches by
+ * `(channel, appId)` via a `ChannelAdapterRegistry`. Per-app
+ * registrations (a Facebook adapter scoped to a specific Page) win
+ * over fallbacks (a legacy global FB env-var registration); fallbacks
+ * win over nothing. Channels with no registered adapter at all cause
+ * the row to be marked `failed` with a "no adapter" reason — fail
+ * loud rather than silently dropping posts.
  */
 
 export interface PublishInput {
@@ -45,9 +48,9 @@ export type PublishResult =
 
 export interface ChannelAdapter {
   /**
-   * Channels this adapter is registered for. The publisher indexes a
-   * `Map<channel, adapter>` from this list — the same adapter can
-   * serve multiple channels (e.g. the stub serves all of them).
+   * Channels this adapter is registered for. The registry indexes by
+   * channel (and optionally appId) — the same adapter can serve
+   * multiple channels (e.g. the stub serves all of them).
    */
   channels: ReadonlyArray<string>;
   /**
@@ -60,21 +63,95 @@ export interface ChannelAdapter {
   publish(input: PublishInput): Promise<PublishResult>;
 }
 
-export type ChannelAdapterMap = ReadonlyMap<string, ChannelAdapter>;
+/**
+ * One entry in the channel-adapter registry. `appId` undefined means
+ * the entry is a *fallback* — used for any post on this adapter's
+ * channels that doesn't have a per-app match. `appId` set scopes the
+ * entry to that single app's posts.
+ */
+export interface RegisteredAdapter {
+  adapter: ChannelAdapter;
+  /** Undefined → fallback (catch-all). Set → only handles this app's posts. */
+  appId?: string;
+  /** Diagnostic name surfaced in start-up logs. e.g. "facebook:erdei". */
+  name: string;
+}
+
+/** Read-only view of what's wired in the registry; used in start-up logs. */
+export interface RegistryDescription {
+  channel: string;
+  /** Undefined when the entry is a fallback for the channel. */
+  appId?: string;
+  adapterName: string;
+}
+
+export interface ChannelAdapterRegistry {
+  /**
+   * Returns the adapter that should handle a `(channel, appId)` post,
+   * or `null` when no adapter is registered. Lookup priority:
+   *   1. per-app match
+   *   2. fallback for the channel
+   *   3. null
+   */
+  get(channel: string, appId: string): ChannelAdapter | null;
+  /** Union of channels covered by per-app adapters and/or a fallback. */
+  channels(): ReadonlySet<string>;
+  /** Flat description of every registered entry. Stable for snapshots. */
+  describe(): RegistryDescription[];
+}
 
 /**
- * Helper: builds a `ChannelAdapterMap` from a list of adapters.
- * Last adapter wins on overlap — adapters earlier in the list act
- * as defaults that more-specific adapters can override.
+ * Builds the registry. Within a priority tier, last-wins:
+ *  - Two fallbacks for the same channel → the later one is used.
+ *  - Two per-app entries for the same `(channel, appId)` → the later
+ *    one is used.
+ *
+ * The split between fallback and per-app is by `appId` presence, not
+ * by registration order — a fallback registered before a per-app
+ * entry still loses to that per-app entry for the matching app.
  */
-export function buildAdapterMap(
-  adapters: ReadonlyArray<ChannelAdapter>,
-): ChannelAdapterMap {
-  const out = new Map<string, ChannelAdapter>();
-  for (const adapter of adapters) {
-    for (const channel of adapter.channels) {
-      out.set(channel, adapter);
+export function buildAdapterRegistry(
+  registered: ReadonlyArray<RegisteredAdapter>,
+): ChannelAdapterRegistry {
+  const perApp = new Map<string, Map<string, RegisteredAdapter>>();
+  const fallback = new Map<string, RegisteredAdapter>();
+  for (const entry of registered) {
+    for (const channel of entry.adapter.channels) {
+      if (entry.appId !== undefined) {
+        let byApp = perApp.get(channel);
+        if (!byApp) {
+          byApp = new Map();
+          perApp.set(channel, byApp);
+        }
+        byApp.set(entry.appId, entry);
+      } else {
+        fallback.set(channel, entry);
+      }
     }
   }
-  return out;
+  return {
+    get(channel, appId) {
+      const direct = perApp.get(channel)?.get(appId)?.adapter;
+      if (direct) return direct;
+      return fallback.get(channel)?.adapter ?? null;
+    },
+    channels() {
+      const set = new Set<string>();
+      for (const c of perApp.keys()) set.add(c);
+      for (const c of fallback.keys()) set.add(c);
+      return set;
+    },
+    describe() {
+      const out: RegistryDescription[] = [];
+      for (const [channel, byApp] of perApp) {
+        for (const [appId, entry] of byApp) {
+          out.push({ channel, appId, adapterName: entry.name });
+        }
+      }
+      for (const [channel, entry] of fallback) {
+        out.push({ channel, adapterName: entry.name });
+      }
+      return out;
+    },
+  };
 }

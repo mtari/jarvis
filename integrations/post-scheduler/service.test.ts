@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { dbFile } from "../../cli/paths.ts";
@@ -13,13 +15,26 @@ import {
   type ScheduledPostInput,
 } from "../../orchestrator/scheduled-posts.ts";
 import { createDaemonLogger } from "../../orchestrator/daemon-logger.ts";
-import type { PublishResult, ChannelAdapter } from "../../tools/channels/types.ts";
+import {
+  buildAdapterRegistry,
+  type ChannelAdapter,
+  type ChannelAdapterRegistry,
+  type PublishResult,
+} from "../../tools/channels/types.ts";
 import type { DaemonContext } from "../../cli/commands/daemon.ts";
 import {
-  buildDefaultAdapters,
+  buildDefaultRegistry,
   createPostSchedulerService,
   runPostSchedulerTick,
 } from "./service.ts";
+
+function fallbackRegistry(
+  adapters: ReadonlyArray<ChannelAdapter>,
+): ChannelAdapterRegistry {
+  return buildAdapterRegistry(
+    adapters.map((adapter, i) => ({ adapter, name: `test-adapter-${i}` })),
+  );
+}
 
 function row(
   id: string,
@@ -88,9 +103,9 @@ describe("runPostSchedulerTick", () => {
     try {
       await runPostSchedulerTick({
         dataDir: sandbox.dataDir,
-        adapters: new Map([
-          ["facebook", alwaysOkAdapter(["facebook"])],
-          ["instagram", alwaysOkAdapter(["instagram"])],
+        registry: fallbackRegistry([
+          alwaysOkAdapter(["facebook"]),
+          alwaysOkAdapter(["instagram"]),
         ]),
         ctx,
         now: new Date("2026-04-09T00:00:00.000Z"),
@@ -122,7 +137,7 @@ describe("runPostSchedulerTick", () => {
       // 5 hours past scheduled time — past 1h grace AND due for publishing.
       await runPostSchedulerTick({
         dataDir: sandbox.dataDir,
-        adapters: new Map([["facebook", alwaysOkAdapter(["facebook"])]]),
+        registry: fallbackRegistry([alwaysOkAdapter(["facebook"])]),
         ctx,
         now: new Date("2026-04-08T14:00:00.000Z"),
       });
@@ -158,7 +173,7 @@ describe("runPostSchedulerTick", () => {
     try {
       await runPostSchedulerTick({
         dataDir: sandbox.dataDir,
-        adapters: new Map([["facebook", alwaysOkAdapter(["facebook"])]]),
+        registry: fallbackRegistry([alwaysOkAdapter(["facebook"])]),
         ctx,
         now: new Date("2026-04-08T14:00:00.000Z"),
         staleGraceMs: null,
@@ -190,7 +205,7 @@ describe("runPostSchedulerTick", () => {
     try {
       await runPostSchedulerTick({
         dataDir: sandbox.dataDir,
-        adapters: new Map([["facebook", alwaysOkAdapter(["facebook"])]]),
+        registry: fallbackRegistry([alwaysOkAdapter(["facebook"])]),
         ctx,
         now: new Date("2026-04-09T00:00:00.000Z"),
       });
@@ -292,7 +307,7 @@ describe("createPostSchedulerService", () => {
   });
 });
 
-describe("buildDefaultAdapters", () => {
+describe("buildDefaultRegistry", () => {
   let sandbox: InstallSandbox;
   let silencer: ConsoleSilencer;
 
@@ -306,27 +321,212 @@ describe("buildDefaultAdapters", () => {
     sandbox.cleanup();
   });
 
-  it("returns just the file-stub when FB env vars are missing", () => {
-    const adapters = buildDefaultAdapters(sandbox.dataDir, {});
-    expect(adapters).toHaveLength(1);
-    expect(adapters[0]?.channels).toContain("facebook");
-    expect(adapters[0]?.channels).toContain("instagram");
+  function seedBrain(
+    app: string,
+    fbConn?: { pageId: string; tokenEnvVar: string },
+  ): void {
+    const dir = path.join(
+      sandbox.dataDir,
+      "vaults",
+      "personal",
+      "brains",
+      app,
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    const brain: Record<string, unknown> = {
+      schemaVersion: 1,
+      projectName: app,
+      projectType: "app",
+      projectStatus: "active",
+      projectPriority: 3,
+      userPreferences: {},
+      connections: fbConn ? { facebook: fbConn } : {},
+      priorities: [],
+      wip: {},
+    };
+    fs.writeFileSync(path.join(dir, "brain.json"), JSON.stringify(brain));
+  }
+
+  it("returns just the file-stub when no FB config anywhere", () => {
+    const r = buildDefaultRegistry({ dataDir: sandbox.dataDir, env: {} });
+    const desc = r.describe();
+    expect(desc.length).toBeGreaterThan(0);
+    expect(desc.every((e) => e.adapterName === "file-stub")).toBe(true);
+    expect(desc.every((e) => e.appId === undefined)).toBe(true);
+    expect(r.channels().has("facebook")).toBe(true);
   });
 
-  it("appends the FB adapter when both env vars are present", () => {
-    const adapters = buildDefaultAdapters(sandbox.dataDir, {
-      FB_PAGE_ID: "123",
-      FB_PAGE_ACCESS_TOKEN: "tok",
+  it("registers the legacy FB env adapter as a `facebook` fallback", () => {
+    const r = buildDefaultRegistry({
+      dataDir: sandbox.dataDir,
+      env: { FB_PAGE_ID: "123", FB_PAGE_ACCESS_TOKEN: "tok" },
     });
-    expect(adapters).toHaveLength(2);
-    // Last adapter overrides via buildAdapterMap last-wins.
-    expect(adapters[1]?.channels).toEqual(["facebook"]);
+    const desc = r.describe();
+    expect(
+      desc.some(
+        (e) =>
+          e.channel === "facebook" &&
+          e.appId === undefined &&
+          e.adapterName === "facebook:legacy-env",
+      ),
+    ).toBe(true);
   });
 
-  it("skips the FB adapter when one env var is missing", () => {
-    const adapters = buildDefaultAdapters(sandbox.dataDir, {
-      FB_PAGE_ID: "123",
+  it("registers per-app FB adapters when brain + env both present", () => {
+    seedBrain("erdei", {
+      pageId: "fb-erdei-id",
+      tokenEnvVar: "FB_TOKEN_ERDEI",
     });
-    expect(adapters).toHaveLength(1);
+    seedBrain("kuna", {
+      pageId: "fb-kuna-id",
+      tokenEnvVar: "FB_TOKEN_KUNA",
+    });
+    const r = buildDefaultRegistry({
+      dataDir: sandbox.dataDir,
+      env: {
+        FB_TOKEN_ERDEI: "tok-e",
+        FB_TOKEN_KUNA: "tok-k",
+      },
+    });
+    const desc = r.describe();
+    const perApp = desc.filter(
+      (e) => e.channel === "facebook" && e.appId !== undefined,
+    );
+    expect(perApp).toHaveLength(2);
+    expect(perApp.map((e) => e.appId).sort()).toEqual(["erdei", "kuna"]);
+    // get(channel, appId) returns per-app adapters distinctly
+    expect(r.get("facebook", "erdei")).not.toBeNull();
+    expect(r.get("facebook", "kuna")).not.toBeNull();
+    // Unrelated app falls through to stub fallback
+    expect(r.get("facebook", "other")?.channels).toContain("blog");
+  });
+
+  it("skips per-app FB when its env var is unset (and warns)", () => {
+    seedBrain("erdei", {
+      pageId: "fb-erdei-id",
+      tokenEnvVar: "FB_TOKEN_ERDEI",
+    });
+    const warnings: Array<{ msg: string; meta?: Record<string, unknown> }> = [];
+    const r = buildDefaultRegistry({
+      dataDir: sandbox.dataDir,
+      env: {},
+      logger: {
+        warn: (msg, meta) => warnings.push({ msg, ...(meta && { meta }) }),
+      },
+    });
+    const desc = r.describe();
+    const perApp = desc.filter(
+      (e) => e.channel === "facebook" && e.appId !== undefined,
+    );
+    expect(perApp).toHaveLength(0);
+    expect(warnings.some((w) => w.msg.includes("misconfigured"))).toBe(true);
+  });
+
+  it("skips per-app FB when brain.connections.facebook is malformed", () => {
+    // pageId set but tokenEnvVar missing
+    seedBrain("erdei", {
+      pageId: "fb-erdei-id",
+    } as { pageId: string; tokenEnvVar: string });
+    const warnings: string[] = [];
+    const r = buildDefaultRegistry({
+      dataDir: sandbox.dataDir,
+      env: {},
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+    expect(
+      r.describe().some((e) => e.adapterName.startsWith("facebook:erdei")),
+    ).toBe(false);
+    expect(warnings.length).toBeGreaterThan(0);
+  });
+
+  it("brains with no facebook connection are silently skipped (not warned)", () => {
+    seedBrain("appA");
+    const warnings: string[] = [];
+    const r = buildDefaultRegistry({
+      dataDir: sandbox.dataDir,
+      env: {},
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+    const desc = r.describe();
+    expect(
+      desc.filter((e) => e.adapterName.startsWith("facebook")),
+    ).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("per-app FB wins over legacy global FB for the matching app", () => {
+    seedBrain("erdei", {
+      pageId: "fb-erdei-id",
+      tokenEnvVar: "FB_TOKEN_ERDEI",
+    });
+    const r = buildDefaultRegistry({
+      dataDir: sandbox.dataDir,
+      env: {
+        FB_PAGE_ID: "global-id",
+        FB_PAGE_ACCESS_TOKEN: "global-tok",
+        FB_TOKEN_ERDEI: "tok-e",
+      },
+    });
+    // erdei → per-app; other apps → legacy fallback
+    const erdei = r.get("facebook", "erdei");
+    const other = r.get("facebook", "other-app");
+    expect(erdei).not.toBeNull();
+    expect(other).not.toBeNull();
+    expect(erdei).not.toBe(other);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildAdapterRegistry sanity (in tools/channels but exercised heavily here)
+// ---------------------------------------------------------------------------
+
+describe("buildAdapterRegistry priorities", () => {
+  it("per-app match beats fallback for the channel", () => {
+    const perApp: ChannelAdapter = {
+      channels: ["facebook"],
+      async publish() {
+        return { ok: true, publishedId: "per-app" };
+      },
+    };
+    const fallback: ChannelAdapter = {
+      channels: ["facebook"],
+      async publish() {
+        return { ok: true, publishedId: "fallback" };
+      },
+    };
+    const registry = buildAdapterRegistry([
+      { adapter: fallback, name: "fb-fallback" },
+      { adapter: perApp, appId: "erdei", name: "fb-erdei" },
+    ]);
+    expect(registry.get("facebook", "erdei")).toBe(perApp);
+    expect(registry.get("facebook", "kuna")).toBe(fallback);
+  });
+
+  it("returns null when no match anywhere", () => {
+    const registry = buildAdapterRegistry([]);
+    expect(registry.get("facebook", "erdei")).toBeNull();
+  });
+
+  it("describe surfaces every entry with channel + appId", () => {
+    const stub: ChannelAdapter = {
+      channels: ["blog", "newsletter"],
+      async publish() {
+        return { ok: true, publishedId: "x" };
+      },
+    };
+    const fb: ChannelAdapter = {
+      channels: ["facebook"],
+      async publish() {
+        return { ok: true, publishedId: "x" };
+      },
+    };
+    const registry = buildAdapterRegistry([
+      { adapter: stub, name: "stub" },
+      { adapter: fb, appId: "erdei", name: "fb-erdei" },
+    ]);
+    const desc = registry.describe();
+    expect(desc).toHaveLength(3);
+    const byName = desc.map((e) => e.adapterName).sort();
+    expect(byName).toEqual(["fb-erdei", "stub", "stub"]);
   });
 });
