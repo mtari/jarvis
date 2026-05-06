@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { parseArgs } from "node:util";
 import Database from "better-sqlite3";
 import { appendEvent } from "../../orchestrator/event-log.ts";
+import { publishDuePosts } from "../../orchestrator/post-publisher.ts";
 import {
   editScheduledPost,
   findScheduledPost,
@@ -12,6 +13,11 @@ import {
   type ScheduledPost,
   type ScheduledPostStatus,
 } from "../../orchestrator/scheduled-posts.ts";
+import { createFileStubAdapter } from "../../tools/channels/file-stub.ts";
+import {
+  buildAdapterMap,
+  type ChannelAdapter,
+} from "../../tools/channels/types.ts";
 import { dbFile, getDataDir } from "../paths.ts";
 
 /**
@@ -34,8 +40,10 @@ const VALID_STATUSES: ReadonlyArray<ScheduledPostStatus> = [
 ];
 
 export interface PostsCommandDeps {
-  /** Test seam — fixed clock for edit history. */
+  /** Test seam — fixed clock for edit history + publish-due cutoff. */
   now?: Date;
+  /** Test / advanced seam — override the channel adapters used by publish-due. */
+  adapters?: ReadonlyArray<ChannelAdapter>;
 }
 
 export async function runPosts(
@@ -50,14 +58,16 @@ export async function runPosts(
       return runPostsEdit(rest, deps);
     case "skip":
       return runPostsSkip(rest);
+    case "publish-due":
+      return runPostsPublishDue(rest, deps);
     case undefined:
       console.error(
-        "posts: missing subcommand. Usage: yarn jarvis posts <list|edit|skip> ...",
+        "posts: missing subcommand. Usage: yarn jarvis posts <list|edit|skip|publish-due> ...",
       );
       return 1;
     default:
       console.error(
-        `posts: unknown subcommand "${subcommand}". Available: list, edit, skip.`,
+        `posts: unknown subcommand "${subcommand}". Available: list, edit, skip, publish-due.`,
       );
       return 1;
   }
@@ -322,4 +332,68 @@ async function runPostsSkip(rest: string[]): Promise<number> {
 
 function isStatus(s: string): s is ScheduledPostStatus {
   return (VALID_STATUSES as ReadonlyArray<string>).includes(s);
+}
+
+// ---------------------------------------------------------------------------
+// posts publish-due
+// ---------------------------------------------------------------------------
+
+async function runPostsPublishDue(
+  rest: string[],
+  deps: PostsCommandDeps,
+): Promise<number> {
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args: rest,
+      options: {
+        limit: { type: "string" },
+      },
+      allowPositionals: false,
+    });
+  } catch (err) {
+    console.error(`posts publish-due: ${(err as Error).message}`);
+    return 1;
+  }
+  let maxPerTick: number | undefined;
+  if (parsed.values.limit !== undefined) {
+    const n = Number.parseInt(parsed.values.limit, 10);
+    if (!Number.isFinite(n) || n < 1) {
+      console.error(
+        `posts publish-due: invalid --limit "${parsed.values.limit}".`,
+      );
+      return 1;
+    }
+    maxPerTick = n;
+  }
+
+  const dataDir = getDataDir();
+  const adapters = buildAdapterMap(
+    deps.adapters ?? [createFileStubAdapter({ dataDir })],
+  );
+  const db = new Database(dbFile(dataDir));
+  try {
+    const result = await publishDuePosts({
+      db,
+      adapters,
+      ...(deps.now !== undefined && { now: deps.now }),
+      ...(maxPerTick !== undefined && { maxPerTick }),
+    });
+    if (result.examined === 0) {
+      console.log("No due pending posts.");
+      return 0;
+    }
+    console.log(
+      `Examined ${result.examined} due post(s) — published ${result.published.length}, failed ${result.failed.length}.`,
+    );
+    for (const p of result.published) {
+      console.log(`  ✓ ${p.postId} → ${p.publishedId}  [${p.channel}]`);
+    }
+    for (const f of result.failed) {
+      console.log(`  ✗ ${f.postId} [${f.channel}]: ${f.reason}`);
+    }
+    return result.failed.length > 0 ? 1 : 0;
+  } finally {
+    db.close();
+  }
 }

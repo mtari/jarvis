@@ -13,6 +13,7 @@ import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import { createAnalystService } from "../../integrations/analyst/service.ts";
 import { createTriageService } from "../../integrations/triage/service.ts";
 import { createPlanExecutorService } from "../../integrations/plan-executor/service.ts";
+import { createPostSchedulerService } from "../../integrations/post-scheduler/service.ts";
 import {
   createSlackService,
   readSlackEnv,
@@ -194,6 +195,7 @@ function defaultServices(dataDir: string): DaemonService[] {
     createPlanExecutorService({ dataDir }),
     createAnalystService({ dataDir }),
     createTriageService({ dataDir }),
+    createPostSchedulerService({ dataDir }),
   ];
   const slackConfig = readSlackEnv();
   if (slackConfig) {
