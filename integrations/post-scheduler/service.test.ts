@@ -123,6 +123,113 @@ describe("runPostSchedulerTick", () => {
     }
   });
 
+  it("reconciles marketing plan state after publish (executing → done when last row publishes)", async () => {
+    // Drop a marketing plan in `executing` (simulating after marketer fired).
+    const planText = [
+      "# Plan: tick-reconcile",
+      "Type: marketing",
+      "Subtype: campaign",
+      "App: demo",
+      "Priority: normal",
+      "Destructive: false",
+      "Status: executing",
+      "Author: strategist",
+      "Confidence: 75 — fixture",
+      "",
+      "## Opportunity",
+      "x",
+      "",
+      "## Audience",
+      "x",
+      "",
+      "## Channels",
+      "x",
+      "",
+      "## Content calendar",
+      "(rows below)",
+      "",
+      "## Schedule",
+      "x",
+      "",
+      "## Tracking & KPIs",
+      "x",
+      "",
+      "## Success metric",
+      "- Metric: x",
+      "- Baseline: x",
+      "- Target: x",
+      "- Data source: x",
+      "",
+      "## Observation window",
+      "30d.",
+      "",
+      "## Connections required",
+      "- Facebook: present",
+      "",
+      "## Rollback",
+      "x",
+      "",
+      "## Estimated effort",
+      "- Claude calls: ~3",
+      "- Your review time: 5 min",
+      "- Wall-clock to ship: 1 hour",
+      "",
+      "## Amendment clauses",
+      "x",
+      "",
+    ].join("\n");
+    const planDir = path.join(
+      sandbox.dataDir,
+      "vaults",
+      "personal",
+      "plans",
+      "demo",
+    );
+    fs.mkdirSync(planDir, { recursive: true });
+    fs.writeFileSync(path.join(planDir, "tick-reconcile.md"), planText);
+
+    const db = new Database(dbFile(sandbox.dataDir));
+    try {
+      insertScheduledPost(db, {
+        ...row("p1"),
+        planId: "tick-reconcile",
+      });
+    } finally {
+      db.close();
+    }
+
+    const ctx = buildCtx(sandbox);
+    try {
+      await runPostSchedulerTick({
+        dataDir: sandbox.dataDir,
+        registry: fallbackRegistry([alwaysOkAdapter(["facebook"])]),
+        ctx,
+        now: new Date("2026-04-09T00:00:00.000Z"),
+      });
+    } finally {
+      ctx.logger.close();
+    }
+
+    // Plan should now be `done`.
+    const verifyDb = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const transitions = verifyDb
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'plan-transition' ORDER BY id ASC",
+        )
+        .all() as Array<{ payload: string }>;
+      const planTransitions = transitions
+        .map((t) => JSON.parse(t.payload))
+        .filter((t) => t.planId === "tick-reconcile");
+      // executing → done (since the plan started in executing)
+      expect(planTransitions).toEqual([
+        expect.objectContaining({ from: "executing", to: "done" }),
+      ]);
+    } finally {
+      verifyDb.close();
+    }
+  });
+
   it("flags stale-window rows then publishes them on the same tick", async () => {
     const db = new Database(dbFile(sandbox.dataDir));
     try {

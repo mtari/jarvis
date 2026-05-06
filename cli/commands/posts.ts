@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { parseArgs } from "node:util";
 import Database from "better-sqlite3";
 import { appendEvent } from "../../orchestrator/event-log.ts";
+import { reconcileMarketingPlanState } from "../../orchestrator/marketing-plan-lifecycle.ts";
 import { publishDuePosts } from "../../orchestrator/post-publisher.ts";
 import {
   approveScheduledPost,
@@ -331,6 +332,25 @@ async function runPostsSkip(rest: string[]): Promise<number> {
     });
     console.log(`✓ Skipped ${id}`);
     console.log(`  Reason: ${reason.trim()}`);
+
+    // Skipping might have removed the last open row of a marketing plan,
+    // so the plan should now move to `done`. Reconcile is idempotent and
+    // a no-op for non-marketing plans.
+    try {
+      const reconcile = reconcileMarketingPlanState({
+        dataDir,
+        dbFilePath: dbFile(dataDir),
+        planId: updated.planId,
+        actor: "cli",
+      });
+      for (const t of reconcile.transitioned) {
+        console.log(`  Plan ${updated.planId}: ${t.from} → ${t.to}`);
+      }
+    } catch (err) {
+      console.error(
+        `posts skip: plan reconcile failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     return 0;
   } finally {
     db.close();

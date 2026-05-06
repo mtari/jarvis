@@ -105,7 +105,7 @@ describe("publishDuePosts", () => {
     });
     expect(result.examined).toBe(1);
     expect(result.published).toEqual([
-      { postId: "p1", channel: "facebook", publishedId: "fb-123" },
+      { postId: "p1", planId: "plan-1", channel: "facebook", publishedId: "fb-123" },
     ]);
     expect(calls).toHaveLength(1);
 
@@ -171,7 +171,7 @@ describe("publishDuePosts", () => {
       now: new Date("2026-04-09T00:00:00.000Z"),
     });
     expect(result.failed).toEqual([
-      { postId: "p1", channel: "facebook", reason: "rate-limited" },
+      { postId: "p1", planId: "plan-1", channel: "facebook", reason: "rate-limited" },
     ]);
     const updated = listScheduledPosts(db)[0];
     expect(updated?.status).toBe("failed");
