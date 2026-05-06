@@ -18,6 +18,7 @@ import type { Database } from "better-sqlite3";
  */
 
 export type ScheduledPostStatus =
+  | "awaiting-review"
   | "pending"
   | "published"
   | "failed"
@@ -213,6 +214,7 @@ function toScheduledPost(row: RawRow): ScheduledPost {
 
 function assertStatus(s: string): ScheduledPostStatus {
   switch (s) {
+    case "awaiting-review":
     case "pending":
     case "published":
     case "failed":
@@ -327,6 +329,56 @@ export function editScheduledPost(
 export interface SkipScheduledPostInput {
   reason: string;
   actor: string;
+}
+
+export interface ApproveScheduledPostInput {
+  actor: string;
+}
+
+/**
+ * Flips an `awaiting-review` row to `pending` so the publisher tick
+ * picks it up. Used for single-post plans where each post needs
+ * per-post review before publishing (§10).
+ *
+ * Idempotent on already-pending rows. Refuses on rows that have
+ * progressed past the review gate (published, failed, skipped):
+ * publishing them would be a re-publish; the operator is asking for
+ * the wrong tool.
+ */
+export function approveScheduledPost(
+  db: Database,
+  id: string,
+  input: ApproveScheduledPostInput,
+): ScheduledPost {
+  const current = findScheduledPost(db, id);
+  if (!current) {
+    throw new ScheduledPostMutationError(`scheduled post "${id}" not found`);
+  }
+  if (current.status === "pending") {
+    return current;
+  }
+  if (current.status !== "awaiting-review" && current.status !== "edited") {
+    throw new ScheduledPostMutationError(
+      `scheduled post "${id}" has status "${current.status}"; only awaiting-review or edited rows can be approved`,
+    );
+  }
+  const trimmedActor = input.actor.trim();
+  if (trimmedActor.length === 0) {
+    throw new ScheduledPostMutationError("approval actor cannot be empty");
+  }
+  db.prepare(
+    `UPDATE scheduled_posts
+        SET status = 'pending',
+            failure_reason = NULL
+      WHERE id = ?`,
+  ).run(id);
+  const updated = findScheduledPost(db, id);
+  if (!updated) {
+    throw new ScheduledPostMutationError(
+      `internal: row "${id}" disappeared after approve`,
+    );
+  }
+  return updated;
 }
 
 /**

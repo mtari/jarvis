@@ -8,6 +8,7 @@ import {
   type InstallSandbox,
 } from "../cli/commands/_test-helpers.ts";
 import {
+  approveScheduledPost,
   countScheduledPosts,
   editScheduledPost,
   findScheduledPost,
@@ -190,6 +191,73 @@ describe("scheduled-posts store", () => {
     it("throws on unknown id", () => {
       expect(() =>
         editScheduledPost(db, "ghost", { newContent: "x", actor: "cli" }),
+      ).toThrow(/not found/);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // approveScheduledPost
+  // -------------------------------------------------------------------------
+
+  describe("approveScheduledPost", () => {
+    it("flips awaiting-review → pending", () => {
+      insertScheduledPost(db, row("a1", { status: "awaiting-review" }));
+      const updated = approveScheduledPost(db, "a1", { actor: "cli" });
+      expect(updated.status).toBe("pending");
+    });
+
+    it("flips edited → pending (post-edit re-review case)", () => {
+      insertScheduledPost(db, row("a2", { status: "edited" }));
+      const updated = approveScheduledPost(db, "a2", { actor: "cli" });
+      expect(updated.status).toBe("pending");
+    });
+
+    it("clears any prior failure_reason on approve", () => {
+      insertScheduledPost(db, row("a3", { status: "awaiting-review" }));
+      db.prepare(
+        "UPDATE scheduled_posts SET failure_reason = ? WHERE id = ?",
+      ).run("stale note", "a3");
+      const updated = approveScheduledPost(db, "a3", { actor: "cli" });
+      expect(updated.failureReason).toBeNull();
+    });
+
+    it("is idempotent on already-pending rows", () => {
+      insertScheduledPost(db, row("a4", { status: "pending" }));
+      const updated = approveScheduledPost(db, "a4", { actor: "cli" });
+      expect(updated.status).toBe("pending");
+    });
+
+    it("rejects approve on published rows", () => {
+      insertScheduledPost(db, row("a5", { status: "published" }));
+      expect(() =>
+        approveScheduledPost(db, "a5", { actor: "cli" }),
+      ).toThrow(/published/);
+    });
+
+    it("rejects approve on skipped rows", () => {
+      insertScheduledPost(db, row("a6", { status: "skipped" }));
+      expect(() =>
+        approveScheduledPost(db, "a6", { actor: "cli" }),
+      ).toThrow(ScheduledPostMutationError);
+    });
+
+    it("rejects approve on failed rows", () => {
+      insertScheduledPost(db, row("a7", { status: "failed" }));
+      expect(() =>
+        approveScheduledPost(db, "a7", { actor: "cli" }),
+      ).toThrow(/failed/);
+    });
+
+    it("rejects empty actor", () => {
+      insertScheduledPost(db, row("a8", { status: "awaiting-review" }));
+      expect(() =>
+        approveScheduledPost(db, "a8", { actor: "  " }),
+      ).toThrow(/actor/);
+    });
+
+    it("throws on unknown id", () => {
+      expect(() =>
+        approveScheduledPost(db, "ghost", { actor: "cli" }),
       ).toThrow(/not found/);
     });
   });

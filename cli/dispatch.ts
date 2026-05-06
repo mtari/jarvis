@@ -90,6 +90,8 @@ Utilities:
                               edit_history. Refuses on already-published rows.
   posts skip <post-id> --reason "<text>"
                               Mark a row as skipped — scheduler won't publish it.
+  posts approve <post-id>     Flip an awaiting-review row (single-post plans)
+                              to pending so the daemon will publish it.
   posts publish-due [--limit N]
                               Manually fire one publisher tick: pick up due
                               pending rows, publish through registered channel

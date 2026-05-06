@@ -56,6 +56,12 @@ export interface PreparedPost {
   scheduledAt: string;
   /** True when humanizer reported no edits. */
   unchanged: boolean;
+  /**
+   * Initial row status. `pending` for campaign plans (publisher
+   * picks up directly); `awaiting-review` for single-post plans
+   * (operator runs `posts approve <id>` to gate publishing).
+   */
+  status: "pending" | "awaiting-review";
 }
 
 export interface PrepareMarketingPlanInput {
@@ -128,6 +134,14 @@ export async function prepareMarketingPlan(
       };
     }
 
+    // §10: campaign posts publish without per-post review (the user reviews
+    // the plan once); single-post plans need a per-post review gate. We
+    // express that here: campaign rows land "pending" (publisher picks them
+    // up); single-post rows land "awaiting-review" (operator runs `posts
+    // approve <id>` to flip them to pending).
+    const isSinglePost = plan.metadata.subtype === "single-post";
+    const initialStatus = isSinglePost ? "awaiting-review" : "pending";
+
     const prepared: PreparedPost[] = [];
     for (const entry of entries) {
       const result = await humanize(
@@ -145,7 +159,7 @@ export async function prepareMarketingPlan(
         content: result.text,
         assets: entry.assets,
         scheduledAt,
-        status: "pending",
+        status: initialStatus,
       };
       db.transaction(() => {
         insertScheduledPost(db, row);
@@ -158,6 +172,7 @@ export async function prepareMarketingPlan(
             planId: input.planId,
             channel: entry.channel,
             scheduledAt,
+            status: initialStatus,
             humanizerChangeCount: result.changes.length,
             humanizerUnchanged: result.unchanged,
           },
@@ -170,6 +185,7 @@ export async function prepareMarketingPlan(
         humanizedText: result.text,
         scheduledAt,
         unchanged: result.unchanged,
+        status: initialStatus,
       });
     }
 
