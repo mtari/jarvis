@@ -445,6 +445,96 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
   });
 
   // -------------------------------------------------------------------------
+  // Discuss proposal buttons — Accept / Drop
+  // -------------------------------------------------------------------------
+
+  app.action("discuss_accept", async ({ ack, body, action, client }) => {
+    await ack();
+    if (action.type !== "button") return;
+    const threadTs = action.value;
+    if (!threadTs) return;
+    const userId = "user" in body && body.user?.id ? body.user.id : "<slack>";
+    const channelId =
+      body.type === "block_actions" ? body.channel?.id : undefined;
+    if (!channelId) return;
+
+    try {
+      const result = await continueDiscussConversation({
+        ctx: {
+          dataDir: ctx.dataDir,
+          client,
+          anthropic: ctx.getAnthropicClient(),
+        },
+        channel: channelId,
+        threadTs,
+        userText: "y",
+        userId,
+      });
+      ctx.log("discuss accept via slack", {
+        channel: channelId,
+        threadTs,
+        status: result.status,
+      });
+      await stripDiscussButtons(client, body, `✓ Accepted by <@${userId}>`);
+    } catch (err) {
+      ctx.logError("discuss accept failed", err, {
+        channel: channelId,
+        threadTs,
+      });
+      await postEphemeral(
+        client,
+        body,
+        `✗ Accept failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  });
+
+  app.action("discuss_drop", async ({ ack, body, action, client }) => {
+    await ack();
+    if (action.type !== "button") return;
+    const threadTs = action.value;
+    if (!threadTs) return;
+    const userId = "user" in body && body.user?.id ? body.user.id : "<slack>";
+    const channelId =
+      body.type === "block_actions" ? body.channel?.id : undefined;
+    if (!channelId) return;
+
+    try {
+      const result = await continueDiscussConversation({
+        ctx: {
+          dataDir: ctx.dataDir,
+          client,
+          anthropic: ctx.getAnthropicClient(),
+        },
+        channel: channelId,
+        threadTs,
+        userText: "n",
+        userId,
+      });
+      ctx.log("discuss drop via slack", {
+        channel: channelId,
+        threadTs,
+        status: result.status,
+      });
+      await stripDiscussButtons(
+        client,
+        body,
+        `↪ Dropped by <@${userId}> — Jarvis will refine and try again.`,
+      );
+    } catch (err) {
+      ctx.logError("discuss drop failed", err, {
+        channel: channelId,
+        threadTs,
+      });
+      await postEphemeral(
+        client,
+        body,
+        `✗ Drop failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
   // Discuss thread replies — drive the conversation forward
   // -------------------------------------------------------------------------
 
@@ -1119,6 +1209,45 @@ async function postDmOrEphemeral(
  * the same message visually closes itself.
  */
 async function closeSetupTaskMessage(
+  client: BoltApp["client"] | undefined,
+  body: unknown,
+  outcomeText: string,
+): Promise<void> {
+  if (!client) return;
+  const b = body as {
+    type?: string;
+    message?: { ts?: string; blocks?: Array<{ type?: string }> };
+    channel?: { id?: string };
+  };
+  if (b.type !== "block_actions" || !b.message?.ts || !b.channel?.id) return;
+  const trimmed = (b.message.blocks ?? []).filter(
+    (block) => block.type !== "actions",
+  );
+  try {
+    await client.chat.update({
+      channel: b.channel.id,
+      ts: b.message.ts,
+      blocks: [
+        ...trimmed,
+        {
+          type: "context",
+          elements: [{ type: "mrkdwn", text: outcomeText }],
+        },
+      ] as never,
+      text: outcomeText,
+    });
+  } catch {
+    // best-effort
+  }
+}
+
+/**
+ * After a discuss Accept / Drop click, strip the action row from the
+ * proposal message + append an outcome context line so the message
+ * visually closes. Same shape as closeSetupTaskMessage; kept as a
+ * separate function so the two can diverge later if needed.
+ */
+async function stripDiscussButtons(
   client: BoltApp["client"] | undefined,
   body: unknown,
   outcomeText: string,
