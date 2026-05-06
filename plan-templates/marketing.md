@@ -18,8 +18,17 @@ Segment, language, cultural context.
 Which platforms, in what priority.
 
 ## Content calendar
-For Subtype=campaign: every post's final text (pre-humanized per §13), date, channel, asset references. This is what gets scheduled — you will not see each post again before it publishes.
-For Subtype=single-post: the full finalized post text for this single entry.
+Every post as a `### Post N` block. Marketer parses this — keep the format strict.
+
+### Post 1
+Date: <YYYY-MM-DD>
+Channel: <facebook | instagram | twitter | linkedin | newsletter | blog>
+Assets: <comma-separated refs, or `-`>
+Text:
+The actual post text — multi-line allowed; ends at the next `### ` or `## ` header.
+
+### Post 2
+...
 
 ## Schedule
 When each piece goes live.
