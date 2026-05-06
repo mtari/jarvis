@@ -19,7 +19,7 @@ import {
   type ConsoleSilencer,
   type InstallSandbox,
 } from "./_test-helpers.ts";
-import { runDocs } from "./docs.ts";
+import { runDocs, type DocsCommandDeps } from "./docs.ts";
 
 function seedBrain(sandbox: InstallSandbox, app: string): void {
   const brainPath = brainFile(sandbox.dataDir, "personal", app);
@@ -181,14 +181,161 @@ describe("docs add (cache mode v1)", () => {
     sandbox.cleanup();
   });
 
-  it("requires --keep (absorb mode is unimplemented)", async () => {
-    const file = path.join(tmpDir, "spec.md");
-    fs.writeFileSync(file, "hello");
-    const code = await runDocs(["add", "--app", "demo", file]);
+  it("absorb mode (no --keep) drafts an improvement/meta plan + writes docs.json entry", async () => {
+    const file = path.join(tmpDir, "brand-guide.md");
+    fs.writeFileSync(file, "# Brand voice\n\nWarm and factual.");
+    const planBody = [
+      "<plan>",
+      "# Plan: Absorb brand-guide-md into demo brain",
+      "Type: improvement",
+      "Subtype: meta",
+      "ImplementationReview: skip",
+      "App: demo",
+      "Priority: normal",
+      "Destructive: false",
+      "Status: draft",
+      "Author: strategist",
+      "Confidence: 75 — fixture",
+      "",
+      "## Problem",
+      "Brain lacks brand voice; doc fills it.",
+      "",
+      "## Build plan",
+      "- Apply the brain changes below.",
+      "- Write doc id to docs.json.",
+      "",
+      "## Brain changes (proposed)",
+      "- `brand.voice`: add — \"warm, factual\"",
+      "",
+      "## Doc summary",
+      "Brand voice is warm and factual.",
+      "",
+      "## Testing strategy",
+      "Manual diff of brain.",
+      "",
+      "## Acceptance criteria",
+      "- brain.brand.voice set",
+      "",
+      "## Success metric",
+      "- Metric: subjective",
+      "- Baseline: pre",
+      "- Target: post",
+      "- Data source: manual",
+      "",
+      "## Observation window",
+      "N/A.",
+      "",
+      "## Connections required",
+      "- None: present",
+      "",
+      "## Rollback",
+      "Revert brain.json.",
+      "",
+      "## Estimated effort",
+      "- Claude calls: 1",
+      "- Your review time: 5 min",
+      "- Wall-clock to ship: minutes",
+      "",
+      "## Amendment clauses",
+      "Pause if conflicting with active plan.",
+      "</plan>",
+    ].join("\n");
+    const buildClient = (): {
+      chat: (req: unknown) => Promise<unknown>;
+    } => ({
+      async chat() {
+        return {
+          text: planBody,
+          blocks: [{ type: "text", text: planBody }],
+          stopReason: "end_turn",
+          model: "claude-sonnet-4-6",
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cachedInputTokens: 0,
+            cacheCreationTokens: 0,
+          },
+          redactions: [],
+        };
+      },
+    });
+    const code = await runDocs(["add", "--app", "demo", file], {
+      buildClient: buildClient as unknown as NonNullable<
+        DocsCommandDeps["buildClient"]
+      >,
+    });
+    expect(code).toBe(0);
+
+    // Plan file written
+    const folder = path.join(
+      sandbox.dataDir,
+      "vaults",
+      "personal",
+      "plans",
+      "demo",
+    );
+    const planFiles = fs.readdirSync(folder).filter((f) => f.endsWith(".md"));
+    expect(planFiles).toHaveLength(1);
+    const planText = fs.readFileSync(path.join(folder, planFiles[0]!), "utf8");
+    expect(planText).toContain("Type: improvement");
+    expect(planText).toContain("Subtype: meta");
+    expect(planText).toContain("Status: awaiting-review");
+
+    // docs.json entry
+    const docs = loadDocsIndex(sandbox.dataDir, "personal", "demo");
+    expect(docs).toHaveLength(1);
+    expect(docs[0]?.retention).toBe("absorbed");
+    expect(docs[0]?.summary).toContain("Brand voice");
+    expect(docs[0]?.cachedFile).toBeUndefined();
+
+    // doc-absorb-proposed event recorded
+    const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const events = db
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'doc-absorb-proposed'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(events).toHaveLength(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("absorb mode surfaces clarify response as a hint to use --keep", async () => {
+    const file = path.join(tmpDir, "irrelevant.md");
+    fs.writeFileSync(file, "Random unrelated content.");
+    const buildClient = (): {
+      chat: (req: unknown) => Promise<unknown>;
+    } => ({
+      async chat() {
+        const text =
+          "<clarify>\nDoc has nothing project-relevant. Did you want --keep?\n</clarify>";
+        return {
+          text,
+          blocks: [{ type: "text", text }],
+          stopReason: "end_turn",
+          model: "claude-sonnet-4-6",
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cachedInputTokens: 0,
+            cacheCreationTokens: 0,
+          },
+          redactions: [],
+        };
+      },
+    });
+    const code = await runDocs(["add", "--app", "demo", file], {
+      buildClient: buildClient as unknown as NonNullable<
+        DocsCommandDeps["buildClient"]
+      >,
+    });
     expect(code).toBe(1);
-    expect(
-      errSpy.mock.calls.map((c: unknown[]) => String(c[0])).join("\n"),
-    ).toContain("absorb mode");
+    const errOut = errSpy.mock.calls
+      .map((c: unknown[]) => String(c[0]))
+      .join("\n");
+    expect(errOut).toContain("--keep");
   });
 
   it("caches a local file end-to-end", async () => {

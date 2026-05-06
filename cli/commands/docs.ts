@@ -1,6 +1,12 @@
 import fs from "node:fs";
 import { parseArgs } from "node:util";
 import Database from "better-sqlite3";
+import { absorbDoc, DocAbsorbError } from "../../agents/strategist-doc-absorb.ts";
+import {
+  createSdkClient,
+  type AnthropicClient,
+} from "../../orchestrator/agent-sdk-runtime.ts";
+import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import { brainExists } from "../../orchestrator/brain.ts";
 import {
   cacheRelativePath,
@@ -17,8 +23,9 @@ import {
   type DocEntry,
   type FetchUrl,
 } from "../../orchestrator/docs.ts";
+import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
-import { brainFile, dbFile, getDataDir } from "../paths.ts";
+import { brainFile, dbFile, envFile, getDataDir } from "../paths.ts";
 
 /**
  * `yarn jarvis docs <subcommand>`
@@ -36,6 +43,8 @@ export interface DocsCommandDeps {
   /** Test seam — overrides URL fetcher. */
   fetchUrl?: FetchUrl;
   now?: Date;
+  /** Test seam — overrides the LLM client used for absorb mode. */
+  buildClient?: () => AnthropicClient;
 }
 
 export async function runDocs(
@@ -182,13 +191,6 @@ async function runDocsAdd(
     );
     return 1;
   }
-  if (!keep) {
-    console.error(
-      "docs add: absorb mode (without --keep) is not yet implemented. Use --keep for cache mode, or wait for the absorb-mode follow-up.",
-    );
-    return 1;
-  }
-
   const dataDir = getDataDir();
   if (!brainExists(brainFile(dataDir, vault, app))) {
     console.error(
@@ -215,7 +217,6 @@ async function runDocsAdd(
   }
 
   const existing = loadDocsIndex(dataDir, vault, app);
-  const wantedId = docIdFromSource(source);
   // Refuse to clobber an existing entry with the same source — keep the
   // user's mental model intact ("add the same doc twice = no-op").
   const sameSource = existing.find((e) => e.source === source);
@@ -225,6 +226,20 @@ async function runDocsAdd(
     );
     return 1;
   }
+
+  if (!keep) {
+    return absorbDocViaStrategist({
+      app,
+      vault,
+      dataDir,
+      source,
+      docContent: loaded.content,
+      ...(parsed.values.title !== undefined && { contextTag: parsed.values.title }),
+      ...(deps.buildClient !== undefined && { buildClient: deps.buildClient }),
+    });
+  }
+
+  const wantedId = docIdFromSource(source);
   const id = uniqueDocId(
     wantedId,
     existing.map((e) => e.id),
@@ -392,5 +407,64 @@ function recordEvent(
     appendEvent(db, { appId: app, vaultId: vault, kind, payload });
   } finally {
     db.close();
+  }
+}
+
+interface AbsorbDocCliInput {
+  app: string;
+  vault: string;
+  dataDir: string;
+  source: string;
+  docContent: string;
+  contextTag?: string;
+  buildClient?: () => AnthropicClient;
+}
+
+async function absorbDocViaStrategist(
+  input: AbsorbDocCliInput,
+): Promise<number> {
+  loadEnvFile(envFile(input.dataDir));
+  const baseClient: AnthropicClient = input.buildClient
+    ? input.buildClient()
+    : createSdkClient();
+  const recorder = buildAgentCallRecorder(baseClient, dbFile(input.dataDir), {
+    app: input.app,
+    vault: input.vault,
+    agent: "strategist",
+    mode: "subscription",
+  });
+  try {
+    const result = await absorbDoc({
+      client: recorder.client,
+      app: input.app,
+      vault: input.vault,
+      dataDir: input.dataDir,
+      source: input.source,
+      docContent: input.docContent,
+      ...(input.contextTag !== undefined && { contextTag: input.contextTag }),
+    });
+    recorder.flush();
+    console.log(`✓ Absorb plan drafted for ${input.app}`);
+    console.log(`  Plan: ${result.planId}`);
+    console.log(`  Path: ${result.planPath}`);
+    console.log(`  Doc:  ${result.docId} (registered, retention=absorbed)`);
+    console.log("");
+    console.log(
+      "  Review with: yarn jarvis plans --pending-review --app " + input.app,
+    );
+    console.log(
+      "  After approval, apply the proposed brain changes by hand (auto-apply lands in a follow-up).",
+    );
+    return 0;
+  } catch (err) {
+    recorder.flush();
+    if (err instanceof DocAbsorbError) {
+      console.error(`docs add (absorb): ${err.message}`);
+      return 1;
+    }
+    console.error(
+      `docs add (absorb): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return 1;
   }
 }
