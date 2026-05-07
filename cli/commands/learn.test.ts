@@ -128,4 +128,118 @@ describe("runLearn", () => {
     // Old rows excluded → no themes surface.
     expect(out).toContain("none above threshold");
   });
+
+  // -------------------------------------------------------------------------
+  // learn draft
+  // -------------------------------------------------------------------------
+
+  function fakeMetaClient(): NonNullable<
+    NonNullable<Parameters<typeof runLearn>[1]>["buildClient"]
+  > {
+    const text = `<plan>
+# Plan: Add scope-tightening rule
+Type: improvement
+Subtype: meta
+ImplementationReview: skip
+App: jarvis
+Priority: normal
+Destructive: false
+Status: draft
+Author: strategist
+Confidence: 70 — fixture
+
+## Problem
+Recurring scope rejections.
+
+## Build plan
+- Add prompt rule.
+
+## Testing strategy
+Manual.
+
+## Acceptance criteria
+- ok
+
+## Success metric
+- Metric: x
+- Baseline: x
+- Target: x
+- Data source: x
+
+## Observation window
+30d.
+
+## Connections required
+- None: present
+
+## Rollback
+Revert.
+
+## Estimated effort
+- Claude calls: 1
+- Your review time: 5 min
+- Wall-clock to ship: minutes
+
+## Amendment clauses
+Pause if metric grows.
+</plan>`;
+    return () =>
+      ({
+        async chat() {
+          return {
+            text,
+            blocks: [{ type: "text", text }],
+            stopReason: "end_turn",
+            model: "claude-sonnet-4-6",
+            usage: {
+              inputTokens: 0,
+              outputTokens: 0,
+              cachedInputTokens: 0,
+              cacheCreationTokens: 0,
+            },
+            redactions: [],
+          };
+        },
+      }) as never;
+  }
+
+  it("draft: no findings → friendly message + exit 0", async () => {
+    const code = await runLearn(["draft"], {
+      buildClient: fakeMetaClient(),
+    });
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+    expect(out).toContain("nothing to draft");
+  });
+
+  it("draft: drafts a plan when a finding is above threshold", async () => {
+    const db = new Database(dbFile(sandbox.dataDir));
+    try {
+      for (let i = 0; i < 5; i += 1) {
+        recordFeedback(db, {
+          kind: "reject",
+          actor: "user",
+          targetType: "plan",
+          targetId: `p-${i}`,
+          note: "the scope is bad",
+        });
+      }
+    } finally {
+      db.close();
+    }
+    const code = await runLearn(["draft"], {
+      buildClient: fakeMetaClient(),
+    });
+    expect(code).toBe(0);
+    const out = logSpy.mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+    expect(out).toContain("Drafted 1 meta plan(s)");
+  });
+
+  it("draft: rejects invalid --threshold", async () => {
+    expect(await runLearn(["draft", "--threshold", "abc"])).toBe(1);
+  });
+
+  it("draft: rejects invalid --max-drafts", async () => {
+    expect(await runLearn(["draft", "--max-drafts", "0"])).toBe(1);
+  });
 });

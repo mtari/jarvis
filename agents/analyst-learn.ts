@@ -1,8 +1,17 @@
+import fs from "node:fs";
+import path from "node:path";
 import Database from "better-sqlite3";
+import type { AnthropicClient } from "../orchestrator/agent-sdk-runtime.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
 import { listFeedback, type FeedbackRow } from "../orchestrator/feedback-store.ts";
-import { listPlans } from "../orchestrator/plan-store.ts";
-import { dbFile } from "../cli/paths.ts";
+import { parsePlan, transitionPlan } from "../orchestrator/plan.ts";
+import { listPlans, savePlan } from "../orchestrator/plan-store.ts";
+import {
+  dumpFailedDraft,
+  generatePlanId,
+  parseStrategistResponse,
+} from "./strategist.ts";
+import { dbFile, planDir, repoRoot } from "../cli/paths.ts";
 
 /**
  * Analyst's learning loop — Phase 4 v1.
@@ -382,4 +391,361 @@ function buildRecommendations(args: {
     );
   }
   return out;
+}
+
+// ===========================================================================
+// Auto-draft meta plans from scan findings
+// ===========================================================================
+
+/**
+ * Single-finding shape passed to Strategist for drafting. Subset of
+ * the LearnReport — flattened so the agent prompt is straightforward
+ * to construct.
+ */
+export type LearnFinding =
+  | {
+      kind: "rejection-theme";
+      token: string;
+      count: number;
+      examplePlanIds: string[];
+    }
+  | {
+      kind: "revise-theme";
+      token: string;
+      count: number;
+      examplePlanIds: string[];
+    }
+  | {
+      kind: "low-approval";
+      type: string;
+      subtype: string | null;
+      total: number;
+      approved: number;
+      rate: number;
+    };
+
+export interface DraftMetaPlansFromScanInput {
+  dataDir: string;
+  client: AnthropicClient;
+  /** Reuse a recent scan instead of running one. Test seam. */
+  report?: LearnReport;
+  /** Minimum count to draft a meta plan for a theme. Default 5. */
+  threshold?: number;
+  /** Hard cap on drafts per call. Default 5. */
+  maxDrafts?: number;
+  /** Test seam — fixed clock for the recorded events. */
+  now?: Date;
+}
+
+export interface DraftedFinding {
+  finding: LearnFinding;
+  planId: string;
+  planPath: string;
+}
+
+export interface SkippedFinding {
+  finding: LearnFinding;
+  reason: string;
+}
+
+export interface DraftMetaPlansFromScanResult {
+  drafted: DraftedFinding[];
+  skipped: SkippedFinding[];
+  errors: SkippedFinding[];
+}
+
+/**
+ * Default threshold for auto-draft. Findings below this stay in the
+ * scan report only; humans decide when to act.
+ */
+export const DEFAULT_DRAFT_THRESHOLD = 5;
+
+/**
+ * Walks the scan's findings, drafts a meta plan per finding above
+ * the threshold (single Strategist call each). Idempotent across
+ * invocations: findings already drafted in the last 14 days are
+ * skipped via `learn-meta-drafted` events.
+ */
+export async function draftMetaPlansFromScan(
+  input: DraftMetaPlansFromScanInput,
+): Promise<DraftMetaPlansFromScanResult> {
+  const threshold = input.threshold ?? DEFAULT_DRAFT_THRESHOLD;
+  const maxDrafts = input.maxDrafts ?? 5;
+
+  const report = input.report ?? runLearnScan({ dataDir: input.dataDir });
+  const findings = pickFindingsToDraft(report, threshold).slice(0, maxDrafts);
+  const result: DraftMetaPlansFromScanResult = {
+    drafted: [],
+    skipped: [],
+    errors: [],
+  };
+
+  if (findings.length === 0) return result;
+
+  const recentlyDrafted = readRecentlyDraftedFindings(input.dataDir);
+  const systemPrompt = loadLearnMetaPrompt();
+
+  for (const finding of findings) {
+    const key = findingDedupeKey(finding);
+    if (recentlyDrafted.has(key)) {
+      result.skipped.push({
+        finding,
+        reason: `already drafted within the last 14 days (${key})`,
+      });
+      continue;
+    }
+
+    const userMessage = buildLearnMetaContext(finding);
+    let responseText: string;
+    try {
+      const response = await input.client.chat({
+        system: systemPrompt,
+        cacheSystem: true,
+        messages: [{ role: "user", content: userMessage }],
+      });
+      responseText = response.text;
+    } catch (err) {
+      result.errors.push({
+        finding,
+        reason: `Strategist call failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      continue;
+    }
+
+    let action;
+    try {
+      action = parseStrategistResponse({
+        text: responseText,
+        blocks: [{ type: "text", text: responseText }],
+        stopReason: null,
+        model: "",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cachedInputTokens: 0,
+          cacheCreationTokens: 0,
+        },
+        redactions: [],
+      });
+    } catch (err) {
+      result.errors.push({
+        finding,
+        reason: `parse failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      continue;
+    }
+
+    if (action.kind !== "draft") {
+      // Strategist returned <clarify> — finding too thin to act on.
+      result.skipped.push({
+        finding,
+        reason: `Strategist asked for clarification: ${action.questions.join(" ")}`,
+      });
+      continue;
+    }
+
+    let plan;
+    try {
+      plan = parsePlan(action.markdown);
+    } catch (err) {
+      const dumpPath = dumpFailedDraft(input.dataDir, action.markdown);
+      result.errors.push({
+        finding,
+        reason: `schema validation failed: ${err instanceof Error ? err.message : String(err)}${dumpPath ? ` (raw at ${dumpPath})` : ""}`,
+      });
+      continue;
+    }
+    if (
+      plan.metadata.type !== "improvement" ||
+      plan.metadata.subtype !== "meta"
+    ) {
+      result.errors.push({
+        finding,
+        reason: `expected improvement/meta, got ${plan.metadata.type}/${plan.metadata.subtype ?? "(none)"}`,
+      });
+      continue;
+    }
+
+    const transitioned = transitionPlan(plan, "awaiting-review");
+    const app = plan.metadata.app;
+    // Find an appropriate vault — use 'personal' as default for the
+    // jarvis app; per-app meta plans use the same vault as the app
+    // they target if findable, else 'personal'.
+    const vault = inferVault(input.dataDir, app);
+    const planId = generatePlanId(
+      transitioned.metadata.title,
+      app,
+      input.dataDir,
+      vault,
+    );
+    const folder = planDir(input.dataDir, vault, app);
+    fs.mkdirSync(folder, { recursive: true });
+    const planPath = path.join(folder, `${planId}.md`);
+    savePlan(planPath, transitioned);
+
+    const writeDb = new Database(dbFile(input.dataDir));
+    try {
+      writeDb.transaction(() => {
+        appendEvent(writeDb, {
+          appId: app,
+          vaultId: vault,
+          kind: "plan-drafted",
+          payload: {
+            planId,
+            brief: `learn auto-draft: ${describeFindingShort(finding)}`,
+            rounds: 0,
+            author: "strategist",
+          },
+        });
+        appendEvent(writeDb, {
+          appId: app,
+          vaultId: vault,
+          kind: "learn-meta-drafted",
+          payload: {
+            planId,
+            findingKind: finding.kind,
+            findingKey: key,
+          },
+          ...(input.now !== undefined && {
+            createdAt: input.now.toISOString(),
+          }),
+        });
+      })();
+    } finally {
+      writeDb.close();
+    }
+
+    result.drafted.push({ finding, planId, planPath });
+  }
+
+  return result;
+}
+
+/** Stable key per finding so we can dedupe across runs. */
+function findingDedupeKey(f: LearnFinding): string {
+  if (f.kind === "low-approval") {
+    return `low-approval:${f.type}:${f.subtype ?? "(none)"}`;
+  }
+  return `${f.kind}:${f.token}`;
+}
+
+function readRecentlyDraftedFindings(dataDir: string): Set<string> {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 14);
+  const cutoffIso = cutoff.toISOString();
+  const db = new Database(dbFile(dataDir), { readonly: true });
+  try {
+    const rows = db
+      .prepare(
+        "SELECT payload FROM events WHERE kind = 'learn-meta-drafted' AND created_at >= ?",
+      )
+      .all(cutoffIso) as Array<{ payload: string }>;
+    const out = new Set<string>();
+    for (const r of rows) {
+      try {
+        const p = JSON.parse(r.payload) as { findingKey?: unknown };
+        if (typeof p.findingKey === "string") out.add(p.findingKey);
+      } catch {
+        // skip malformed
+      }
+    }
+    return out;
+  } finally {
+    db.close();
+  }
+}
+
+function pickFindingsToDraft(
+  report: LearnReport,
+  threshold: number,
+): LearnFinding[] {
+  const out: LearnFinding[] = [];
+  for (const t of report.rejectionThemes) {
+    if (t.count >= threshold) {
+      out.push({
+        kind: "rejection-theme",
+        token: t.token,
+        count: t.count,
+        examplePlanIds: t.examplePlanIds,
+      });
+    }
+  }
+  for (const t of report.reviseThemes) {
+    if (t.count >= threshold) {
+      out.push({
+        kind: "revise-theme",
+        token: t.token,
+        count: t.count,
+        examplePlanIds: t.examplePlanIds,
+      });
+    }
+  }
+  for (const lar of report.lowApprovalRates) {
+    // Low-approval requires >=threshold total + already-low rate.
+    if (lar.total >= threshold) {
+      out.push({
+        kind: "low-approval",
+        type: lar.type,
+        subtype: lar.subtype,
+        total: lar.total,
+        approved: lar.approved,
+        rate: lar.rate,
+      });
+    }
+  }
+  return out;
+}
+
+function buildLearnMetaContext(finding: LearnFinding): string {
+  const lines: string[] = [];
+  lines.push("Recurring pattern detected by `yarn jarvis learn scan`:");
+  lines.push("");
+  if (finding.kind === "rejection-theme") {
+    lines.push(`Kind: rejection-theme`);
+    lines.push(`Token: ${finding.token}`);
+    lines.push(`Count: ${finding.count} distinct plans`);
+    lines.push(`Example plan ids: ${finding.examplePlanIds.join(", ")}`);
+  } else if (finding.kind === "revise-theme") {
+    lines.push(`Kind: revise-theme`);
+    lines.push(`Token: ${finding.token}`);
+    lines.push(`Count: ${finding.count} distinct plans`);
+    lines.push(`Example plan ids: ${finding.examplePlanIds.join(", ")}`);
+  } else {
+    lines.push(`Kind: low-approval`);
+    lines.push(
+      `Plan category: ${finding.type}${finding.subtype ? `/${finding.subtype}` : ""}`,
+    );
+    lines.push(`Approval rate: ${finding.approved}/${finding.total} (${Math.round(finding.rate * 100)}%)`);
+  }
+  lines.push("");
+  lines.push(
+    "Diagnose what this pattern likely means about Strategist's drafting / the brain / a threshold, and propose ONE intervention as a meta plan.",
+  );
+  return lines.join("\n");
+}
+
+function describeFindingShort(f: LearnFinding): string {
+  if (f.kind === "low-approval") {
+    return `low-approval ${f.type}${f.subtype ? `/${f.subtype}` : ""}`;
+  }
+  return `${f.kind} "${f.token}"`;
+}
+
+function inferVault(dataDir: string, app: string): string {
+  // Walk listOnboardedApps-style: find the vault where this app's
+  // brain lives. Default to "personal" when not found (matches the
+  // out-of-the-box vault).
+  const records = listPlans(dataDir);
+  const hit = records.find((r) => r.app === app);
+  return hit?.vault ?? "personal";
+}
+
+let cachedLearnMetaPrompt: string | undefined;
+function loadLearnMetaPrompt(): string {
+  if (cachedLearnMetaPrompt !== undefined) return cachedLearnMetaPrompt;
+  cachedLearnMetaPrompt = fs.readFileSync(
+    path.join(repoRoot(), "prompts", "strategist-learn-meta.md"),
+    "utf8",
+  );
+  return cachedLearnMetaPrompt;
 }
