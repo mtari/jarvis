@@ -1,6 +1,13 @@
+import fs from "node:fs";
+import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { dbFile } from "../cli/paths.ts";
+import type {
+  AnthropicClient,
+  ChatResponse,
+} from "../orchestrator/agent-sdk-runtime.ts";
+import { appendEvent } from "../orchestrator/event-log.ts";
+import { dbFile, planDir } from "../cli/paths.ts";
 import {
   dropPlan,
   makeInstallSandbox,
@@ -9,7 +16,11 @@ import {
   type InstallSandbox,
 } from "../cli/commands/_test-helpers.ts";
 import { recordFeedback } from "../orchestrator/feedback-store.ts";
-import { runLearnScan } from "./analyst-learn.ts";
+import {
+  draftMetaPlansFromScan,
+  runLearnScan,
+  type LearnFinding,
+} from "./analyst-learn.ts";
 
 function seedFeedback(
   sandbox: InstallSandbox,
@@ -210,5 +221,356 @@ describe("runLearnScan", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+// ===========================================================================
+// draftMetaPlansFromScan
+// ===========================================================================
+
+const VALID_META_PLAN_RESPONSE = `<plan>
+# Plan: Add scope-tightening rule to Strategist
+Type: improvement
+Subtype: meta
+ImplementationReview: skip
+App: jarvis
+Priority: normal
+Destructive: false
+Status: draft
+Author: strategist
+Confidence: 70 — 5 plans rejected with "scope" theme
+
+## Problem
+Five recent plans were rejected with notes mentioning "scope" — Strategist's draft is too broad.
+
+## Build plan
+- Edit \`prompts/strategist-improvement.md\` to add a scope-tightening guardrail.
+
+## Testing strategy
+Re-run a synthetic plan request that previously triggered the pattern.
+
+## Acceptance criteria
+- Subsequent plans show clearer scope boundaries.
+
+## Success metric
+- Metric: rejection-theme "scope" occurrences per N drafts
+- Baseline: 5 in last 30d
+- Target: < 2 in next 30d
+- Data source: \`yarn jarvis learn scan\`
+
+## Observation window
+30d.
+
+## Connections required
+- None: present
+
+## Rollback
+Revert the prompt change via git.
+
+## Estimated effort
+- Claude calls: 1
+- Your review time: 5 min
+- Wall-clock to ship: minutes
+
+## Amendment clauses
+Pause and amend if "scope" theme grows after the prompt change ships.
+</plan>`;
+
+function fakeClient(text: string): AnthropicClient {
+  return {
+    async chat() {
+      const r: ChatResponse = {
+        text,
+        blocks: [{ type: "text", text }],
+        stopReason: "end_turn",
+        model: "claude-sonnet-4-6",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cachedInputTokens: 0,
+          cacheCreationTokens: 0,
+        },
+        redactions: [],
+      };
+      return r;
+    },
+  };
+}
+
+describe("draftMetaPlansFromScan", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function seedRejectionTheme(
+    sandboxArg: InstallSandbox,
+    token: string,
+    count: number,
+  ): void {
+    // Note is crafted to produce exactly ONE theme above threshold: only
+    // the `token` itself is long-enough + non-stop-word. "the" / "is" /
+    // "bad" are stop-words or under the 4-char minimum.
+    const db = new Database(dbFile(sandboxArg.dataDir));
+    try {
+      for (let i = 0; i < count; i += 1) {
+        recordFeedback(db, {
+          kind: "reject",
+          actor: "user",
+          targetType: "plan",
+          targetId: `p-${token}-${i}`,
+          note: `the ${token} is bad`,
+        });
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  it("drafts a meta plan when a finding is above threshold", async () => {
+    seedRejectionTheme(sandbox, "scope", 5);
+    const result = await draftMetaPlansFromScan({
+      dataDir: sandbox.dataDir,
+      client: fakeClient(VALID_META_PLAN_RESPONSE),
+      threshold: 5,
+    });
+    expect(result.drafted).toHaveLength(1);
+    expect(result.drafted[0]?.planId).toMatch(/scope-tightening/);
+
+    // Plan file written under jarvis/plans
+    const folder = planDir(sandbox.dataDir, "personal", "jarvis");
+    expect(fs.existsSync(folder)).toBe(true);
+    const files = fs.readdirSync(folder).filter((f) => f.endsWith(".md"));
+    expect(files).toHaveLength(1);
+    const planText = fs.readFileSync(path.join(folder, files[0]!), "utf8");
+    expect(planText).toContain("Subtype: meta");
+    expect(planText).toContain("Status: awaiting-review");
+
+    // learn-meta-drafted event recorded
+    const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const events = db
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'learn-meta-drafted'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(events).toHaveLength(1);
+      expect(JSON.parse(events[0]!.payload)).toMatchObject({
+        findingKey: "rejection-theme:scope",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("does NOT draft when count is below threshold", async () => {
+    seedRejectionTheme(sandbox, "scope", 4);
+    const result = await draftMetaPlansFromScan({
+      dataDir: sandbox.dataDir,
+      client: fakeClient(VALID_META_PLAN_RESPONSE),
+      threshold: 5,
+    });
+    expect(result.drafted).toEqual([]);
+    expect(result.skipped).toEqual([]);
+  });
+
+  it("is idempotent — second call with same finding skips (within 14d)", async () => {
+    seedRejectionTheme(sandbox, "scope", 5);
+    const first = await draftMetaPlansFromScan({
+      dataDir: sandbox.dataDir,
+      client: fakeClient(VALID_META_PLAN_RESPONSE),
+      threshold: 5,
+    });
+    expect(first.drafted).toHaveLength(1);
+
+    const second = await draftMetaPlansFromScan({
+      dataDir: sandbox.dataDir,
+      client: fakeClient(VALID_META_PLAN_RESPONSE),
+      threshold: 5,
+    });
+    expect(second.drafted).toEqual([]);
+    expect(second.skipped).toHaveLength(1);
+    expect(second.skipped[0]?.reason).toContain("already drafted");
+  });
+
+  it("skips findings when Strategist returns clarify (signal too thin)", async () => {
+    seedRejectionTheme(sandbox, "scope", 5);
+    const result = await draftMetaPlansFromScan({
+      dataDir: sandbox.dataDir,
+      client: fakeClient(
+        "<clarify>\nFinding too thin to act on confidently.\n</clarify>",
+      ),
+      threshold: 5,
+    });
+    expect(result.drafted).toEqual([]);
+    expect(result.skipped).toHaveLength(1);
+    expect(result.skipped[0]?.reason).toContain("clarification");
+  });
+
+  it("surfaces parse errors per-finding without aborting the rest", async () => {
+    seedRejectionTheme(sandbox, "scope", 5);
+    seedRejectionTheme(sandbox, "rollback", 5);
+    let calls = 0;
+    const client: AnthropicClient = {
+      async chat() {
+        calls += 1;
+        const text =
+          calls === 1 ? "garbage no plan tags here" : VALID_META_PLAN_RESPONSE;
+        return {
+          text,
+          blocks: [{ type: "text", text }],
+          stopReason: "end_turn",
+          model: "claude-sonnet-4-6",
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cachedInputTokens: 0,
+            cacheCreationTokens: 0,
+          },
+          redactions: [],
+        };
+      },
+    };
+    const result = await draftMetaPlansFromScan({
+      dataDir: sandbox.dataDir,
+      client,
+      threshold: 5,
+    });
+    expect(result.drafted.length).toBeGreaterThan(0);
+    expect(result.errors.length).toBeGreaterThan(0);
+  });
+
+  it("respects maxDrafts", async () => {
+    seedRejectionTheme(sandbox, "scope", 5);
+    seedRejectionTheme(sandbox, "rollback", 5);
+    seedRejectionTheme(sandbox, "metric", 5);
+    const result = await draftMetaPlansFromScan({
+      dataDir: sandbox.dataDir,
+      client: fakeClient(VALID_META_PLAN_RESPONSE),
+      threshold: 5,
+      maxDrafts: 2,
+    });
+    expect(result.drafted.length + result.errors.length).toBeLessThanOrEqual(2);
+  });
+
+  it("rejects plans that aren't improvement/meta", async () => {
+    seedRejectionTheme(sandbox, "scope", 5);
+    // Same plan body but with the wrong subtype
+    const badResponse = VALID_META_PLAN_RESPONSE.replace(
+      "Subtype: meta",
+      "Subtype: new-feature",
+    ).replace("ImplementationReview: skip", "ImplementationReview: required");
+    const result = await draftMetaPlansFromScan({
+      dataDir: sandbox.dataDir,
+      client: fakeClient(badResponse),
+      threshold: 5,
+    });
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]?.reason).toContain("improvement/meta");
+  });
+
+  it("treats existing learn-meta-drafted events older than 14d as expired (re-drafts)", async () => {
+    seedRejectionTheme(sandbox, "scope", 5);
+    // Pre-seed an old learn-meta-drafted event
+    const long_ago = new Date();
+    long_ago.setDate(long_ago.getDate() - 30);
+    const db = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(db, {
+        appId: "jarvis",
+        vaultId: "personal",
+        kind: "learn-meta-drafted",
+        payload: {
+          planId: "old-plan",
+          findingKind: "rejection-theme",
+          findingKey: "rejection-theme:scope",
+        },
+        createdAt: long_ago.toISOString(),
+      });
+    } finally {
+      db.close();
+    }
+    const result = await draftMetaPlansFromScan({
+      dataDir: sandbox.dataDir,
+      client: fakeClient(VALID_META_PLAN_RESPONSE),
+      threshold: 5,
+    });
+    // Old event is past the 14-day window, so we re-draft.
+    expect(result.drafted).toHaveLength(1);
+  });
+
+  it("low-approval finding is included when total >= threshold", async () => {
+    // Pre-seed: 5 plans of improvement/new-feature, all rejected.
+    for (let i = 0; i < 5; i += 1) {
+      dropPlan(sandbox, `low-${i}`, {
+        type: "improvement",
+        subtype: "new-feature",
+      });
+    }
+    const db = new Database(dbFile(sandbox.dataDir));
+    try {
+      for (let i = 0; i < 5; i += 1) {
+        recordFeedback(db, {
+          kind: "reject",
+          actor: "user",
+          targetType: "plan",
+          targetId: `low-${i}`,
+        });
+      }
+    } finally {
+      db.close();
+    }
+    const result = await draftMetaPlansFromScan({
+      dataDir: sandbox.dataDir,
+      client: fakeClient(VALID_META_PLAN_RESPONSE),
+      threshold: 5,
+    });
+    // The low-approval finding above threshold should be included.
+    expect(result.drafted.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("no-op when scan has no findings above threshold", async () => {
+    const result = await draftMetaPlansFromScan({
+      dataDir: sandbox.dataDir,
+      client: fakeClient(VALID_META_PLAN_RESPONSE),
+      threshold: 5,
+    });
+    expect(result.drafted).toEqual([]);
+    expect(result.skipped).toEqual([]);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("LearnFinding type smoke (every kind constructible)", () => {
+    const samples: LearnFinding[] = [
+      {
+        kind: "rejection-theme",
+        token: "scope",
+        count: 5,
+        examplePlanIds: ["p1"],
+      },
+      {
+        kind: "revise-theme",
+        token: "rollback",
+        count: 5,
+        examplePlanIds: ["p1"],
+      },
+      {
+        kind: "low-approval",
+        type: "improvement",
+        subtype: "new-feature",
+        total: 5,
+        approved: 1,
+        rate: 0.2,
+      },
+    ];
+    expect(samples).toHaveLength(3);
   });
 });

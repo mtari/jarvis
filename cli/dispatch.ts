@@ -84,8 +84,11 @@ Utilities:
   learn scan [--since <iso>] [--limit N] [--format table|json]
                               Walk the feedback store + recent plan transitions,
                               surface recurring rejection / revise themes and
-                              low-approval plan categories. Phase 4 v1: scan
-                              only — auto-drafting meta plans is a follow-up.
+                              low-approval plan categories.
+  learn draft [--threshold N] [--max-drafts N] [--since <iso>]
+                              Run scan, then ask Strategist to draft a meta
+                              plan per finding above threshold. Idempotent
+                              against the last 14 days.
   marketer prepare <plan-id>  Parse an approved marketing plan's content calendar,
                               humanize each post, persist pending rows to
                               scheduled_posts. Idempotent.
