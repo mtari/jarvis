@@ -26,6 +26,7 @@ import { runScan } from "./commands/scan.ts";
 import { runScout } from "./commands/scout.ts";
 import { runSignals } from "./commands/signals.ts";
 import { runStatus } from "./commands/status.ts";
+import { runTelemetry } from "./commands/telemetry.ts";
 import { runTriage } from "./commands/triage.ts";
 import {
   runSuppress,
@@ -154,6 +155,11 @@ Utilities:
                               Portfolio summary: critical signals, pending
                               reviews, stuck plans, quiet apps, expiring
                               suppressions. Default 7-day window.
+  telemetry [--since <iso>] [--format table|json]
+                              System-quality metrics over a window: plan
+                              transitions, override rate per plan-type,
+                              average revise rounds, escalation count,
+                              learning-loop activity.
   version                     Print Jarvis version
   help, --help, -h            Show this message
 
@@ -230,6 +236,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runObserveImpact(rest);
     case "status":
       return runStatus(rest);
+    case "telemetry":
+      return runTelemetry(rest);
     case "triage":
       return runTriage(rest);
     case "suppress":
