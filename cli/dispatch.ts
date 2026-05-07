@@ -6,6 +6,7 @@ import { runDaemon } from "./commands/daemon.ts";
 import { runDiscussCommand } from "./commands/discuss.ts";
 import { runDocs } from "./commands/docs.ts";
 import { runDoctor } from "./commands/doctor.ts";
+import { runFridayAuditCommand } from "./commands/friday-audit.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
 import { runLearn } from "./commands/learn.ts";
@@ -160,6 +161,13 @@ Utilities:
                               transitions, override rate per plan-type,
                               average revise rounds, escalation count,
                               learning-loop activity.
+  friday-audit [--dry-run] [--force] [--format table|json]
+                              Manual trigger for the Strategist Friday
+                              self-audit. Daemon runs hourly; gates
+                              suppress outside Friday + project-throughput
+                              window. --dry-run records the audit but
+                              skips Strategist; --force bypasses
+                              day-of-week + throughput + idempotency.
   version                     Print Jarvis version
   help, --help, -h            Show this message
 
@@ -246,6 +254,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runUnsuppress(rest);
     case "suppressions":
       return runSuppressions(rest);
+    case "friday-audit":
+      return runFridayAuditCommand(rest);
     case "version":
       return runVersion(rest);
     default:
