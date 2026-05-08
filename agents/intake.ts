@@ -290,7 +290,12 @@ export async function runIntakeAgent(
       systemPrompt,
       userPrompt,
       cwd: input.repoRoot,
-      maxTurns: 4,
+      // Per-round budget. The SDK counts each Read/Glob/Grep tool call as a
+      // turn; the agent typically skims 1–3 repo files on round 1 before
+      // emitting <ask>, then mostly text-only on subsequent rounds. 20 leaves
+      // headroom for tool-heavy rounds without letting a wandering agent
+      // burn an unbounded budget.
+      maxTurns: 20,
       toolPreset: { kind: "readonly" },
       ...(input.model !== undefined && { model: input.model }),
       ...(input.transport !== undefined && { transport: input.transport }),
