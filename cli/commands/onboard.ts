@@ -3,6 +3,12 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import Database from "better-sqlite3";
 import {
+  IntakeError,
+  makeStdioIntakeIO,
+  runIntakeAgent,
+  type IntakeIO,
+} from "../../agents/intake.ts";
+import {
   OnboardError,
   runOnboardAgent,
   type AbsorbedDoc,
@@ -11,6 +17,7 @@ import {
 import type { RunAgentTransport } from "../../orchestrator/agent-sdk-runtime.ts";
 import { saveBrain } from "../../orchestrator/brain.ts";
 import {
+  cacheAbsolutePath,
   cacheRelativePath,
   defaultFetchUrl,
   docIdFromSource,
@@ -34,11 +41,22 @@ import {
 } from "../paths.ts";
 
 export interface OnboardCommandDeps {
-  /** Test injection — overrides the SDK transport. */
+  /** Test injection — overrides the SDK transport for the brain-extraction agent. */
   transport?: RunAgentTransport;
+  /** Test injection — overrides the SDK transport for the intake agent. */
+  intakeTransport?: RunAgentTransport;
+  /** Test injection — replaces the stdin/stdout interview IO. */
+  intakeIO?: IntakeIO;
+  /**
+   * Test injection — overrides the TTY check that decides whether to run
+   * the interview phase. Defaults to `process.stdin.isTTY`.
+   */
+  hasTty?: () => boolean;
   /** For tests: skip the network and return a stub for any URL doc fetch. */
   fetchUrl?: FetchUrl;
 }
+
+const INTAKE_DOC_ID = "intake";
 
 const APP_NAME_PATTERN = /^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$/;
 
@@ -63,6 +81,7 @@ export async function runOnboard(
         docs: { type: "string", multiple: true },
         "docs-keep": { type: "string", multiple: true },
         "move-docs": { type: "boolean" },
+        "skip-interview": { type: "boolean" },
       },
       allowPositionals: false,
     });
@@ -168,13 +187,91 @@ export async function runOnboard(
     `  Vault: ${vault}  •  Absorbed docs: ${absorbedDocs.length}  •  Cached docs: ${cachedDocs.length}`,
   );
 
+  // ---------------------------------------------------------------------
+  // Phase 1 — Interactive interview (intake.md).
+  // Skipped when --skip-interview is set or when stdin isn't a TTY (e.g.
+  // CI, tests, daemon). The intake doc is registered as a cached doc and
+  // fed into Phase 2 alongside any user-provided absorbed docs.
+  // ---------------------------------------------------------------------
+  const skipFlag = v["skip-interview"] === true;
+  const hasTty = (deps.hasTty ?? defaultHasTty)();
+  const runInterview = !skipFlag && hasTty;
+
+  // Pre-create the brain folders so the intake file has a stable home.
+  const brainFolder = brainDir(dataDir, vault, app);
+  fs.mkdirSync(path.join(brainFolder, "docs"), { recursive: true });
+  fs.mkdirSync(path.join(brainFolder, "research"), { recursive: true });
+  fs.mkdirSync(planDir(dataDir, vault, app), { recursive: true });
+
+  let intakeContent: string | undefined;
+  if (runInterview) {
+    const intakeFilePath = cacheAbsolutePath(dataDir, vault, app, INTAKE_DOC_ID);
+    fs.mkdirSync(path.dirname(intakeFilePath), { recursive: true });
+
+    console.log("");
+    console.log(
+      "Phase 1 — Interview. Answer each question and press Enter on a blank line to submit.",
+    );
+    console.log("Press Ctrl-D to wrap up early. Use --skip-interview to bypass next time.");
+
+    const io =
+      deps.intakeIO ??
+      makeStdioIntakeIO({ stdin: process.stdin, stdout: process.stdout });
+
+    try {
+      const intakeResult = await runIntakeAgent({
+        app,
+        repoRoot: repoRoot.path,
+        io,
+        intakeFilePath,
+        ...(deps.intakeTransport !== undefined && {
+          transport: deps.intakeTransport,
+        }),
+      });
+      intakeContent = intakeResult.content;
+      console.log(
+        `\n  Intake captured: ${intakeResult.sections.length} section(s), ${intakeResult.totalRounds} turn(s).`,
+      );
+    } catch (err) {
+      if (err instanceof IntakeError) {
+        console.error(`onboard: intake failed: ${err.message}`);
+        return 1;
+      }
+      throw err;
+    }
+  } else {
+    const reason = skipFlag ? "--skip-interview set" : "no TTY detected";
+    console.log(`  Skipping intake interview (${reason}).`);
+  }
+
+  // ---------------------------------------------------------------------
+  // Phase 2 — Brain extraction. Strategist sees the user-provided absorbed
+  // docs PLUS the intake markdown (if captured). The cached intake doc is
+  // listed as a cached doc reference so Strategist knows it exists, and
+  // also passed inline as an absorbed doc so its contents land in scope.
+  // ---------------------------------------------------------------------
+  const phase2AbsorbedDocs: AbsorbedDoc[] = [...absorbedDocs];
+  const phase2CachedSummaries: CachedDocSummary[] = cachedDocs.map((c) => c.summary);
+  if (intakeContent !== undefined) {
+    const intakeSource = cacheAbsolutePath(dataDir, vault, app, INTAKE_DOC_ID);
+    phase2AbsorbedDocs.push({
+      source: intakeSource,
+      content: intakeContent,
+    });
+    phase2CachedSummaries.push({
+      id: INTAKE_DOC_ID,
+      source: intakeSource,
+      summary: "Onboarding interview transcript captured at intake time.",
+    });
+  }
+
   let agentResult;
   try {
     agentResult = await runOnboardAgent({
       app,
       repoRoot: repoRoot.path,
-      absorbedDocs,
-      cachedDocs: cachedDocs.map((c) => c.summary),
+      absorbedDocs: phase2AbsorbedDocs,
+      cachedDocs: phase2CachedSummaries,
       ...(deps.transport !== undefined && { transport: deps.transport }),
     });
   } catch (err) {
@@ -185,14 +282,23 @@ export async function runOnboard(
     throw err;
   }
 
-  // Write brain.json + scaffolding
-  const brainFolder = brainDir(dataDir, vault, app);
-  fs.mkdirSync(path.join(brainFolder, "docs"), { recursive: true });
-  fs.mkdirSync(path.join(brainFolder, "research"), { recursive: true });
-  fs.mkdirSync(planDir(dataDir, vault, app), { recursive: true });
-
   const addedAt = new Date().toISOString();
   const docsIndex: DocEntry[] = [];
+
+  // Register the intake doc in docs.json as a cached doc.
+  if (intakeContent !== undefined) {
+    docsIndex.push({
+      id: INTAKE_DOC_ID,
+      kind: "file",
+      retention: "cached",
+      source: cacheAbsolutePath(dataDir, vault, app, INTAKE_DOC_ID),
+      title: "Onboarding intake",
+      tags: ["intake"],
+      addedAt,
+      summary: "Onboarding interview transcript captured at intake time.",
+      cachedFile: cacheRelativePath(INTAKE_DOC_ID),
+    });
+  }
 
   // Cache the kept docs to brains/<app>/docs/<id>/
   for (const c of cachedDocs) {
@@ -256,6 +362,7 @@ export async function runOnboard(
         }),
         absorbedDocsCount: absorbedDocs.length,
         cachedDocsCount: cachedDocs.length,
+        intakeCaptured: intakeContent !== undefined,
         numTurns: agentResult.numTurns,
       },
     });
@@ -296,6 +403,11 @@ export async function runOnboard(
   console.log(`  Brain: ${targetBrain}`);
   console.log(`  Plans dir: ${planDir(dataDir, vault, app)}`);
   console.log(`  Turns: ${agentResult.numTurns}`);
+  if (intakeContent !== undefined) {
+    console.log(
+      `  Intake: ${cacheAbsolutePath(dataDir, vault, app, INTAKE_DOC_ID)}`,
+    );
+  }
   if (moveDocs) {
     if (moveResults.moved.length > 0) {
       console.log(`  Moved ${moveResults.moved.length} source doc(s) into jarvis-data:`);
@@ -352,3 +464,6 @@ function resolveRepoRoot(
   return { ok: true, path: resolved };
 }
 
+function defaultHasTty(): boolean {
+  return process.stdin.isTTY === true;
+}

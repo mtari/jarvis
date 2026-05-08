@@ -15,6 +15,8 @@ import {
   type ConsoleSilencer,
   type InstallSandbox,
 } from "./_test-helpers.ts";
+import type { IntakeIO } from "../../agents/intake.ts";
+import { cacheAbsolutePath } from "../../orchestrator/docs.ts";
 import { runOnboard } from "./onboard.ts";
 
 function fixedRunResult(text: string): RunAgentResult {
@@ -349,6 +351,109 @@ describe("runOnboard", () => {
     );
     expect(code).toBe(0);
     expect(fs.existsSync(localPath)).toBe(true);
+  });
+
+  it("auto-skips the intake interview when stdin is not a TTY (default)", async () => {
+    // No `hasTty` override → defaultHasTty() returns false in vitest
+    let captured = "";
+    const code = await runOnboard(
+      ["--app", "demoapp", "--repo", repoRoot],
+      {
+        transport: async (resolved) => {
+          captured = resolved.prompt;
+          return fixedRunResult(BRAIN_FOR("demoapp"));
+        },
+      },
+    );
+    expect(code).toBe(0);
+    expect(captured).not.toContain("Intake captured");
+    // No intake doc registered.
+    const docsJson = JSON.parse(
+      fs.readFileSync(brainDocsFile(sandbox.dataDir, "personal", "demoapp"), "utf8"),
+    ) as Array<Record<string, unknown>>;
+    expect(docsJson.find((d) => d["id"] === "intake")).toBeUndefined();
+  });
+
+  it("--skip-interview bypasses intake even when a TTY is present", async () => {
+    let intakeCalls = 0;
+    const code = await runOnboard(
+      ["--app", "demoapp", "--repo", repoRoot, "--skip-interview"],
+      {
+        transport: fixedTransport(BRAIN_FOR("demoapp")),
+        intakeTransport: async () => {
+          intakeCalls += 1;
+          return fixedRunResult("");
+        },
+        hasTty: () => true,
+      },
+    );
+    expect(code).toBe(0);
+    expect(intakeCalls).toBe(0);
+  });
+
+  it("runs the intake interview when a TTY is present, persists intake.md, registers it as a cached doc, and feeds it into the brain extraction", async () => {
+    // Scripted IO + transport for the intake agent
+    const answers = ["For potential investors.", "Saw a parking gap."];
+    let answerIdx = 0;
+    const intakeIO: IntakeIO = {
+      readUserAnswer: async () => answers[answerIdx++] ?? null,
+      writeOutput: () => {},
+    };
+    const intakeResponses = [
+      `<ask sectionId="audience-and-context">Who is this for?</ask>`,
+      `<save sectionId="audience-and-context" status="answered">For potential investors.</save>
+<ask sectionId="origin-story">Why did you start it?</ask>`,
+      `<save sectionId="origin-story" status="answered">Saw a parking gap.</save>
+<done>2 sections captured.</done>`,
+    ];
+    let intakeIdx = 0;
+    let phase2Prompt = "";
+
+    const code = await runOnboard(
+      ["--app", "demoapp", "--repo", repoRoot],
+      {
+        transport: async (resolved) => {
+          phase2Prompt = resolved.prompt;
+          return fixedRunResult(BRAIN_FOR("demoapp"));
+        },
+        intakeTransport: async () => {
+          if (intakeIdx >= intakeResponses.length) {
+            throw new Error("intake out of responses");
+          }
+          return fixedRunResult(intakeResponses[intakeIdx++]!);
+        },
+        intakeIO,
+        hasTty: () => true,
+      },
+    );
+    expect(code).toBe(0);
+
+    // Intake file persisted
+    const intakeFile = cacheAbsolutePath(
+      sandbox.dataDir,
+      "personal",
+      "demoapp",
+      "intake",
+    );
+    expect(fs.existsSync(intakeFile)).toBe(true);
+    const intakeText = fs.readFileSync(intakeFile, "utf8");
+    expect(intakeText).toContain("# Intake — demoapp");
+    expect(intakeText).toContain("For potential investors.");
+    expect(intakeText).toContain("Saw a parking gap.");
+
+    // Brain extraction got the intake doc inline
+    expect(phase2Prompt).toContain("ABSORBED DOCS");
+    expect(phase2Prompt).toContain("Saw a parking gap.");
+
+    // docs.json has the intake entry
+    const docsJson = JSON.parse(
+      fs.readFileSync(brainDocsFile(sandbox.dataDir, "personal", "demoapp"), "utf8"),
+    ) as Array<Record<string, unknown>>;
+    const intakeEntry = docsJson.find((d) => d["id"] === "intake");
+    expect(intakeEntry).toBeDefined();
+    expect(intakeEntry?.["retention"]).toBe("cached");
+    expect(intakeEntry?.["tags"]).toEqual(["intake"]);
+    expect(intakeEntry?.["cachedFile"]).toBe("docs/intake/content.txt");
   });
 
   it("preserves the source file when the onboard agent fails", async () => {
