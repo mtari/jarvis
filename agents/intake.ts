@@ -21,14 +21,36 @@ export interface IntakeSection {
   body: string;
 }
 
+export interface IntakeProgress {
+  /** Round number, 1-based — i.e. how many turns have been issued so far. */
+  round: number;
+  answered: number;
+  partial: number;
+  skipped: number;
+}
+
+export interface IntakeQuestion {
+  sectionId: string;
+  text: string;
+  /** True when this is a `<followup>`, false when it's a fresh `<ask>`. */
+  isFollowup: boolean;
+  progress: IntakeProgress;
+}
+
+export type UserAnswer =
+  | { kind: "answer"; text: string }
+  | { kind: "skip" }
+  | { kind: "end" };
+
 export interface IntakeIO {
   /**
    * Display the agent's question to the user, then read the user's answer.
-   * Resolve to `null` when the user signals "end the interview" (Ctrl-D / EOF).
-   * Resolve to an empty string only when the user actually typed nothing but
-   * pressed enter — the agent will treat that as a non-answer.
+   * Returns:
+   *   - `{ kind: "answer", text }` for a normal answer
+   *   - `{ kind: "skip" }` when the user asks to skip the current section
+   *   - `{ kind: "end" }` on Ctrl-D / EOF, or when the user asks to wrap up
    */
-  readUserAnswer: (question: { sectionId: string; text: string }) => Promise<string | null>;
+  readUserAnswer: (question: IntakeQuestion) => Promise<UserAnswer>;
   /** Free-form output (status messages, the agent's `<done>` summary). */
   writeOutput: (text: string) => void;
 }
@@ -55,7 +77,9 @@ export interface IntakeAgentResult {
   doneSummary?: string;
 }
 
-const DEFAULT_MAX_ROUNDS = 50;
+// Effectively no cap — the user controls termination via /end or Ctrl-D.
+// Kept as a runaway-loop guard, not a budget.
+const DEFAULT_MAX_ROUNDS = 500;
 
 const PROMPT_PATH = "prompts/strategist-intake.md";
 
@@ -124,12 +148,16 @@ interface IntakeState {
   lastUserMessage: string;
   audience?: string;
   userSignaledEnd: boolean;
+  /** Status per saved sectionId — used when rendering the PRIOR ANSWERS
+   * block so each section is shown with its current status. */
+  savedStatuses: Map<string, SectionStatus>;
 }
 
 function buildUserPrompt(
   state: IntakeState,
   input: { app: string; repoRoot: string },
   isFirstTurn: boolean,
+  collected: ReadonlyArray<IntakeSection>,
 ): string {
   const lines: string[] = [];
   lines.push(`Project app id: ${input.app}`);
@@ -141,15 +169,38 @@ function buildUserPrompt(
   lines.push(`- partial: [${state.partial.join(", ")}]`);
   lines.push(`- skipped: [${state.skipped.join(", ")}]`);
   lines.push(`- last asked: ${state.lastAsked ?? "none"}`);
+
   if (state.userSignaledEnd) {
     lines.push(
       `- user signaled end: true (save what's collected, mark remaining required as partial with "Gap: not collected", emit <done>)`,
     );
   }
+
+  if (collected.length > 0) {
+    lines.push("");
+    lines.push(
+      "PRIOR ANSWERS — full bodies of every section already saved. Build on these.",
+    );
+    lines.push(
+      "If a later answer changes the picture for an earlier section (e.g. user reveals a different segment, contradicts a prior fact, refines a number), emit a fresh <save> for that earlier section in the same turn — multiple <save> blocks per turn are allowed. Don't re-ask sections you've already heard.",
+    );
+    lines.push("");
+    for (const section of collected) {
+      const tag =
+        section.status === "answered"
+          ? ""
+          : ` (${section.status})`;
+      lines.push(`### ${section.id}${tag}`);
+      lines.push(section.body.trim());
+      lines.push("");
+    }
+  }
+
+  lines.push("");
   if (isFirstTurn) {
-    lines.push(`- last user message: (none — this is the first turn)`);
+    lines.push(`LAST USER MESSAGE: (none — this is the first turn)`);
   } else {
-    lines.push(`- last user message: ${quoteMultiline(state.lastUserMessage)}`);
+    lines.push(`LAST USER MESSAGE: ${quoteMultiline(state.lastUserMessage)}`);
   }
   return lines.join("\n");
 }
@@ -184,6 +235,8 @@ function applyTurn(
     if (save.status === "answered") state.answered.push(save.sectionId);
     else if (save.status === "partial") state.partial.push(save.sectionId);
     else state.skipped.push(save.sectionId);
+
+    state.savedStatuses.set(save.sectionId, save.status);
 
     if (
       save.sectionId === "audience-and-context" &&
@@ -277,6 +330,7 @@ export async function runIntakeAgent(
     skipped: [],
     lastUserMessage: "",
     userSignaledEnd: false,
+    savedStatuses: new Map(),
   };
   const sections: IntakeSection[] = [];
   let round = 0;
@@ -285,17 +339,15 @@ export async function runIntakeAgent(
 
   while (round < maxRounds) {
     round += 1;
-    const userPrompt = buildUserPrompt(state, input, round === 1);
+    const userPrompt = buildUserPrompt(state, input, round === 1, sections);
     const result = await runAgent({
       systemPrompt,
       userPrompt,
       cwd: input.repoRoot,
-      // Per-round budget. The SDK counts each Read/Glob/Grep tool call as a
-      // turn; the agent typically skims 1–3 repo files on round 1 before
-      // emitting <ask>, then mostly text-only on subsequent rounds. 20 leaves
-      // headroom for tool-heavy rounds without letting a wandering agent
-      // burn an unbounded budget.
-      maxTurns: 20,
+      // Per-round budget. The SDK counts each Read/Glob/Grep tool call as
+      // a turn. Generous so a tool-heavy round 1 (skimming repo files)
+      // doesn't trip the cap; text-only rounds use ~1 turn anyway.
+      maxTurns: 60,
       toolPreset: { kind: "readonly" },
       ...(input.model !== undefined && { model: input.model }),
       ...(input.transport !== undefined && { transport: input.transport }),
@@ -323,7 +375,9 @@ export async function runIntakeAgent(
       break;
     }
 
-    const next = parsed.ask ?? parsed.followup;
+    const askBlock = parsed.ask;
+    const followupBlock = parsed.followup;
+    const next = askBlock ?? followupBlock;
     if (next === undefined) {
       throw new IntakeError(
         `Round ${round}: agent emitted no <ask>, <followup>, or <done>. First 200 chars: ${result.text.slice(0, 200)}`,
@@ -333,18 +387,27 @@ export async function runIntakeAgent(
     const answer = await input.io.readUserAnswer({
       sectionId: next.sectionId,
       text: next.text,
+      isFollowup: askBlock === undefined && followupBlock !== undefined,
+      progress: {
+        round,
+        answered: state.answered.length,
+        partial: state.partial.length,
+        skipped: state.skipped.length,
+      },
     });
 
-    if (answer === null) {
-      // User signaled end. Tell the agent on the next turn so it wraps up.
+    state.lastAsked = next.sectionId;
+    if (answer.kind === "end") {
       state.userSignaledEnd = true;
-      state.lastAsked = next.sectionId;
       state.lastUserMessage = "";
       continue;
     }
-
-    state.lastAsked = next.sectionId;
-    state.lastUserMessage = answer;
+    if (answer.kind === "skip") {
+      state.lastUserMessage =
+        "(user asked to skip this section — save it as `skipped` with a one-line reason if you have one, otherwise reason: \"user skipped\")";
+      continue;
+    }
+    state.lastUserMessage = answer.text;
   }
 
   const content = writeIntake(
@@ -365,8 +428,13 @@ export async function runIntakeAgent(
 
 /**
  * Default IO: writes question text to stdout, reads multi-line answers from
- * stdin via `readline`. A blank line submits the answer; EOF (Ctrl-D)
- * resolves to `null` so the agent can wrap up early.
+ * stdin via `readline`.
+ *
+ * Submission rules — the user can:
+ *   - type a single line and press Enter twice (one blank line submits)
+ *   - type multiple lines, then press Enter on a blank line to submit
+ *   - type `/skip` on a line by itself to skip the current section
+ *   - type `/end` on a line by itself, or hit Ctrl-D, to end the interview
  */
 export function makeStdioIntakeIO(opts: {
   stdin?: NodeJS.ReadableStream;
@@ -377,32 +445,49 @@ export function makeStdioIntakeIO(opts: {
 
   return {
     readUserAnswer: async (q) => {
-      stdout.write(`\n[${q.sectionId}]\n${q.text.trim()}\n\n`);
-      stdout.write("(answer below; submit a blank line; Ctrl-D ends the interview)\n> ");
+      const banner = renderQuestionBanner(q);
+      stdout.write(banner);
       const readline = await import("node:readline");
       const rl = readline.createInterface({
         input: stdin as NodeJS.ReadableStream,
         output: stdout as NodeJS.WritableStream,
         terminal: false,
       });
-      return new Promise<string | null>((resolve) => {
+      return new Promise<UserAnswer>((resolve) => {
         const lines: string[] = [];
         let resolved = false;
-        const finish = (val: string | null): void => {
+        const finish = (val: UserAnswer): void => {
           if (resolved) return;
           resolved = true;
           rl.close();
           resolve(val);
         };
         rl.on("line", (line) => {
-          if (line.trim() === "" && lines.length > 0) {
-            finish(lines.join("\n").trim());
+          const trimmed = line.trim();
+          if (trimmed === "/skip" && lines.length === 0) {
+            finish({ kind: "skip" });
             return;
           }
-          if (line.trim() !== "") lines.push(line);
+          if (trimmed === "/end" && lines.length === 0) {
+            finish({ kind: "end" });
+            return;
+          }
+          if (trimmed === "" && lines.length > 0) {
+            finish({ kind: "answer", text: lines.join("\n").trim() });
+            return;
+          }
+          if (trimmed !== "") {
+            lines.push(line);
+            // Continuation prompt for multi-line answers
+            stdout.write("  ");
+          }
         });
         rl.on("close", () => {
-          finish(lines.length > 0 ? lines.join("\n").trim() : null);
+          if (lines.length > 0) {
+            finish({ kind: "answer", text: lines.join("\n").trim() });
+          } else {
+            finish({ kind: "end" });
+          }
         });
       });
     },
@@ -410,4 +495,25 @@ export function makeStdioIntakeIO(opts: {
       stdout.write(text);
     },
   };
+}
+
+const HRULE = "─".repeat(72);
+
+function renderQuestionBanner(q: IntakeQuestion): string {
+  const lines: string[] = [];
+  lines.push("");
+  lines.push(HRULE);
+  const tag = q.isFollowup ? "follow-up" : "question";
+  const progress = `answered ${q.progress.answered} · partial ${q.progress.partial} · skipped ${q.progress.skipped}`;
+  lines.push(`[${tag} ${q.progress.round}] ${q.sectionId}    (${progress})`);
+  lines.push("");
+  lines.push(q.text.trim());
+  lines.push("");
+  lines.push(
+    "Type your answer. Submit with a blank line. " +
+      "/skip = skip this section · /end (or Ctrl-D) = finish the interview.",
+  );
+  lines.push("");
+  lines.push("> ");
+  return lines.join("\n");
 }

@@ -396,7 +396,12 @@ describe("runOnboard", () => {
     const answers = ["For potential investors.", "Saw a parking gap."];
     let answerIdx = 0;
     const intakeIO: IntakeIO = {
-      readUserAnswer: async () => answers[answerIdx++] ?? null,
+      readUserAnswer: async () => {
+        const a = answers[answerIdx++];
+        return a !== undefined
+          ? { kind: "answer", text: a }
+          : { kind: "end" };
+      },
       writeOutput: () => {},
     };
     const intakeResponses = [

@@ -209,10 +209,11 @@ export async function runOnboard(
     fs.mkdirSync(path.dirname(intakeFilePath), { recursive: true });
 
     console.log("");
-    console.log(
-      "Phase 1 — Interview. Answer each question and press Enter on a blank line to submit.",
-    );
-    console.log("Press Ctrl-D to wrap up early. Use --skip-interview to bypass next time.");
+    console.log("Phase 1 — Interview");
+    console.log("  Type your answer; submit with a blank line.");
+    console.log("  /skip  — skip the current section");
+    console.log("  /end   — finish the interview now (or press Ctrl-D)");
+    console.log("  --skip-interview bypasses Phase 1 entirely next time.");
 
     const io =
       deps.intakeIO ??
