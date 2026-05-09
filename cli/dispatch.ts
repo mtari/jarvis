@@ -7,6 +7,7 @@ import { runDiscussCommand } from "./commands/discuss.ts";
 import { runDocs } from "./commands/docs.ts";
 import { runDoctor } from "./commands/doctor.ts";
 import { runFridayAuditCommand } from "./commands/friday-audit.ts";
+import { runIdeas } from "./commands/ideas.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
 import { runLearn } from "./commands/learn.ts";
@@ -108,6 +109,11 @@ Utilities:
                               pending rows, publish through registered channel
                               adapters, update statuses. The daemon does this
                               automatically every ~60s when running.
+  ideas add [--vault <v>]     Conversational interview that captures one new
+                              idea, then appends a structured section to
+                              Business_Ideas.md. Pulls out the signal Scout
+                              uses to score (strategic fit, effort, impact,
+                              dependencies) so scoring isn't guesswork.
   scout score [--vault <v>]   Score unscored ideas in Business_Ideas.md. Writes
                               score, scoredAt, rationale back to the file and
                               records an idea-scored event per idea.
@@ -232,6 +238,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runScan(rest);
     case "signals":
       return runSignals(rest);
+    case "ideas":
+      return runIdeas(rest);
     case "scout":
       return runScout(rest);
     case "learn":

@@ -57,6 +57,11 @@ import {
   startDiscussConversation,
   type SlackDiscussContext,
 } from "./discuss.ts";
+import {
+  continueIdeaIntakeConversation,
+  findIdeaIntakeConversation,
+  startIdeaIntakeConversation,
+} from "./idea-intake.ts";
 
 export interface HandlerContext {
   dataDir: string;
@@ -557,51 +562,94 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
     if (!m.thread_ts || m.thread_ts === m.ts) return; // not a thread reply
     if (!m.channel || !m.user || !m.text) return;
 
-    // Quick check: is this thread one of ours? findDiscussConversation
-    // returns null for unowned threads — much cheaper than the full
-    // continueDiscussConversation path.
-    const lookup = findDiscussConversation(
+    // Route the reply to whichever thread-owning system claims it.
+    // Discuss and idea-intake both use Slack threads; we look up by
+    // (channel, thread_ts) in each store and dispatch on the match.
+    const discussLookup = findDiscussConversation(
       ctx.dataDir,
       m.channel,
       m.thread_ts,
     );
-    if (!lookup) return; // not our thread
-
-    try {
-      const result = await continueDiscussConversation({
-        ctx: {
-          dataDir: ctx.dataDir,
-          client,
-          anthropic: ctx.getAnthropicClient(),
-        },
-        channel: m.channel,
-        threadTs: m.thread_ts,
-        userText: m.text,
-        userId: m.user,
-      });
-      ctx.log("discuss thread continued via slack", {
-        channel: m.channel,
-        threadTs: m.thread_ts,
-        status: result.status,
-        ...(result.outcome !== undefined && { outcome: result.outcome }),
-      });
-    } catch (err) {
-      ctx.logError("discuss thread reply failed", err, {
-        channel: m.channel,
-        threadTs: m.thread_ts,
-      });
+    if (discussLookup) {
       try {
-        await client.chat.postMessage({
+        const result = await continueDiscussConversation({
+          ctx: {
+            dataDir: ctx.dataDir,
+            client,
+            anthropic: ctx.getAnthropicClient(),
+          },
           channel: m.channel,
-          thread_ts: m.thread_ts,
-          text: `✗ Discuss errored: ${
-            err instanceof Error ? err.message : String(err)
-          }. Reply again to retry.`,
+          threadTs: m.thread_ts,
+          userText: m.text,
+          userId: m.user,
         });
-      } catch {
-        // best-effort
+        ctx.log("discuss thread continued via slack", {
+          channel: m.channel,
+          threadTs: m.thread_ts,
+          status: result.status,
+          ...(result.outcome !== undefined && { outcome: result.outcome }),
+        });
+      } catch (err) {
+        ctx.logError("discuss thread reply failed", err, {
+          channel: m.channel,
+          threadTs: m.thread_ts,
+        });
+        try {
+          await client.chat.postMessage({
+            channel: m.channel,
+            thread_ts: m.thread_ts,
+            text: `✗ Discuss errored: ${
+              err instanceof Error ? err.message : String(err)
+            }. Reply again to retry.`,
+          });
+        } catch {
+          // best-effort
+        }
       }
+      return;
     }
+
+    const ideaLookup = findIdeaIntakeConversation(
+      ctx.dataDir,
+      m.channel,
+      m.thread_ts,
+    );
+    if (ideaLookup) {
+      try {
+        const result = await continueIdeaIntakeConversation({
+          ctx: { dataDir: ctx.dataDir, client },
+          channel: m.channel,
+          threadTs: m.thread_ts,
+          userText: m.text,
+          userId: m.user,
+        });
+        ctx.log("idea-intake thread continued via slack", {
+          channel: m.channel,
+          threadTs: m.thread_ts,
+          status: result.status,
+          ...(result.ideaId !== undefined && { ideaId: result.ideaId }),
+        });
+      } catch (err) {
+        ctx.logError("idea-intake thread reply failed", err, {
+          channel: m.channel,
+          threadTs: m.thread_ts,
+        });
+        try {
+          await client.chat.postMessage({
+            channel: m.channel,
+            thread_ts: m.thread_ts,
+            text: `✗ Idea intake errored: ${
+              err instanceof Error ? err.message : String(err)
+            }. Reply again to retry.`,
+          });
+        } catch {
+          // best-effort
+        }
+      }
+      return;
+    }
+
+    // Neither system owns this thread — ignore.
   });
 
   app.command("/jarvis", async ({ ack, command, respond, client }) => {
@@ -638,6 +686,17 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
         });
         return;
       }
+      case "ideas": {
+        const sub = parts[1];
+        if (sub === "add") {
+          return runSlashIdeasAdd(parts.slice(2), ctx, respond, command, client);
+        }
+        await respond({
+          response_type: "ephemeral",
+          text: "Usage: `/jarvis ideas add [--vault <v>]`",
+        });
+        return;
+      }
       case "notes":
         return runSlashNotes(parts.slice(1), ctx, respond, command);
       case "ask":
@@ -647,7 +706,7 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       default:
         await respond({
           response_type: "ephemeral",
-          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`notes\`, \`ask\`, \`discuss\`.`,
+          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`notes\`, \`ask\`, \`discuss\`.`,
         });
     }
   });
@@ -808,6 +867,7 @@ const SLASH_USAGE = [
   "• `/jarvis triage` — post the on-demand triage report to this channel",
   "• `/jarvis scout score [--vault <v>]` — score unscored ideas in `Business_Ideas.md`",
   "• `/jarvis scout draft [--threshold N] [--vault <v>]` — auto-draft plans from high-scoring ideas",
+  "• `/jarvis ideas add [--vault <v>]` — capture a new idea via thread interview, append to `Business_Ideas.md`",
   "• `/jarvis notes <app> <text>` — append a free-text note read by Strategist / Scout / Developer",
   "• `/jarvis ask <text>` — natural-language router into the right Jarvis command",
   "• `/jarvis discuss <app> <topic>` — open a multi-turn co-owner conversation in a thread",
@@ -1068,6 +1128,58 @@ async function runSlashAsk(
     await respond({
       response_type: "ephemeral",
       text: `✗ Ask failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    });
+  }
+}
+
+async function runSlashIdeasAdd(
+  args: string[],
+  ctx: HandlerContext,
+  respond: SlashRespond,
+  command: { user_id?: string; channel_id?: string },
+  client: BoltApp["client"],
+): Promise<void> {
+  // Light flag parsing — only --vault for now.
+  let vault = "personal";
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === "--vault" && args[i + 1]) {
+      vault = args[i + 1]!;
+      i += 1;
+    }
+  }
+  const channel = command.channel_id;
+  if (!channel) {
+    await respond({
+      response_type: "ephemeral",
+      text: "Couldn't determine the channel for this thread. Try invoking from a channel rather than a DM.",
+    });
+    return;
+  }
+  const userId = command.user_id ?? "<slack>";
+  await respond({
+    response_type: "ephemeral",
+    text: ":bulb: Opening idea-intake thread… reply in the thread to answer.",
+  });
+  try {
+    const result = await startIdeaIntakeConversation({
+      ctx: { dataDir: ctx.dataDir, client },
+      channel,
+      vault,
+      invokedBy: userId,
+    });
+    ctx.log("idea-intake thread opened via slack", {
+      userId,
+      vault,
+      conversationId: result.conversationId,
+      threadTs: result.threadTs,
+    });
+  } catch (err) {
+    ctx.logError("/jarvis ideas add failed", err, { userId, vault });
+    await respond({
+      response_type: "ephemeral",
+      text: `✗ Idea intake failed: ${
         err instanceof Error ? err.message : String(err)
       }`,
     });
