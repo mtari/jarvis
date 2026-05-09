@@ -114,6 +114,10 @@ Utilities:
                               Business_Ideas.md. Pulls out the signal Scout
                               uses to score (strategic fit, effort, impact,
                               dependencies) so scoring isn't guesswork.
+  ideas list [--format table|json]
+                              List every idea with its score, sorted high
+                              score first (unscored last). Marks ideas that
+                              already have an auto-drafted plan.
   scout score [--vault <v>]   Score unscored ideas in Business_Ideas.md. Writes
                               score, scoredAt, rationale back to the file and
                               records an idea-scored event per idea.

@@ -68,6 +68,78 @@ describe("runIdeas", () => {
     expect(await runIdeas(["unknown"])).toBe(1);
   });
 
+  it("ideas list prints scored ideas first, then unscored — table format", async () => {
+    fs.writeFileSync(
+      `${sandbox.dataDir}/Business_Ideas.md`,
+      `## Low score
+App: a
+Brief: low
+Score: 30
+
+## High score
+App: a
+Brief: high
+Score: 90
+
+## Unscored
+App: a
+Brief: ?
+
+`,
+    );
+    const lines: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]): void => {
+      lines.push(args.map((a) => String(a)).join(" "));
+    };
+    try {
+      const code = await runIdeas(["list"]);
+      expect(code).toBe(0);
+    } finally {
+      console.log = origLog;
+    }
+    const text = lines.join("\n");
+    const highIdx = text.indexOf("High score");
+    const lowIdx = text.indexOf("Low score");
+    const unscoredIdx = text.indexOf("Unscored");
+    expect(highIdx).toBeGreaterThan(-1);
+    expect(highIdx).toBeLessThan(lowIdx);
+    expect(lowIdx).toBeLessThan(unscoredIdx);
+    expect(text).toContain("3 idea(s)");
+  });
+
+  it("ideas list --format json emits structured records", async () => {
+    fs.writeFileSync(
+      `${sandbox.dataDir}/Business_Ideas.md`,
+      `## A
+App: x
+Brief: y
+Score: 70
+
+`,
+    );
+    const lines: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]): void => {
+      lines.push(args.map((a) => String(a)).join(" "));
+    };
+    try {
+      const code = await runIdeas(["list", "--format", "json"]);
+      expect(code).toBe(0);
+    } finally {
+      console.log = origLog;
+    }
+    const parsed = JSON.parse(lines.join("\n")) as Array<Record<string, unknown>>;
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]?.["title"]).toBe("A");
+    expect(parsed[0]?.["score"]).toBe(70);
+    expect(parsed[0]?.["drafted"]).toBe(false);
+  });
+
+  it("ideas list --format invalid returns exit 1", async () => {
+    expect(await runIdeas(["list", "--format", "csv"])).toBe(1);
+  });
+
   it("appends a new idea to Business_Ideas.md and records an idea-added event", async () => {
     const transport: RunAgentTransport = (() => {
       const responses = [

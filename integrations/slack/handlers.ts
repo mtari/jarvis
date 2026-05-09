@@ -62,6 +62,10 @@ import {
   findIdeaIntakeConversation,
   startIdeaIntakeConversation,
 } from "./idea-intake.ts";
+import {
+  formatIdeaListing,
+  listIdeasWithStatus,
+} from "../../orchestrator/idea-listing.ts";
 
 export interface HandlerContext {
   dataDir: string;
@@ -691,9 +695,12 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
         if (sub === "add") {
           return runSlashIdeasAdd(parts.slice(2), ctx, respond, command, client);
         }
+        if (sub === "list") {
+          return runSlashIdeasList(parts.slice(2), ctx, respond);
+        }
         await respond({
           response_type: "ephemeral",
-          text: "Usage: `/jarvis ideas add [--vault <v>]`",
+          text: "Usage: `/jarvis ideas add|list [--vault <v>]`",
         });
         return;
       }
@@ -706,7 +713,7 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       default:
         await respond({
           response_type: "ephemeral",
-          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`notes\`, \`ask\`, \`discuss\`.`,
+          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`ideas list\`, \`notes\`, \`ask\`, \`discuss\`.`,
         });
     }
   });
@@ -868,6 +875,7 @@ const SLASH_USAGE = [
   "• `/jarvis scout score [--vault <v>]` — score unscored ideas in `Business_Ideas.md`",
   "• `/jarvis scout draft [--threshold N] [--vault <v>]` — auto-draft plans from high-scoring ideas",
   "• `/jarvis ideas add [--vault <v>]` — capture a new idea via thread interview, append to `Business_Ideas.md`",
+  "• `/jarvis ideas list [--vault <v>]` — show every idea with its score (high → low, then unscored)",
   "• `/jarvis notes <app> <text>` — append a free-text note read by Strategist / Scout / Developer",
   "• `/jarvis ask <text>` — natural-language router into the right Jarvis command",
   "• `/jarvis discuss <app> <topic>` — open a multi-turn co-owner conversation in a thread",
@@ -1132,6 +1140,27 @@ async function runSlashAsk(
       }`,
     });
   }
+}
+
+async function runSlashIdeasList(
+  args: string[],
+  ctx: HandlerContext,
+  respond: SlashRespond,
+): Promise<void> {
+  // Light flag parsing — only --vault for now (currently unused, but accepted
+  // so the command shape matches `ideas add` and the future multi-vault model).
+  void args;
+  const rows = listIdeasWithStatus(ctx.dataDir);
+  const body = formatIdeaListing(rows, "slack");
+  const header = `:bulb: *Ideas* (${rows.length})`;
+  const footer =
+    rows.length === 0
+      ? ""
+      : "\n\n_Run `/jarvis scout score` to score unscored, `/jarvis scout draft` to auto-draft high scorers._";
+  await respond({
+    response_type: "ephemeral",
+    text: `${header}\n\n${body}${footer}`,
+  });
 }
 
 async function runSlashIdeasAdd(

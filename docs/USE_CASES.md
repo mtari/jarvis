@@ -19,7 +19,11 @@ Format: **User wants to X.** Constraint or context.
 8. **User wants to onboard a project. Onboarded project is a normal repo, so it only contains one single project.** `yarn jarvis onboard --app <name> --repo <path-or-url>` — Strategist inspects the repo root, drafts a brain, user reviews and commits.
 9. **User wants to onboard a project. Onboarded project is in a monorepo, so it contains multiple projects.** `yarn jarvis onboard --app <name> --monorepo-path apps/<name>` — Strategist detects the target app's subpath from workspace config and scopes inspection to that directory only; other sibling projects are ignored for this brain.
 10. **User wants to onboard an existing app with live traffic.** Umami script tag added during Phase 1; 2–4 weeks of baseline accrues before Phase 2 signals go live.
+10a. **User wants Jarvis to interview them about the project before drafting the brain.** Phase 1 of `yarn jarvis onboard` — interactive 50+ section conversation (origin story, traction, business model, risks, vision). Captured to `docs/intake/content.txt` and registered as a cached doc. Phase 2 brain extraction reads it back. Type `/skip` per question, `/end` to wrap up early.
+10b. **User wants to skip the intake interview.** `yarn jarvis onboard --app <name> --repo <path> --skip-interview` — Phase 2 runs without an intake. Auto-skipped when stdin isn't a TTY (CI, daemon, tests).
 11. **User wants to evaluate an idea from Business_Ideas.md.** Scout scores it against market + preferences; surfaces in next weekly triage.
+11a. **User wants to add a new idea conversationally.** `yarn jarvis ideas add` (or Slack `/jarvis ideas add` — opens a thread; replies become answers). Walks 5–6 cluster questions covering audience, why-now, expected outcome, effort, risks. Appends a structured section to `Business_Ideas.md` so Scout can score it without guessing.
+11b. **User wants to see all ideas with scores at a glance.** `yarn jarvis ideas list` (or `/jarvis ideas list`). Sorted high → low; unscored last. Marks ideas that already have an auto-drafted plan.
 12. **User wants Scout to generate new ideas.** Scout scans market signals + user's stated domains; adds scored candidates to `jarvis-data/ideas/`.
 
 ## Plan creation

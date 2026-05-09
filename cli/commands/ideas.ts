@@ -14,6 +14,10 @@ import {
   type BusinessIdea,
 } from "../../orchestrator/business-ideas.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
+import {
+  formatIdeaListing,
+  listIdeasWithStatus,
+} from "../../orchestrator/idea-listing.ts";
 import { businessIdeasFile, dbFile, getDataDir } from "../paths.ts";
 
 /**
@@ -40,13 +44,14 @@ export async function runIdeas(
 ): Promise<number> {
   const [subcommand, ...rest] = rawArgs;
   if (subcommand === "add") return runIdeasAdd(rest, deps);
+  if (subcommand === "list") return runIdeasList(rest);
   if (subcommand === undefined) {
     console.error(
-      "ideas: missing subcommand. Usage: yarn jarvis ideas add [--vault <name>]",
+      "ideas: missing subcommand. Usage: yarn jarvis ideas <add|list> [--vault <name>]",
     );
   } else {
     console.error(
-      `ideas: unknown subcommand "${subcommand}". Available: add`,
+      `ideas: unknown subcommand "${subcommand}". Available: add, list`,
     );
   }
   return 1;
@@ -184,6 +189,53 @@ function uniqueId(base: string, existing: ReadonlyArray<string>): string {
   let suffix = 2;
   while (existing.includes(`${base}-${suffix}`)) suffix += 1;
   return `${base}-${suffix}`;
+}
+
+async function runIdeasList(rest: string[]): Promise<number> {
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args: rest,
+      options: {
+        format: { type: "string" },
+      },
+      allowPositionals: false,
+    });
+  } catch (err) {
+    console.error(`ideas list: ${(err as Error).message}`);
+    return 1;
+  }
+  const format = parsed.values.format ?? "table";
+  if (format !== "table" && format !== "json") {
+    console.error(
+      `ideas list: invalid --format "${format}" (expected table or json)`,
+    );
+    return 1;
+  }
+
+  const dataDir = getDataDir();
+  const rows = listIdeasWithStatus(dataDir);
+
+  if (format === "json") {
+    console.log(
+      JSON.stringify(
+        rows.map((r) => ({
+          ...r.idea,
+          drafted: r.drafted,
+        })),
+        null,
+        2,
+      ),
+    );
+    return 0;
+  }
+
+  console.log(formatIdeaListing(rows, "plain"));
+  console.log("");
+  console.log(
+    `${rows.length} idea(s). yarn jarvis scout score → score unscored. yarn jarvis scout draft → auto-draft high scorers.`,
+  );
+  return 0;
 }
 
 function defaultHasTty(): boolean {
