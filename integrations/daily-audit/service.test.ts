@@ -7,7 +7,7 @@ import {
   type InstallSandbox,
 } from "../../cli/commands/_test-helpers.ts";
 import type { DaemonContext } from "../../cli/commands/daemon.ts";
-import { createFridayAuditService } from "./service.ts";
+import { createDailyAuditService } from "./service.ts";
 
 function buildCtx(sandbox: InstallSandbox): DaemonContext {
   const logger = createDaemonLogger({
@@ -21,7 +21,7 @@ function buildCtx(sandbox: InstallSandbox): DaemonContext {
   };
 }
 
-describe("createFridayAuditService", () => {
+describe("createDailyAuditService", () => {
   let sandbox: InstallSandbox;
   let silencer: ConsoleSilencer;
 
@@ -39,7 +39,7 @@ describe("createFridayAuditService", () => {
     const ctx = buildCtx(sandbox);
     try {
       const tickBody = vi.fn(async () => {});
-      const svc = createFridayAuditService({
+      const svc = createDailyAuditService({
         dataDir: sandbox.dataDir,
         tickMs: 60_000_000,
         _tickBody: tickBody,
@@ -64,7 +64,7 @@ describe("createFridayAuditService", () => {
             resolveBody = resolve;
           }),
       );
-      const svc = createFridayAuditService({
+      const svc = createDailyAuditService({
         dataDir: sandbox.dataDir,
         tickMs: 1,
         _tickBody: tickBody,
@@ -87,7 +87,7 @@ describe("createFridayAuditService", () => {
       const tickBody = vi.fn(async () => {
         throw new Error("boom");
       });
-      const svc = createFridayAuditService({
+      const svc = createDailyAuditService({
         dataDir: sandbox.dataDir,
         tickMs: 60_000_000,
         _tickBody: tickBody,

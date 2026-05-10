@@ -1,7 +1,7 @@
 import {
-  runFridayAudit,
-  type FridayAuditResult,
-} from "../../agents/strategist-friday-audit.ts";
+  runDailyAudit,
+  type DailyAuditResult,
+} from "../../agents/strategist-daily-audit.ts";
 import {
   createSdkClient,
   type AnthropicClient,
@@ -12,18 +12,18 @@ import type {
 } from "../../cli/commands/daemon.ts";
 
 /**
- * Daemon service: runs the Strategist Friday self-audit on a recurring
- * cadence. Tick is hourly; the audit's own gates (day-of-week,
- * throughput, idempotency) keep it a no-op outside its window. Mirrors
- * the learn-tick pattern: `tickInFlight` guard, `_tickBody` test seam,
+ * Daemon service: runs the Strategist daily self-audit on a recurring
+ * cadence. Tick is hourly; the audit's own gates (throughput,
+ * idempotency) keep it a no-op outside its window. Mirrors the
+ * learn-tick pattern: `tickInFlight` guard, `_tickBody` test seam,
  * lazy AnthropicClient.
  */
 
-/** Tick interval. The audit's own day-of-week + idempotency gates keep
- * the service quiet outside Fridays. */
+/** Tick interval. The audit's own 24h idempotency window keeps the
+ * service to one effective run per day even though the tick is hourly. */
 const DEFAULT_TICK_MS = 60 * 60 * 1000;
 
-export interface FridayAuditServiceOptions {
+export interface DailyAuditServiceOptions {
   dataDir: string;
   tickMs?: number;
   /** Override for the SDK client (test seam). */
@@ -34,8 +34,8 @@ export interface FridayAuditServiceOptions {
   _tickBody?: (ctx: DaemonContext) => Promise<void>;
 }
 
-export function createFridayAuditService(
-  opts: FridayAuditServiceOptions,
+export function createDailyAuditService(
+  opts: DailyAuditServiceOptions,
 ): DaemonService {
   const tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
 
@@ -53,7 +53,7 @@ export function createFridayAuditService(
   let tickInFlight = false;
 
   return {
-    name: "friday-audit",
+    name: "daily-audit",
     start(ctx: DaemonContext): void {
       const tickFn = async (): Promise<void> => {
         if (tickInFlight) return;
@@ -63,14 +63,14 @@ export function createFridayAuditService(
             await opts._tickBody(ctx);
             return;
           }
-          const result = await runFridayAudit({
+          const result = await runDailyAudit({
             dataDir: opts.dataDir,
             client: getClient(),
             ...(opts.now !== undefined && { now: opts.now() }),
           });
           logResult(ctx, result);
         } catch (err) {
-          ctx.logger.error("friday-audit errored", err);
+          ctx.logger.error("daily-audit errored", err);
         } finally {
           tickInFlight = false;
         }
@@ -89,23 +89,20 @@ export function createFridayAuditService(
   };
 }
 
-function logResult(ctx: DaemonContext, result: FridayAuditResult): void {
+function logResult(ctx: DaemonContext, result: DailyAuditResult): void {
   if (!result.ran) {
     // Silent on the common skip paths to keep the daemon log clean.
-    if (
-      result.skipReason === "not-friday" ||
-      result.skipReason === "already-ran-recently"
-    ) {
+    if (result.skipReason === "already-ran-recently") {
       return;
     }
-    ctx.logger.info("friday-audit skipped", {
+    ctx.logger.info("daily-audit skipped", {
       reason: result.skipReason,
       backlogDepth: result.backlogDepth,
       projectShipments: result.projectShipments,
     });
     return;
   }
-  ctx.logger.info("friday-audit ran", {
+  ctx.logger.info("daily-audit ran", {
     drafted: result.drafted.map((d) => d.planId),
     errors: result.errors.length,
     backlogDepth: result.backlogDepth,

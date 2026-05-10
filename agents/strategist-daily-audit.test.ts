@@ -14,7 +14,7 @@ import {
   type ConsoleSilencer,
   type InstallSandbox,
 } from "../cli/commands/_test-helpers.ts";
-import { runFridayAudit } from "./strategist-friday-audit.ts";
+import { runDailyAudit } from "./strategist-daily-audit.ts";
 
 const IMPROVEMENT_PLAN_RESPONSE = `<plan>
 # Plan: Tighten Strategist scope rule
@@ -85,9 +85,10 @@ function fakeClient(text = IMPROVEMENT_PLAN_RESPONSE): AnthropicClient {
   };
 }
 
-/** A Friday in May 2026 — used as a stable `now` for tests. */
+/** Stable `now` values for tests. After dropping the day-of-week gate
+ * either day should drive the same behaviour; both are kept so the
+ * "runs on any day" assertion is explicit. */
 const A_FRIDAY = new Date("2026-05-08T12:00:00.000Z");
-/** A non-Friday in the same week. */
 const A_TUESDAY = new Date("2026-05-05T12:00:00.000Z");
 
 /** Seed a project shipment so the throughput gate passes. */
@@ -132,7 +133,7 @@ function seedSignal(sandbox: InstallSandbox): void {
   }
 }
 
-describe("runFridayAudit", () => {
+describe("runDailyAudit", () => {
   let sandbox: InstallSandbox;
   let silencer: ConsoleSilencer;
 
@@ -146,21 +147,22 @@ describe("runFridayAudit", () => {
     sandbox.cleanup();
   });
 
-  it("skips when not Friday", async () => {
+  it("runs on any day of the week given correct gates (no day-of-week gate)", async () => {
     seedProjectShipment(sandbox);
-    const result = await runFridayAudit({
+    seedSignal(sandbox);
+    const result = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: A_TUESDAY,
     });
-    expect(result.ran).toBe(false);
-    expect(result.skipReason).toBe("not-friday");
-    expect(result.drafted).toEqual([]);
+    expect(result.ran).toBe(true);
+    expect(result.drafted).toHaveLength(1);
   });
 
   it("skips when no project shipped in past 7 days", async () => {
-    // Friday but no throughput.
-    const result = await runFridayAudit({
+    // Throughput gate stands in for the old day-of-week gate as the
+    // "is it worth running today" signal.
+    const result = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: A_FRIDAY,
@@ -183,7 +185,7 @@ describe("runFridayAudit", () => {
     } finally {
       db.close();
     }
-    const result = await runFridayAudit({
+    const result = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: A_FRIDAY,
@@ -196,7 +198,7 @@ describe("runFridayAudit", () => {
     seedProjectShipment(sandbox);
     seedSignal(sandbox);
     // First run drafts.
-    const r1 = await runFridayAudit({
+    const r1 = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: A_FRIDAY,
@@ -204,7 +206,7 @@ describe("runFridayAudit", () => {
     expect(r1.ran).toBe(true);
     // Second run, hours later, hits the idempotency window.
     const later = new Date(A_FRIDAY.getTime() + 2 * 60 * 60 * 1000);
-    const r2 = await runFridayAudit({
+    const r2 = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: later,
@@ -235,7 +237,7 @@ describe("runFridayAudit", () => {
       app: "jarvis",
       status: "awaiting-review",
     });
-    const result = await runFridayAudit({
+    const result = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: A_FRIDAY,
@@ -260,7 +262,7 @@ describe("runFridayAudit", () => {
       app: "jarvis",
       status: "awaiting-review",
     });
-    const result = await runFridayAudit({
+    const result = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: A_FRIDAY,
@@ -275,7 +277,7 @@ describe("runFridayAudit", () => {
     const longAgo = new Date(A_FRIDAY);
     longAgo.setDate(longAgo.getDate() - 14);
     seedProjectShipment(sandbox, longAgo.toISOString());
-    const result = await runFridayAudit({
+    const result = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: A_FRIDAY,
@@ -288,7 +290,7 @@ describe("runFridayAudit", () => {
     // No seeded shipment, no seeded signal. --force bypasses
     // the throughput gate; the no-context branch then fires because
     // hasMeaningfulSignal sees an empty DB.
-    const result = await runFridayAudit({
+    const result = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: A_FRIDAY,
@@ -301,7 +303,7 @@ describe("runFridayAudit", () => {
   it("drafts a jarvis improvement plan when all gates pass", async () => {
     seedProjectShipment(sandbox);
     seedSignal(sandbox);
-    const result = await runFridayAudit({
+    const result = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: A_FRIDAY,
@@ -309,12 +311,12 @@ describe("runFridayAudit", () => {
     expect(result.ran).toBe(true);
     expect(result.drafted).toHaveLength(1);
     expect(result.drafted[0]?.planId).toMatch(/^\d{4}-\d{2}-\d{2}-/);
-    // friday-audit-completed event recorded.
+    // daily-audit-completed event recorded.
     const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
     try {
       const rows = db
         .prepare(
-          "SELECT payload FROM events WHERE kind = 'friday-audit-completed'",
+          "SELECT payload FROM events WHERE kind = 'daily-audit-completed'",
         )
         .all() as Array<{ payload: string }>;
       expect(rows).toHaveLength(1);
@@ -326,10 +328,10 @@ describe("runFridayAudit", () => {
     }
   });
 
-  it("--force bypasses the day-of-week + throughput + idempotency gates", async () => {
-    // No throughput, not a Friday — should still run.
+  it("--force bypasses the throughput + idempotency gates", async () => {
+    // No throughput — should still run with --force.
     seedSignal(sandbox);
-    const result = await runFridayAudit({
+    const result = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: A_TUESDAY,
@@ -349,7 +351,7 @@ describe("runFridayAudit", () => {
         status: "awaiting-review",
       });
     }
-    const result = await runFridayAudit({
+    const result = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: A_TUESDAY,
@@ -362,7 +364,7 @@ describe("runFridayAudit", () => {
   it("--dry-run records a dry-run audit but does not draft", async () => {
     seedProjectShipment(sandbox);
     seedSignal(sandbox);
-    const result = await runFridayAudit({
+    const result = await runDailyAudit({
       dataDir: sandbox.dataDir,
       client: fakeClient(),
       now: A_FRIDAY,
@@ -374,7 +376,7 @@ describe("runFridayAudit", () => {
     try {
       const rows = db
         .prepare(
-          "SELECT payload FROM events WHERE kind = 'friday-audit-completed'",
+          "SELECT payload FROM events WHERE kind = 'daily-audit-completed'",
         )
         .all() as Array<{ payload: string }>;
       expect(rows).toHaveLength(1);

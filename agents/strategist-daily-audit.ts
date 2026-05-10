@@ -11,61 +11,65 @@ import { listPlans } from "../orchestrator/plan-store.ts";
 import { dbFile } from "../cli/paths.ts";
 
 /**
- * Friday self-audit (§5, §16). On schedule:
- *   1. Day-of-week gate: only run on Fridays.
- *   2. Throughput gate: only run when ≥1 *project* plan (any app != "jarvis")
+ * Daily self-audit (§5, §16). On schedule:
+ *   1. Throughput gate: only run when ≥1 *project* plan (any app != "jarvis")
  *      reached `shipped-pending-impact` in the past 7 days.
- *   3. Backlog gate: only draft when the `jarvis` improvement-plan backlog
+ *   2. Backlog gate: only draft when the `jarvis` improvement-plan backlog
  *      depth (status ∈ {awaiting-review, approved}, subtype != "meta") is
  *      below `targetDepth` (default 3).
- *   4. Idempotency: skip if a `friday-audit-completed` event fired in the
- *      last 24h, regardless of whether it actually drafted.
+ *   3. Idempotency: skip if a `daily-audit-completed` event fired in the
+ *      last 24h, regardless of whether it actually drafted. The 24h window
+ *      is what enforces the once-per-day cadence — the daemon ticks hourly
+ *      and the idempotency check makes every tick after the first a no-op
+ *      until the window rolls.
+ *
+ * Until 2026-05-10 this was `friday-audit` and ran only on Fridays. The
+ * day-of-week gate was dropped to give the audit a faster feedback loop;
+ * the existing 24h idempotency already enforces the right cadence.
  *
  * When all gates pass, builds an input bundle (telemetry summary +
  * learn-scan findings) and asks Strategist to draft ONE improvement plan
  * for the `jarvis` app per run. Per-run drafting count caps prevent
- * proliferation; if depth stays below target next Friday, another plan
+ * proliferation; if depth stays below target the next day, another plan
  * gets drafted then.
  *
  * Subtype `meta` is *excluded* from the drafted output — those flow via
- * the learning loop. Friday audit drafts product improvements to jarvis
- * itself.
+ * the learning loop. The daily audit drafts product improvements to
+ * jarvis itself.
  */
 
 const DEFAULT_TARGET_DEPTH = 3;
 const DEFAULT_THROUGHPUT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_IDEMPOTENCY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_DRAFTS_PER_RUN = 1;
-const FRIDAY = 5;
 const JARVIS_APP = "jarvis";
 const JARVIS_VAULT = "personal";
 
-export type FridayAuditSkipReason =
-  | "not-friday"
+export type DailyAuditSkipReason =
   | "no-throughput"
   | "already-ran-recently"
   | "backlog-full"
   | "no-context";
 
-export interface FridayAuditDraft {
+export interface DailyAuditDraft {
   planId: string;
   planPath: string;
 }
 
-export interface FridayAuditResult {
+export interface DailyAuditResult {
   /** True if the run actually called Strategist; false on any gate skip. */
   ran: boolean;
   /** Populated when ran=false. */
-  skipReason?: FridayAuditSkipReason;
+  skipReason?: DailyAuditSkipReason;
   /** Backlog depth at time of run. */
   backlogDepth: number;
   /** Number of project shipments observed in the throughput window. */
   projectShipments: number;
-  drafted: FridayAuditDraft[];
+  drafted: DailyAuditDraft[];
   errors: string[];
 }
 
-export interface RunFridayAuditInput {
+export interface RunDailyAuditInput {
   dataDir: string;
   client: AnthropicClient;
   /** Test seam — fixed clock. */
@@ -79,18 +83,18 @@ export interface RunFridayAuditInput {
   /** Cap on drafts per run. Default 1 — top up gradually. */
   maxDraftsPerRun?: number;
   /**
-   * Bypass the not-Friday + no-throughput + already-ran gates (test +
-   * `--force` from the CLI). Backlog-full is still respected because
-   * topping up beyond the target depth would overshoot the spec.
+   * Bypass the no-throughput + already-ran gates (test + `--force`
+   * from the CLI). Backlog-full is still respected because topping up
+   * beyond the target depth would overshoot the spec.
    */
   force?: boolean;
   /** Build but don't draft. Lets the operator see what would fire. */
   dryRun?: boolean;
 }
 
-export async function runFridayAudit(
-  input: RunFridayAuditInput,
-): Promise<FridayAuditResult> {
+export async function runDailyAudit(
+  input: RunDailyAuditInput,
+): Promise<DailyAuditResult> {
   const now = input.now ?? new Date();
   const targetDepth = input.targetDepth ?? DEFAULT_TARGET_DEPTH;
   const throughputWindowMs =
@@ -108,14 +112,11 @@ export async function runFridayAudit(
   const baseResult = {
     backlogDepth,
     projectShipments,
-    drafted: [] as FridayAuditDraft[],
+    drafted: [] as DailyAuditDraft[],
     errors: [] as string[],
   };
 
   if (!input.force) {
-    if (now.getDay() !== FRIDAY) {
-      return { ran: false, skipReason: "not-friday", ...baseResult };
-    }
     if (projectShipments === 0) {
       return { ran: false, skipReason: "no-throughput", ...baseResult };
     }
@@ -187,7 +188,7 @@ export async function runFridayAudit(
             ? err.message
             : String(err);
       baseResult.errors.push(`strategist error: ${msg}`);
-      // Stop on first error to avoid retry storms; next Friday tries again.
+      // Stop on first error to avoid retry storms; tomorrow tries again.
       break;
     }
   }
@@ -267,7 +268,7 @@ function hasRecentAuditCompletion(
   try {
     const row = db
       .prepare(
-        `SELECT 1 FROM events WHERE kind = 'friday-audit-completed'
+        `SELECT 1 FROM events WHERE kind = 'daily-audit-completed'
          AND created_at >= ? LIMIT 1`,
       )
       .get(sinceIso);
@@ -279,7 +280,7 @@ function hasRecentAuditCompletion(
 
 interface RecordAuditArgs {
   now: Date;
-  drafted: FridayAuditDraft[];
+  drafted: DailyAuditDraft[];
   backlogDepth: number;
   projectShipments: number;
   mode: "live" | "dry-run";
@@ -295,7 +296,7 @@ function recordAuditCompletion(
     appendEvent(db, {
       appId: JARVIS_APP,
       vaultId: JARVIS_VAULT,
-      kind: "friday-audit-completed",
+      kind: "daily-audit-completed",
       payload: {
         mode: args.mode,
         drafted: args.drafted.map((d) => d.planId),
@@ -346,7 +347,7 @@ function composeBrief(args: {
   now: Date;
 }): string {
   const lines: string[] = [];
-  lines.push("Weekly Friday self-audit for the `jarvis` app itself.");
+  lines.push("Daily self-audit for the `jarvis` app itself.");
   lines.push("");
   lines.push(
     "You are drafting ONE improvement plan against the `jarvis` source tree, derived from the operational signals below. Constraints:",
