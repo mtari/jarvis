@@ -490,6 +490,7 @@ You can reorder at any time:
 | User brief            | Anytime                                            | Plan drafted → app backlog                  |
 | Post-merge regression | Analyst mid-window                                 | Rollback plan drafted                       |
 | Daily self-audit      | Daily, gated on project throughput (7-day rolling) | Self-improvement plan → `jarvis` backlog    |
+| Project audit         | Daily, per non-jarvis onboarded app, gated on app status + backlog depth | Improvement plan → app backlog |
 | Telemetry alert       | Any time (circuit break / budget / override spike) | Urgent self-improvement plan                |
 
 ---
@@ -505,7 +506,7 @@ You can reorder at any time:
 - Loads brains (SQLite at `jarvis-data/jarvis.db` + `jarvis-data/brains/*/brain.json`).
 - Opens the Slack Socket Mode WebSocket.
 - Writes `jarvis-data/.daemon.pid` so `yarn jarvis doctor` can detect it.
-- Starts internal schedulers: hourly signal collectors; daily events-to-JSONL export + observation sampling + morning digest; Monday 6am Scout triage; daily self-audit (gated on 7-day project-throughput window — see §5); weekly Umami data archival to the SQLite event log + suppression-expiry sweep.
+- Starts internal schedulers: hourly signal collectors; daily events-to-JSONL export + observation sampling + morning digest; Monday 6am Scout triage; daily self-audit (gated on 7-day project-throughput window — see §5); daily project-audit per non-jarvis app (gated on app status + backlog depth — see §5); weekly Umami data archival to the SQLite event log + suppression-expiry sweep.
 - Resumes any in-flight plans from `jarvis-data/logs/checkpoints/`.
 - Logs to `jarvis-data/logs/daemon-YYYY-MM-DD.log`.
 
@@ -1649,6 +1650,7 @@ All commands prefixed `yarn jarvis ...`. Grouped by purpose.
 | `/jarvis ideas add`                 | `yarn jarvis ideas add` — opens a thread; each thread reply is one user answer. Saves to `Business_Ideas.md` when the agent emits `<idea>`. Persistence: `idea-intake-started` / `idea-intake-message` / `idea-intake-closed` events. |
 | `/jarvis ideas list`                | `yarn jarvis ideas list` — ephemeral message, mrkdwn formatting.                                                                                                                                                          |
 | `/jarvis daily-audit [--dry-run] [--force]` | `yarn jarvis daily-audit ...` — manually fires the audit. Daemon already runs it once per day; this is for testing the gates or seeing the bundled brief.                                                          |
+| `/jarvis project-audit --app <name> \| --all [--dry-run] [--force]` | `yarn jarvis project-audit ...` — manually fires the per-app project audit. Daemon runs hourly; each app's 24h idempotency gate enforces once-per-day. `--app` targets one app; `--all` runs all non-jarvis apps. `--dry-run` records event but skips Strategist; `--force` bypasses app-paused, already-ran-recently, and no-context gates. |
 | `/jarvis notes <app> <text>`        | `yarn jarvis notes <app> --append "<text>"`                                                                                                                                                                               |
 | `/jarvis ask "<text>"`              | `yarn jarvis ask "<text>"`                                                                                                                                                                                                |
 | `/jarvis discuss <app> "<topic>"`   | `yarn jarvis discuss --app <app> "<topic>"` — opens a thread; replies become user turns. Shares the `app.message` thread router with `ideas add`.                                                                         |
