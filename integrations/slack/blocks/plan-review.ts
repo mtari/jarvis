@@ -22,7 +22,14 @@ const PRIORITY_EMOJI: Record<string, string> = {
   low: "·",
 };
 
-const MAX_BODY_CHARS = 2800; // Slack section text cap is 3000
+// Slack's per-section text cap is 3000 chars. We chunk long sections at
+// paragraph (preferably double-newline) boundaries so the user sees the
+// full plan rather than a truncated preview.
+const MAX_SECTION_CHARS = 2900;
+// Block Kit messages cap at 50 blocks. Header + summary + divider +
+// actions + context account for 5; that leaves 45 for plan-body sections.
+// In practice we soft-cap before that to keep messages reviewable.
+const MAX_BODY_BLOCKS = 45;
 
 export function buildPlanReviewBlocks(input: PlanReviewBlocksInput): KnownBlock[] {
   const { planId, plan } = input;
@@ -39,13 +46,40 @@ export function buildPlanReviewBlocks(input: PlanReviewBlocksInput): KnownBlock[
     `Confidence: *${meta.confidence.score}*${meta.confidence.rationale ? ` — ${meta.confidence.rationale}` : ""}`,
   );
 
-  // First two sections of the body for at-a-glance context
-  const bodyExcerpts: string[] = [];
-  for (const section of plan.sections.slice(0, 2)) {
+  // Every plan body section, in order, as its own section block (or
+  // multiple consecutive blocks for long sections). No truncation — the
+  // reviewer needs to see the whole plan.
+  const bodyBlocks: KnownBlock[] = [];
+  let bodyBlockCount = 0;
+  let overflowed = false;
+  for (const section of plan.sections) {
     if (!section.body.trim()) continue;
-    bodyExcerpts.push(`*${section.title}*\n${truncate(section.body.trim(), 600)}`);
+    const chunks = chunkSectionForSlack(section.body.trim(), MAX_SECTION_CHARS);
+    for (let i = 0; i < chunks.length; i += 1) {
+      if (bodyBlockCount >= MAX_BODY_BLOCKS) {
+        overflowed = true;
+        break;
+      }
+      const heading = i === 0 ? `*${section.title}*\n` : "";
+      bodyBlocks.push({
+        type: "section",
+        text: { type: "mrkdwn", text: `${heading}${chunks[i]!}` },
+      });
+      bodyBlockCount += 1;
+    }
+    if (overflowed) break;
   }
-  const fullSummary = [summaryLines.join("\n"), ...bodyExcerpts].join("\n\n");
+  if (overflowed) {
+    bodyBlocks.push({
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `_Plan body exceeded Slack's block budget — full content at ${input.path ?? `\`${planId}.md\``}._`,
+        },
+      ],
+    });
+  }
 
   const blocks: KnownBlock[] = [
     {
@@ -56,9 +90,11 @@ export function buildPlanReviewBlocks(input: PlanReviewBlocksInput): KnownBlock[
       type: "section",
       text: {
         type: "mrkdwn",
-        text: truncate(fullSummary, MAX_BODY_CHARS),
+        text: summaryLines.join("\n"),
       },
     },
+    { type: "divider" },
+    ...bodyBlocks,
     { type: "divider" },
     {
       type: "actions",
@@ -120,9 +156,36 @@ export function buildPlanReviewBlocks(input: PlanReviewBlocksInput): KnownBlock[
   return blocks;
 }
 
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return s.slice(0, max - 1) + "…";
+/**
+ * Splits a single plan section's body into Slack-section-sized chunks.
+ * Prefers paragraph (blank-line) boundaries; falls back to line boundaries;
+ * falls back to a hard split at the cap. Empty paragraphs are coalesced so
+ * the chunks read naturally.
+ */
+export function chunkSectionForSlack(body: string, max: number): string[] {
+  if (body.length <= max) return [body];
+  const chunks: string[] = [];
+  let remaining = body;
+  while (remaining.length > max) {
+    const minPos = Math.floor(max * 0.5);
+    let split = -1;
+    // Prefer paragraph break (`\n\n`). Look up to position `max + 2` so a
+    // boundary landing exactly at the cap (chunk_end..chunk_end+1) is found.
+    const paraCandidate = remaining.slice(0, max + 2);
+    const doubleNl = paraCandidate.lastIndexOf("\n\n");
+    if (doubleNl >= minPos && doubleNl <= max) split = doubleNl;
+    if (split === -1) {
+      // Fall back to single line break, search up to position `max + 1`.
+      const lineCandidate = remaining.slice(0, max + 1);
+      const singleNl = lineCandidate.lastIndexOf("\n");
+      if (singleNl >= minPos && singleNl <= max) split = singleNl;
+    }
+    if (split === -1) split = max; // hard split
+    chunks.push(remaining.slice(0, split).trimEnd());
+    remaining = remaining.slice(split).replace(/^\s+/, "");
+  }
+  if (remaining.length > 0) chunks.push(remaining);
+  return chunks;
 }
 
 export function buildReviseModal(planId: string): {

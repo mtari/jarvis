@@ -4,6 +4,7 @@ import {
   buildPlanReviewBlocks,
   buildReviseModal,
   buildOutcomeContext,
+  chunkSectionForSlack,
 } from "./plan-review.ts";
 
 const SAMPLE_PLAN = parsePlan(`# Plan: Add status command
@@ -126,5 +127,89 @@ describe("buildOutcomeContext", () => {
       const first = block.elements[0];
       expect(first?.type).toBe("mrkdwn");
     }
+  });
+});
+
+describe("buildPlanReviewBlocks — full plan rendering", () => {
+  it("renders every plan section as its own block, not truncated", () => {
+    const blocks = buildPlanReviewBlocks({
+      planId: "2026-05-11-full",
+      plan: SAMPLE_PLAN,
+      path: "/tmp/full.md",
+    });
+    const sectionTexts = blocks
+      .filter((b) => b.type === "section")
+      .map((b) =>
+        b.type === "section" && b.text.type === "mrkdwn" ? b.text.text : "",
+      );
+    // First section is the summary line (planId / type / confidence)
+    expect(sectionTexts[0]).toContain("Confidence: *80*");
+    // Every plan body section appears in its own block
+    expect(sectionTexts.some((t) => t.includes("*Problem*"))).toBe(true);
+    expect(sectionTexts.some((t) => t.includes("Need a quick health summary"))).toBe(true);
+    expect(sectionTexts.some((t) => t.includes("*Build plan*"))).toBe(true);
+    expect(sectionTexts.some((t) => t.includes("Add a status command to dispatch."))).toBe(true);
+    expect(sectionTexts.some((t) => t.includes("*Testing strategy*"))).toBe(true);
+    expect(sectionTexts.some((t) => t.includes("*Acceptance criteria*"))).toBe(true);
+    expect(sectionTexts.some((t) => t.includes("prints the snapshot"))).toBe(true);
+  });
+
+  it("chunks a long section across multiple consecutive blocks without truncating", () => {
+    const longBody = "Paragraph one.\n\n" + "x".repeat(3500) + "\n\nfinal";
+    const plan = parsePlan(`# Plan: long
+Type: improvement
+Subtype: new-feature
+ImplementationReview: required
+App: jarvis
+Priority: normal
+Destructive: false
+Status: awaiting-review
+Author: strategist
+Confidence: 70
+
+## Big section
+${longBody}
+`);
+    const blocks = buildPlanReviewBlocks({ planId: "x", plan });
+    const sectionTexts = blocks
+      .filter((b) => b.type === "section")
+      .map((b) =>
+        b.type === "section" && b.text.type === "mrkdwn" ? b.text.text : "",
+      );
+    // The big section spans multiple blocks
+    const bigBlocks = sectionTexts.filter((t) => t.includes("xxxx"));
+    expect(bigBlocks.length).toBeGreaterThanOrEqual(2);
+    // First chunk carries the title heading; subsequent chunks don't repeat it
+    expect(bigBlocks[0]?.startsWith("*Big section*")).toBe(true);
+    expect(bigBlocks[1]?.startsWith("*Big section*")).toBe(false);
+    // Every Slack section block stays under the 3000-char cap
+    for (const t of sectionTexts) expect(t.length).toBeLessThanOrEqual(3000);
+    // The full body is preserved across the chunks (sum of x's matches input)
+    const xCount = bigBlocks.reduce(
+      (acc, t) => acc + (t.match(/x/g)?.length ?? 0),
+      0,
+    );
+    expect(xCount).toBe(3500);
+  });
+});
+
+describe("chunkSectionForSlack", () => {
+  it("returns the body unchanged when under the cap", () => {
+    expect(chunkSectionForSlack("hello", 100)).toEqual(["hello"]);
+  });
+
+  it("splits at paragraph boundaries when possible", () => {
+    const body = "a".repeat(2900) + "\n\n" + "b".repeat(500);
+    const chunks = chunkSectionForSlack(body, 2900);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toBe("a".repeat(2900));
+    expect(chunks[1]).toBe("b".repeat(500));
+  });
+
+  it("falls back to a hard split when no boundary is in range", () => {
+    const body = "z".repeat(7000);
+    const chunks = chunkSectionForSlack(body, 2900);
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(2900);
+    expect(chunks.join("")).toBe(body);
   });
 });
