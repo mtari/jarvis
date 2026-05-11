@@ -6,6 +6,11 @@ import { listPlans } from "../orchestrator/plan-store.ts";
 import { loadBrain, type Brain } from "../orchestrator/brain.ts";
 import { notesContextBlock } from "../orchestrator/notes.ts";
 import { dbFile, brainFile } from "../cli/paths.ts";
+import {
+  gatherProjectResearch,
+  type ProjectResearchBundle,
+  type GatherResearchOptions,
+} from "../tools/research/index.ts";
 
 /**
  * Daily project audit (§5, §6). On schedule, for each non-jarvis onboarded
@@ -61,6 +66,8 @@ export interface RunProjectAuditInput {
   now?: Date;
   force?: boolean;
   dryRun?: boolean;
+  disableResearch?: boolean;
+  researchOpts?: GatherResearchOptions;
 }
 
 export async function runProjectAudit(
@@ -139,7 +146,7 @@ export async function runProjectAudit(
   }
 
   // Compose brief
-  const brief = composeBrief({
+  let brief = composeBrief({
     brain,
     dataDir: input.dataDir,
     vault: input.vault,
@@ -156,6 +163,22 @@ export async function runProjectAudit(
 
   baseResult.ran = true;
 
+  // Gather external research and append sections to brief
+  let researchGatheredAt: string | undefined;
+  if (!input.disableResearch) {
+    try {
+      const bundle = await gatherProjectResearch(
+        brain,
+        input.dataDir,
+        input.researchOpts ?? {},
+      );
+      brief = appendResearchSections(brief, bundle);
+      researchGatheredAt = new Date().toISOString();
+    } catch {
+      brief += "\n\n> External research — fetch errored, continuing without.";
+    }
+  }
+
   if (input.dryRun) {
     recordAuditCompletion(input.dataDir, input.app, input.vault, {
       now,
@@ -163,6 +186,7 @@ export async function runProjectAudit(
       mode: "dry-run",
       transitionsCount,
       signalsCount,
+      ...(researchGatheredAt !== undefined && { researchGatheredAt }),
     });
     return { ...baseResult, mode: "dry-run" };
   }
@@ -194,6 +218,7 @@ export async function runProjectAudit(
     mode: "live",
     transitionsCount,
     signalsCount,
+    ...(researchGatheredAt !== undefined && { researchGatheredAt }),
   });
 
   return baseResult;
@@ -268,6 +293,7 @@ interface RecordAuditArgs {
   mode: "live" | "dry-run";
   transitionsCount: number;
   signalsCount: number;
+  researchGatheredAt?: string;
 }
 
 function recordAuditCompletion(
@@ -289,12 +315,69 @@ function recordAuditCompletion(
         mode: args.mode,
         transitionsCount: args.transitionsCount,
         signalsCount: args.signalsCount,
+        ...(args.researchGatheredAt !== undefined && {
+          researchGatheredAt: args.researchGatheredAt,
+        }),
       },
       createdAt: args.now.toISOString(),
     });
   } finally {
     db.close();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Research section appender
+// ---------------------------------------------------------------------------
+
+function appendResearchSections(
+  brief: string,
+  bundle: ProjectResearchBundle,
+): string {
+  const lines: string[] = [brief];
+
+  lines.push("");
+  lines.push("## External research — Competitor snapshots");
+  if (bundle.competitors.length === 0) {
+    lines.push("No data — brain config missing or fetch failed.");
+  } else {
+    for (const c of bundle.competitors) {
+      lines.push(`- **${c.url}**: ${c.title || "(no title)"}`);
+      if (c.h1) lines.push(`  H1: ${c.h1}`);
+      if (c.description) lines.push(`  ${c.description}`);
+      if (c.prices.length > 0) lines.push(`  Prices: ${c.prices.join(", ")}`);
+    }
+  }
+
+  lines.push("");
+  lines.push("## External research — Facebook Insights");
+  if (!bundle.facebookInsights) {
+    lines.push("No data — brain config missing or fetch failed.");
+  } else {
+    const fi = bundle.facebookInsights;
+    lines.push(`- Page impressions (7d): ${fi.pageImpressions}`);
+    lines.push(`- Engaged users (7d): ${fi.pageEngagedUsers}`);
+    lines.push(`- Post engagements (7d): ${fi.pagePostEngagements}`);
+  }
+
+  lines.push("");
+  lines.push("## External research — Google Trends");
+  const validSeries = (bundle.trends ?? []).filter(
+    (s) => Array.isArray(s) && s.length > 0,
+  );
+  if (validSeries.length === 0) {
+    lines.push("No data — brain config missing or fetch failed.");
+  } else {
+    for (let i = 0; i < validSeries.length; i++) {
+      const series = validSeries[i]!;
+      const latest = series[series.length - 1];
+      lines.push(
+        `- Keyword ${i + 1}: latest value ${latest?.value ?? "n/a"} (${latest?.date ?? "?"})`,
+      );
+    }
+  }
+
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------

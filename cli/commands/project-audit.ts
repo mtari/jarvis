@@ -20,12 +20,13 @@ import { getDataDir } from "../paths.ts";
  * gates (--force).
  */
 
-const USAGE = `usage: yarn jarvis project-audit --app <name> | --all [--dry-run] [--force]
+const USAGE = `usage: yarn jarvis project-audit --app <name> | --all [--dry-run] [--force] [--no-research]
 
   --app <name>   Run audit for one app by name
   --all          Run audit for all onboarded apps except jarvis
   --dry-run      Compose brief and record event but skip Strategist call
   --force        Bypass app-paused, already-ran-recently, and no-context gates
+  --no-research  Skip external research (fast / offline)
 `;
 
 export interface ProjectAuditCommandDeps {
@@ -47,6 +48,7 @@ export async function runProjectAuditCommand(
         all: { type: "boolean" },
         "dry-run": { type: "boolean" },
         force: { type: "boolean" },
+        "no-research": { type: "boolean" },
       },
       allowPositionals: false,
     });
@@ -58,6 +60,7 @@ export async function runProjectAuditCommand(
   const v = parsed.values;
   const dryRun = v["dry-run"] === true;
   const force = v.force === true;
+  const disableResearch = v["no-research"] === true;
 
   if (!v.app && !v.all) {
     process.stderr.write(USAGE);
@@ -92,6 +95,7 @@ export async function runProjectAuditCommand(
       client,
       dryRun,
       force,
+      disableResearch,
       ...(deps.now !== undefined && { now: deps.now }),
     });
     printResult(found.app, result);
@@ -110,6 +114,7 @@ export async function runProjectAuditCommand(
         client,
         dryRun,
         force,
+        disableResearch,
         ...(deps.now !== undefined && { now: deps.now }),
       });
     } catch (err) {

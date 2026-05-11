@@ -9,7 +9,8 @@ import {
   type ConsoleSilencer,
   type InstallSandbox,
 } from "../../cli/commands/_test-helpers.ts";
-import { checkpointsDir, dbFile } from "../../cli/paths.ts";
+import { brainDir, brainFile, checkpointsDir, dbFile } from "../../cli/paths.ts";
+import { saveBrain } from "../../orchestrator/brain.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { recordEscalation } from "../../orchestrator/escalations.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
@@ -655,5 +656,110 @@ describe("discuss action handlers", () => {
     } finally {
       conn.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /jarvis project-audit slash command
+// ---------------------------------------------------------------------------
+
+describe("/jarvis project-audit", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function seedAuditBrain(app: string): void {
+    fs.mkdirSync(brainDir(sandbox.dataDir, "personal", app), { recursive: true });
+    saveBrain(brainFile(sandbox.dataDir, "personal", app), {
+      schemaVersion: 1,
+      projectName: app,
+      projectType: "app",
+      projectStatus: "active",
+      projectPriority: 3,
+    });
+  }
+
+  function seedTransitionAndSignal(app: string): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: app,
+        vaultId: "personal",
+        kind: "plan-transition",
+        payload: { planId: "p1", from: "approved", to: "executing" },
+      });
+      appendEvent(conn, {
+        appId: app,
+        vaultId: "personal",
+        kind: "signal",
+        payload: { kind: "yarn-audit", severity: "moderate", title: "dep" },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  it("no --app and no --all → ephemeral usage error", async () => {
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "project-audit" },
+      respond: async (args) => {
+        responds.push(args);
+      },
+    });
+    expect(responds).toHaveLength(1);
+    expect(responds[0]?.text).toContain("Usage");
+    expect(responds[0]?.text).toContain("project-audit");
+  });
+
+  it("--app <name> --no-research --dry-run --force → running + result messages", async () => {
+    seedAuditBrain("erdei-fahazak");
+    seedTransitionAndSignal("erdei-fahazak");
+
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: {
+        text: "project-audit --app erdei-fahazak --no-research --dry-run --force",
+      },
+      respond: async (args) => {
+        responds.push(args);
+      },
+    });
+    expect(responds.length).toBeGreaterThanOrEqual(2);
+    expect(responds[0]?.text).toContain("erdei-fahazak");
+    const lastRespond = responds[responds.length - 1];
+    expect(lastRespond?.text).toMatch(/skipped|ran/i);
+  });
+
+  it("--all --no-research --dry-run --force → aggregate result for all non-jarvis apps", async () => {
+    seedAuditBrain("app-one");
+    seedAuditBrain("app-two");
+    seedTransitionAndSignal("app-one");
+    seedTransitionAndSignal("app-two");
+
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: {
+        text: "project-audit --all --no-research --dry-run --force",
+      },
+      respond: async (args) => {
+        responds.push(args);
+      },
+    });
+    expect(responds.length).toBeGreaterThanOrEqual(1);
+    const lastText = responds[responds.length - 1]?.text ?? "";
+    expect(lastText).toContain("Project audit — all apps");
   });
 });
