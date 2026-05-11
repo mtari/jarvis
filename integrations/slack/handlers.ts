@@ -21,7 +21,7 @@ import { interpretAsk } from "../../cli/commands/ask.ts";
 import { todayLogPath } from "../../cli/commands/logs.ts";
 import fs from "node:fs";
 import { appendNote } from "../../orchestrator/notes.ts";
-import { findPlan } from "../../orchestrator/plan-store.ts";
+import { findPlan, scanPlans } from "../../orchestrator/plan-store.ts";
 import {
   approveScheduledPost,
   findScheduledPost,
@@ -30,7 +30,9 @@ import {
 } from "../../orchestrator/scheduled-posts.ts";
 import { resolveSetupTask } from "../../orchestrator/setup-tasks.ts";
 import { suppress } from "../../orchestrator/suppressions.ts";
-import { dbFile } from "../../cli/paths.ts";
+import { daemonPidFile, dbFile } from "../../cli/paths.ts";
+import { readPidFile, defaultIsPidAlive } from "../../orchestrator/daemon-pid.ts";
+import { readTodayCallCount } from "../../cli/commands/cost.ts";
 import { buildSkipReasonModal } from "./blocks/setup-task.ts";
 import {
   buildPostSkipReasonModal,
@@ -727,10 +729,12 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
         return runSlashAsk(parts.slice(1).join(" "), ctx, respond);
       case "discuss":
         return runSlashDiscuss(parts.slice(1), ctx, respond, command, client);
+      case "status":
+        return runSlashStatus(ctx, respond);
       default:
         await respond({
           response_type: "ephemeral",
-          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`ideas list\`, \`daily-audit\`, \`project-audit\`, \`logs\`, \`notes\`, \`ask\`, \`discuss\`.`,
+          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`ideas list\`, \`daily-audit\`, \`project-audit\`, \`logs\`, \`notes\`, \`ask\`, \`discuss\`, \`status\`.`,
         });
     }
   });
@@ -899,6 +903,7 @@ const SLASH_USAGE = [
   "• `/jarvis notes <app> <text>` — append a free-text note read by Strategist / Scout / Developer",
   "• `/jarvis ask <text>` — natural-language router into the right Jarvis command",
   "• `/jarvis discuss <app> <topic>` — open a multi-turn co-owner conversation in a thread",
+  "• `/jarvis status` — daemon liveness, plan-queue depth, and recent activity",
 ].join("\n");
 
 type SlashRespond = (args: {
@@ -1573,6 +1578,133 @@ async function runSlashDiscuss(
       text: `✗ Discuss failed: ${
         err instanceof Error ? err.message : String(err)
       }`,
+    });
+  }
+}
+
+const STATUS_ORDER = [
+  "awaiting-review",
+  "approved",
+  "executing",
+  "done",
+  "rejected",
+  "draft",
+];
+
+function formatStatusUptime(startedAt: string): string {
+  const ms = Date.now() - new Date(startedAt).getTime();
+  if (ms < 0) return "0s";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  if (h < 24) return `${h}h ${rm}m`;
+  const d = Math.floor(h / 24);
+  const rh = h % 24;
+  return `${d}d ${rh}h`;
+}
+
+async function runSlashStatus(
+  ctx: HandlerContext,
+  respond: SlashRespond,
+): Promise<void> {
+  try {
+    const lines: string[] = [];
+
+    // Daemon liveness
+    const pidPath = daemonPidFile(ctx.dataDir);
+    const pidData = readPidFile(pidPath);
+    if (pidData && defaultIsPidAlive(pidData.pid)) {
+      lines.push(`*Daemon:* running (pid ${pidData.pid}, up ${formatStatusUptime(pidData.startedAt)})`);
+    } else {
+      lines.push("*Daemon:* stopped");
+    }
+
+    // Plan counts by status
+    const scan = scanPlans(ctx.dataDir);
+    const counts = new Map<string, number>();
+    for (const r of scan.records) {
+      const s = r.plan.metadata.status;
+      counts.set(s, (counts.get(s) ?? 0) + 1);
+    }
+    const planParts: string[] = [];
+    for (const s of STATUS_ORDER) {
+      const n = counts.get(s);
+      if (n && n > 0) planParts.push(`${n} ${s}`);
+    }
+    for (const [s, n] of counts) {
+      if (!STATUS_ORDER.includes(s) && n > 0) planParts.push(`${n} ${s}`);
+    }
+    lines.push(`*Plans:* ${planParts.length > 0 ? planParts.join(", ") : "none"}`);
+
+    // Last 3 plan transitions + last agent call (single readonly connection)
+    const dbPath = dbFile(ctx.dataDir);
+    interface TransitionRow { created_at: string; payload: string }
+    interface AgentCallRow { created_at: string; payload: string }
+    const transitions: string[] = [];
+    let lastCallStr = "none";
+
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const transRows = db
+        .prepare(
+          "SELECT created_at, payload FROM events WHERE kind = 'plan-transition' ORDER BY id DESC LIMIT 3",
+        )
+        .all() as TransitionRow[];
+      for (const row of transRows) {
+        try {
+          const p = JSON.parse(row.payload) as { planId?: string; to?: string };
+          transitions.push(`${row.created_at} ${p.planId ?? "?"} → ${p.to ?? "?"}`);
+        } catch {
+          transitions.push(row.created_at);
+        }
+      }
+
+      const callRow = db
+        .prepare(
+          "SELECT created_at, payload FROM events WHERE kind = 'agent-call' ORDER BY id DESC LIMIT 1",
+        )
+        .get() as AgentCallRow | undefined;
+      if (callRow) {
+        try {
+          const p = JSON.parse(callRow.payload) as { agent?: string };
+          lastCallStr = `${callRow.created_at} (${p.agent ?? "unknown"})`;
+        } catch {
+          lastCallStr = callRow.created_at;
+        }
+      }
+    } finally {
+      db.close();
+    }
+
+    lines.push(`*Last transitions:* ${transitions.length > 0 ? "\n" + transitions.map((t) => `  • ${t}`).join("\n") : "none"}`);
+    lines.push(`*Last agent call:* ${lastCallStr}`);
+
+    // Calls today
+    const callsToday = readTodayCallCount(dbPath);
+    lines.push(`*Calls today:* ${callsToday}`);
+
+    // Record the invocation
+    const writeDb = new Database(dbPath);
+    try {
+      appendEvent(writeDb, {
+        appId: "jarvis",
+        vaultId: "personal",
+        kind: "slack.slash.status",
+        payload: {},
+      });
+    } finally {
+      writeDb.close();
+    }
+
+    await respond({ response_type: "ephemeral", text: lines.join("\n") });
+  } catch (err) {
+    ctx.logError("/jarvis status failed", err);
+    await respond({
+      response_type: "ephemeral",
+      text: `✗ Status failed: ${err instanceof Error ? err.message : String(err)}`,
     });
   }
 }
