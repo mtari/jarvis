@@ -726,6 +726,8 @@ Other agents read freely (no lock needed for reads). Writers update brain AND ap
 
 `jarvis-data/brains/[app]/research/` holds Scout's research outputs (markdown). Indexed with per-topic freshness TTL (default 30 days, configurable per topic class — pricing is 7 days, architectural decisions are 180 days).
 
+**Research tool layer:** Read-only per-project adapters (competitor HTML snapshot, Facebook Page Insights, Google Trends) gathered into `ProjectResearchBundle` and disk-cached under `$JARVIS_DATA_DIR/research-cache/<app>/` with a 24h default TTL. Consumed by project-audit Phase C. Brain fields consulted: `brand.competitors[]` (array of competitor URLs), `brand.targetKeywords[]` (search keyword strings), `connections.facebook.{pageId, tokenEnvVar}` (Graph API credentials). Facebook Insights adapter uses Graph API v19.0 (matching `tools/channels/facebook.ts`). Source: `tools/research/`.
+
 ### Project docs (user-provided, per app)
 
 `jarvis-data/brains/[app]/docs/` — your own project context that isn't code and isn't Scout-generated. Sits alongside `research/` but sourced **from you**.
