@@ -140,7 +140,7 @@ describe("buildPlanReviewBlocks — full plan rendering", () => {
     const sectionTexts = blocks
       .filter((b) => b.type === "section")
       .map((b) =>
-        b.type === "section" && b.text.type === "mrkdwn" ? b.text.text : "",
+        b.type === "section" && b.text && b.text.type === "mrkdwn" ? b.text.text : "",
       );
     // First section is the summary line (planId / type / confidence)
     expect(sectionTexts[0]).toContain("Confidence: *80*");
@@ -174,7 +174,7 @@ ${longBody}
     const sectionTexts = blocks
       .filter((b) => b.type === "section")
       .map((b) =>
-        b.type === "section" && b.text.type === "mrkdwn" ? b.text.text : "",
+        b.type === "section" && b.text && b.text.type === "mrkdwn" ? b.text.text : "",
       );
     // The big section spans multiple blocks
     const bigBlocks = sectionTexts.filter((t) => t.includes("xxxx"));
