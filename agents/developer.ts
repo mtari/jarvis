@@ -72,12 +72,14 @@ export class DeveloperError extends Error {
   }
 }
 
-// Draft-impl needs headroom to read existing files for grounding (each
-// Read/Glob/Grep counts as one SDK turn). 30 was tight for plans that
-// reference many existing modules; matching execute's 60 gives a safe
-// ceiling without uncapping the loop.
+// Draft-impl and execute both count Read/Glob/Grep/Edit/Bash as one SDK
+// turn each. Execute touches the most tools (typecheck + test + commit +
+// push + PR usually push the turn count past 50) so 90 gives a safe
+// ceiling. Draft-impl stays at 60 since it has no shell side-effects.
+// Bumped from 60 → 90 after Phase C wire-up hit error_max_turns at
+// turn 61/60 mid-execute and had to be salvaged by hand.
 const DEFAULT_MAX_TURNS_DRAFT_IMPL = 60;
-const DEFAULT_MAX_TURNS_EXECUTE = 60;
+const DEFAULT_MAX_TURNS_EXECUTE = 90;
 
 // ---------- Mode A: draft implementation plan ----------
 
