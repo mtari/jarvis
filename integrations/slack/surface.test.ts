@@ -27,7 +27,10 @@ import {
   findUnsurfacedSetupTasks,
   runAlertTick,
   runEscalationDeliveryTick,
+  announcePrCompletion,
+  findUnannouncedPrCompletions,
   runPostReviewSurfaceTick,
+  runPrAnnouncementTick,
   runSetupTaskDeliveryTick,
   runSurfaceTick,
   runTriageDeliveryTick,
@@ -1761,5 +1764,179 @@ describe("updateSurfacedPost", () => {
       "irrelevant",
     );
     expect(updates).toHaveLength(0);
+  });
+});
+
+describe("PR completion announcements", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function seedExecuteFired(opts: {
+    planId: string;
+    app?: string;
+    prUrl?: string;
+    done?: boolean;
+    branch?: string;
+    numTurns?: number;
+  }): void {
+    const conn = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: opts.app ?? "jarvis",
+        vaultId: "personal",
+        kind: "plan-executor-fired",
+        payload: {
+          planId: opts.planId,
+          app: opts.app ?? "jarvis",
+          mode: "execute",
+          durationMs: 123,
+          result: {
+            done: opts.done ?? true,
+            blocked: false,
+            amended: false,
+            numTurns: opts.numTurns ?? 42,
+            ...(opts.prUrl !== undefined && { prUrl: opts.prUrl }),
+            ...(opts.branch !== undefined && { branch: opts.branch }),
+          },
+        },
+      });
+    } finally {
+      conn.close();
+    }
+  }
+
+  describe("findUnannouncedPrCompletions", () => {
+    it("returns successful execute fires with a prUrl that haven't been announced", () => {
+      seedExecuteFired({
+        planId: "p1",
+        prUrl: "https://github.com/x/y/pull/1",
+        branch: "feat/x",
+      });
+      const candidates = findUnannouncedPrCompletions(dbFile(sandbox.dataDir));
+      expect(candidates).toHaveLength(1);
+      expect(candidates[0]).toMatchObject({
+        planId: "p1",
+        app: "jarvis",
+        prUrl: "https://github.com/x/y/pull/1",
+        branch: "feat/x",
+      });
+    });
+
+    it("excludes fires without a prUrl", () => {
+      seedExecuteFired({ planId: "p2" }); // no prUrl
+      expect(findUnannouncedPrCompletions(dbFile(sandbox.dataDir))).toEqual([]);
+    });
+
+    it("excludes fires where done=false", () => {
+      seedExecuteFired({
+        planId: "p3",
+        prUrl: "https://github.com/x/y/pull/2",
+        done: false,
+      });
+      expect(findUnannouncedPrCompletions(dbFile(sandbox.dataDir))).toEqual([]);
+    });
+
+    it("excludes plans already announced (via slack-pr-announced event)", () => {
+      seedExecuteFired({ planId: "p4", prUrl: "https://github.com/x/y/pull/3" });
+      const conn = new Database(dbFile(sandbox.dataDir));
+      try {
+        appendEvent(conn, {
+          appId: "jarvis",
+          vaultId: "personal",
+          kind: "slack-pr-announced",
+          payload: { planId: "p4", channel: "C-INBOX", messageTs: "1700000000.001" },
+        });
+      } finally {
+        conn.close();
+      }
+      expect(findUnannouncedPrCompletions(dbFile(sandbox.dataDir))).toEqual([]);
+    });
+
+    it("returns each plan only once even when it has multiple successful fires", () => {
+      seedExecuteFired({ planId: "p5", prUrl: "https://github.com/x/y/pull/4" });
+      seedExecuteFired({ planId: "p5", prUrl: "https://github.com/x/y/pull/4-retry" });
+      const candidates = findUnannouncedPrCompletions(dbFile(sandbox.dataDir));
+      expect(candidates).toHaveLength(1);
+    });
+  });
+
+  describe("announcePrCompletion", () => {
+    it("posts a message with the PR URL and records a slack-pr-announced event", async () => {
+      const planId = "2026-05-11-foo";
+      dropPlan(sandbox, planId, { status: "done", app: "jarvis" });
+      const { client, posts } = fakeWebClient();
+      const ctx: SurfaceContext = {
+        dataDir: sandbox.dataDir,
+        client,
+        inboxChannelId: "C-INBOX",
+      };
+      const result = await announcePrCompletion(ctx, {
+        planId,
+        app: "jarvis",
+        vault: "personal",
+        prUrl: "https://github.com/x/y/pull/9",
+        branch: "feat/foo",
+        numTurns: 50,
+      });
+      expect(result.posted).toBe(true);
+      expect(posts).toHaveLength(1);
+      expect(posts[0]?.channel).toBe("C-INBOX");
+      expect(posts[0]?.text).toContain("PR ready for review");
+      expect(posts[0]?.text).toContain("https://github.com/x/y/pull/9");
+      expect(posts[0]?.text).toContain("feat/foo");
+
+      // slack-pr-announced event is the idempotency marker
+      const conn = new Database(dbFile(sandbox.dataDir), { readonly: true });
+      try {
+        const rows = conn
+          .prepare(
+            "SELECT payload FROM events WHERE kind = 'slack-pr-announced'",
+          )
+          .all() as Array<{ payload: string }>;
+        expect(rows).toHaveLength(1);
+        const p = JSON.parse(rows[0]!.payload) as { planId: string; prUrl: string };
+        expect(p.planId).toBe(planId);
+        expect(p.prUrl).toBe("https://github.com/x/y/pull/9");
+      } finally {
+        conn.close();
+      }
+    });
+  });
+
+  describe("runPrAnnouncementTick", () => {
+    it("posts one announcement per unannounced plan and is idempotent on second tick", async () => {
+      seedExecuteFired({
+        planId: "p10",
+        prUrl: "https://github.com/x/y/pull/10",
+        branch: "feat/a",
+      });
+      seedExecuteFired({
+        planId: "p11",
+        prUrl: "https://github.com/x/y/pull/11",
+      });
+      const { client, posts } = fakeWebClient();
+      const ctx: SurfaceContext = {
+        dataDir: sandbox.dataDir,
+        client,
+        inboxChannelId: "C-INBOX",
+      };
+      const first = await runPrAnnouncementTick(ctx);
+      expect(first.posted).toEqual(["p10", "p11"]);
+      expect(posts).toHaveLength(2);
+
+      const second = await runPrAnnouncementTick(ctx);
+      expect(second.posted).toEqual([]);
+      expect(posts).toHaveLength(2);
+    });
   });
 });

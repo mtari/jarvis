@@ -1669,6 +1669,15 @@ For each orphan found, the service appends a `plan-executor-fired` event with `m
 
 Log line: `plan-executor: recovered orphaned claim` (one per orphan; nothing emitted when the sweep finds zero).
 
+### Post-execute Slack notification + checkout
+
+After a successful execute fire (Developer reaches DONE with a PR URL), two side-effects run:
+
+1. **Slack PR-ready notification** — the Slack service's tick scans for `plan-executor-fired` events with `result.done = true` and `result.prUrl` set that have no follow-up `slack-pr-announced` event. For each, it posts a message to the inbox channel with the plan title, app, branch, turn count, and the PR URL, then records `slack-pr-announced` as the dedup marker. Idempotent across ticks.
+2. **Local checkout return** — the plan-executor runs `git checkout main` in the execute fire's `cwd` so the operator's shell isn't sitting on the feature branch after the PR opens. Failures here are non-fatal (logged as an error, but the PR is open regardless).
+
+Failure log lines: `plan-executor: failed to checkout main after success` (non-fatal), `PR announcement failed` (per plan, logged from the Slack tick).
+
 ---
 
 ## 18. Resource model
