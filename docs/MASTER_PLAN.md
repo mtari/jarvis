@@ -490,7 +490,7 @@ You can reorder at any time:
 | User brief            | Anytime                                            | Plan drafted → app backlog                  |
 | Post-merge regression | Analyst mid-window                                 | Rollback plan drafted                       |
 | Daily self-audit      | Daily, gated on project throughput (7-day rolling) | Self-improvement plan → `jarvis` backlog    |
-| Project audit         | Daily, per non-jarvis onboarded app, gated on app status + backlog depth | Improvement plan → app backlog |
+| Project audit         | Daily, per non-jarvis onboarded app, gated on app status + backlog depth | Improvement plan → app backlog. Research bundle (competitor snapshots, FB Insights, Google Trends) folded into brief when `brain.brand.competitors` / `targetKeywords` / `connections.facebook` present. Bypassed with `--no-research`. |
 | Telemetry alert       | Any time (circuit break / budget / override spike) | Urgent self-improvement plan                |
 
 ---
@@ -1652,7 +1652,7 @@ All commands prefixed `yarn jarvis ...`. Grouped by purpose.
 | `/jarvis ideas add`                 | `yarn jarvis ideas add` — opens a thread; each thread reply is one user answer. Saves to `Business_Ideas.md` when the agent emits `<idea>`. Persistence: `idea-intake-started` / `idea-intake-message` / `idea-intake-closed` events. |
 | `/jarvis ideas list`                | `yarn jarvis ideas list` — ephemeral message, mrkdwn formatting.                                                                                                                                                          |
 | `/jarvis daily-audit [--dry-run] [--force]` | `yarn jarvis daily-audit ...` — manually fires the audit. Daemon already runs it once per day; this is for testing the gates or seeing the bundled brief.                                                          |
-| `/jarvis project-audit --app <name> \| --all [--dry-run] [--force]` | `yarn jarvis project-audit ...` — manually fires the per-app project audit. Daemon runs hourly; each app's 24h idempotency gate enforces once-per-day. `--app` targets one app; `--all` runs all non-jarvis apps. `--dry-run` records event but skips Strategist; `--force` bypasses app-paused, already-ran-recently, and no-context gates. |
+| `/jarvis project-audit --app <name> \| --all [--dry-run] [--force] [--no-research]` | `yarn jarvis project-audit ...` — manually fires the per-app project audit. Daemon runs hourly; each app's 24h idempotency gate enforces once-per-day. `--app` targets one app; `--all` runs all non-jarvis apps. `--dry-run` records event but skips Strategist; `--force` bypasses app-paused, already-ran-recently, and no-context gates. `--no-research` skips the external research gather (fast / offline). |
 | `/jarvis notes <app> <text>`        | `yarn jarvis notes <app> --append "<text>"`                                                                                                                                                                               |
 | `/jarvis ask "<text>"`              | `yarn jarvis ask "<text>"`                                                                                                                                                                                                |
 | `/jarvis discuss <app> "<topic>"`   | `yarn jarvis discuss --app <app> "<topic>"` — opens a thread; replies become user turns. Shares the `app.message` thread router with `ideas add`.                                                                         |

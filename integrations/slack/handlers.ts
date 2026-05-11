@@ -43,6 +43,11 @@ import {
   type DailyAuditResult,
 } from "../../agents/strategist-daily-audit.ts";
 import {
+  runProjectAudit,
+  type ProjectAuditResult,
+} from "../../agents/strategist-project-audit.ts";
+import { listOnboardedApps } from "../../orchestrator/brain.ts";
+import {
   buildInboxSummaryText,
   buildOnDemandTriageBlocks,
   formatDraftResults,
@@ -710,6 +715,8 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       }
       case "daily-audit":
         return runSlashDailyAudit(parts.slice(1), ctx, respond);
+      case "project-audit":
+        return runSlashProjectAudit(parts.slice(1), ctx, respond);
       case "notes":
         return runSlashNotes(parts.slice(1), ctx, respond, command);
       case "ask":
@@ -719,7 +726,7 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       default:
         await respond({
           response_type: "ephemeral",
-          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`ideas list\`, \`daily-audit\`, \`notes\`, \`ask\`, \`discuss\`.`,
+          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`ideas list\`, \`daily-audit\`, \`project-audit\`, \`notes\`, \`ask\`, \`discuss\`.`,
         });
     }
   });
@@ -883,6 +890,7 @@ const SLASH_USAGE = [
   "• `/jarvis ideas add [--vault <v>]` — capture a new idea via thread interview, append to `Business_Ideas.md`",
   "• `/jarvis ideas list [--vault <v>]` — show every idea with its score (high → low, then unscored)",
   "• `/jarvis daily-audit [--dry-run] [--force]` — manually fire the daily self-audit (daemon already runs it once per day)",
+  "• `/jarvis project-audit --app <name> | --all [--dry-run] [--force] [--no-research]` — manually fire per-app project audit",
   "• `/jarvis notes <app> <text>` — append a free-text note read by Strategist / Scout / Developer",
   "• `/jarvis ask <text>` — natural-language router into the right Jarvis command",
   "• `/jarvis discuss <app> <topic>` — open a multi-turn co-owner conversation in a thread",
@@ -1081,6 +1089,144 @@ function formatDailyAuditResult(result: DailyAuditResult): string {
   lines.push(":white_check_mark: *Daily audit ran*");
   lines.push(`• \`jarvis\` backlog depth (before): ${result.backlogDepth}`);
   lines.push(`• Project shipments (last 7d): ${result.projectShipments}`);
+  if (result.drafted.length === 0) {
+    lines.push("• Drafted: _(none — dry-run or no slots)_");
+  } else {
+    lines.push(`• Drafted ${result.drafted.length} plan(s):`);
+    for (const d of result.drafted) {
+      lines.push(`    • \`${d.planId}\``);
+    }
+  }
+  if (result.errors.length > 0) {
+    lines.push("• Errors:");
+    for (const e of result.errors) lines.push(`    • ${e}`);
+  }
+  return lines.join("\n");
+}
+
+async function runSlashProjectAudit(
+  args: string[],
+  ctx: HandlerContext,
+  respond: SlashRespond,
+): Promise<void> {
+  let app: string | undefined;
+  let all = false;
+  let dryRun = false;
+  let force = false;
+  let disableResearch = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--app" && args[i + 1]) {
+      app = args[i + 1];
+      i += 1;
+    } else if (a === "--all") {
+      all = true;
+    } else if (a === "--dry-run") {
+      dryRun = true;
+    } else if (a === "--force") {
+      force = true;
+    } else if (a === "--no-research") {
+      disableResearch = true;
+    }
+  }
+
+  if (!app && !all) {
+    await respond({
+      response_type: "ephemeral",
+      text: "Usage: `/jarvis project-audit --app <name> | --all [--dry-run] [--force] [--no-research]`",
+    });
+    return;
+  }
+
+  const client = ctx.getAnthropicClient();
+
+  if (app) {
+    const appName = app;
+    await respond({
+      response_type: "ephemeral",
+      text: `:mag: Running project audit for *${appName}*…`,
+    });
+    let result: ProjectAuditResult;
+    try {
+      result = await runProjectAudit({
+        dataDir: ctx.dataDir,
+        app: appName,
+        vault: "personal",
+        client,
+        dryRun,
+        force,
+        disableResearch,
+      });
+    } catch (err) {
+      ctx.logError("/jarvis project-audit failed", err, { app: appName });
+      await respond({
+        response_type: "ephemeral",
+        text: `✗ Project audit failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      return;
+    }
+    ctx.log("project-audit via slack", {
+      app: appName,
+      dryRun,
+      force,
+      disableResearch,
+      ran: result.ran,
+      ...(result.skipReason !== undefined && { skipReason: result.skipReason }),
+      drafted: result.drafted.length,
+      errors: result.errors.length,
+    });
+    await respond({
+      response_type: "ephemeral",
+      text: formatProjectAuditResult(appName, result),
+    });
+    return;
+  }
+
+  // --all
+  const apps = listOnboardedApps(ctx.dataDir).filter((a) => a.app !== "jarvis");
+  const summaries: string[] = [];
+  for (const { app: appName, vault } of apps) {
+    let result: ProjectAuditResult;
+    try {
+      result = await runProjectAudit({
+        dataDir: ctx.dataDir,
+        app: appName,
+        vault,
+        client,
+        dryRun,
+        force,
+        disableResearch,
+      });
+    } catch (err) {
+      summaries.push(
+        `• *${appName}*: errored — ${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
+    if (!result.ran) {
+      summaries.push(`• *${appName}*: skipped (\`${result.skipReason ?? "unknown"}\`)`);
+    } else if (result.drafted.length === 0) {
+      summaries.push(`• *${appName}*: ran — mode: ${result.mode}, drafted: (none)`);
+    } else {
+      summaries.push(
+        `• *${appName}*: ran — mode: ${result.mode}, drafted: ${result.drafted.map((d) => d.planId).join(", ")}`,
+      );
+    }
+  }
+
+  const header = `:mag: *Project audit — all apps* (${apps.length} total)`;
+  const body = summaries.length > 0 ? summaries.join("\n") : "_No non-jarvis apps found._";
+  await respond({ response_type: "ephemeral", text: `${header}\n${body}` });
+}
+
+function formatProjectAuditResult(app: string, result: ProjectAuditResult): string {
+  const lines: string[] = [];
+  if (!result.ran) {
+    lines.push(`:fast_forward: *Project audit skipped* for *${app}* — \`${result.skipReason}\``);
+    return lines.join("\n");
+  }
+  lines.push(`:white_check_mark: *Project audit ran* for *${app}* (mode: ${result.mode})`);
   if (result.drafted.length === 0) {
     lines.push("• Drafted: _(none — dry-run or no slots)_");
   } else {

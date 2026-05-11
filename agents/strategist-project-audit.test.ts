@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   AnthropicClient,
   ChatResponse,
@@ -450,5 +450,153 @@ describe("runProjectAudit", () => {
     });
     expect(result.transitionsCount).toBe(1);
     expect(result.signalsCount).toBe(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Research integration tests
+  // ---------------------------------------------------------------------------
+
+  it("disableResearch:true — competitorAdapter not called, event has no researchGatheredAt", async () => {
+    seedTransition(sandbox, TARGET_APP, TARGET_VAULT);
+    seedSignal(sandbox, TARGET_APP, TARGET_VAULT);
+    const competitorAdapter = vi.fn();
+    const result = await runProjectAudit({
+      dataDir: sandbox.dataDir,
+      app: TARGET_APP,
+      vault: TARGET_VAULT,
+      client: fakeClient(),
+      now: A_NOW,
+      dryRun: true,
+      disableResearch: true,
+      researchOpts: { competitorAdapter },
+    });
+    expect(result.ran).toBe(true);
+    expect(competitorAdapter).not.toHaveBeenCalled();
+
+    const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const rows = db
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'project-audit-completed'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(rows).toHaveLength(1);
+      const p = JSON.parse(rows[0]!.payload) as Record<string, unknown>;
+      expect("researchGatheredAt" in p).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("research happy path — researchGatheredAt present in event payload", async () => {
+    seedTransition(sandbox, TARGET_APP, TARGET_VAULT);
+    seedSignal(sandbox, TARGET_APP, TARGET_VAULT);
+    const result = await runProjectAudit({
+      dataDir: sandbox.dataDir,
+      app: TARGET_APP,
+      vault: TARGET_VAULT,
+      client: fakeClient(),
+      now: A_NOW,
+      dryRun: true,
+      disableResearch: false,
+      researchOpts: {
+        competitorAdapter: vi.fn().mockResolvedValue(null),
+        facebookAdapter: vi.fn().mockResolvedValue(null),
+        trendsAdapter: vi.fn().mockResolvedValue(null),
+      },
+    });
+    expect(result.ran).toBe(true);
+
+    const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const rows = db
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'project-audit-completed'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(rows).toHaveLength(1);
+      const p = JSON.parse(rows[0]!.payload) as Record<string, unknown>;
+      expect(typeof p["researchGatheredAt"]).toBe("string");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("adapter rejections absorbed by Promise.allSettled — ran:true, researchGatheredAt still set", async () => {
+    // gatherProjectResearch uses Promise.allSettled internally, so individual
+    // adapter rejections don't throw — the bundle returns with empty/null slices.
+    // Seed a brain with brand config so the adapters are actually invoked.
+    fs.mkdirSync(brainDir(sandbox.dataDir, TARGET_VAULT, TARGET_APP), { recursive: true });
+    saveBrain(brainFile(sandbox.dataDir, TARGET_VAULT, TARGET_APP), {
+      schemaVersion: 1,
+      projectName: TARGET_APP,
+      projectType: "app",
+      projectStatus: "active",
+      projectPriority: 3,
+      brand: { competitors: ["https://example.com"], targetKeywords: ["test"] },
+    });
+    seedTransition(sandbox, TARGET_APP, TARGET_VAULT);
+    seedSignal(sandbox, TARGET_APP, TARGET_VAULT);
+    const result = await runProjectAudit({
+      dataDir: sandbox.dataDir,
+      app: TARGET_APP,
+      vault: TARGET_VAULT,
+      client: fakeClient(),
+      now: A_NOW,
+      dryRun: true,
+      disableResearch: false,
+      researchOpts: {
+        competitorAdapter: vi.fn().mockRejectedValue(new Error("network fail")),
+        facebookAdapter: vi.fn().mockRejectedValue(new Error("network fail")),
+        trendsAdapter: vi.fn().mockRejectedValue(new Error("network fail")),
+      },
+    });
+    expect(result.ran).toBe(true);
+
+    const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const rows = db
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'project-audit-completed'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(rows).toHaveLength(1);
+      const p = JSON.parse(rows[0]!.payload) as Record<string, unknown>;
+      // gather returns normally (allSettled absorbs rejections) → researchGatheredAt IS set
+      expect(typeof p["researchGatheredAt"]).toBe("string");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("null-slice placeholders — gather succeeds on bare brain (no brand/fb/keywords), researchGatheredAt set", async () => {
+    seedTransition(sandbox, TARGET_APP, TARGET_VAULT);
+    seedSignal(sandbox, TARGET_APP, TARGET_VAULT);
+    const result = await runProjectAudit({
+      dataDir: sandbox.dataDir,
+      app: TARGET_APP,
+      vault: TARGET_VAULT,
+      client: fakeClient(),
+      now: A_NOW,
+      dryRun: true,
+      disableResearch: false,
+      researchOpts: {},
+    });
+    expect(result.ran).toBe(true);
+
+    const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const rows = db
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'project-audit-completed'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(rows).toHaveLength(1);
+      const p = JSON.parse(rows[0]!.payload) as Record<string, unknown>;
+      // gather succeeds (no adapters called for empty brain) → researchGatheredAt IS set
+      expect(typeof p["researchGatheredAt"]).toBe("string");
+    } finally {
+      db.close();
+    }
   });
 });

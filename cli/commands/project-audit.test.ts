@@ -266,6 +266,31 @@ describe("runProjectAuditCommand", () => {
     }
   });
 
+  it("--no-research skips research — event payload has no researchGatheredAt", async () => {
+    const code = await runProjectAuditCommand(
+      ["--app", TARGET_APP, "--no-research", "--dry-run"],
+      {
+        buildClient: fakeClient,
+        listApps: makeListApps(sandbox, [{ app: TARGET_APP, vault: TARGET_VAULT }]),
+      },
+    );
+    expect(code).toBe(0);
+
+    const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const rows = db
+        .prepare(
+          "SELECT payload FROM events WHERE kind = 'project-audit-completed'",
+        )
+        .all() as Array<{ payload: string }>;
+      expect(rows).toHaveLength(1);
+      const p = JSON.parse(rows[0]!.payload) as Record<string, unknown>;
+      expect("researchGatheredAt" in p).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
   it("--force plumbs through (bypasses no-context when no events in window)", async () => {
     // Remove the seeded events by starting fresh with a new app that has no events
     const FRESH_APP = "fresh-app";
