@@ -1227,3 +1227,162 @@ export async function runPostReviewSurfaceTick(
   }
   return result;
 }
+
+
+// ---------------------------------------------------------------------------
+// PR completion announcements — post a Slack message when Developer
+// finishes an execute fire and opens a PR. Idempotent via a follow-up
+// `slack-pr-announced` event per planId.
+// ---------------------------------------------------------------------------
+
+interface PrAnnouncementCandidate {
+  planId: string;
+  app: string;
+  vault: string;
+  prUrl: string;
+  branch?: string;
+  numTurns?: number;
+}
+
+/**
+ * Finds `plan-executor-fired` events from successful execute fires (mode=execute,
+ * result.done=true, result.prUrl present) for which no `slack-pr-announced`
+ * event has been recorded yet. The announce event acts as the dedup marker.
+ */
+export function findUnannouncedPrCompletions(
+  dbFilePath: string,
+): PrAnnouncementCandidate[] {
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    const fired = db
+      .prepare(
+        "SELECT app_id, vault_id, payload FROM events WHERE kind = 'plan-executor-fired' ORDER BY id ASC",
+      )
+      .all() as Array<{ app_id: string; vault_id: string; payload: string }>;
+    const announced = new Set<string>();
+    const announcedRows = db
+      .prepare(
+        "SELECT payload FROM events WHERE kind = 'slack-pr-announced'",
+      )
+      .all() as Array<{ payload: string }>;
+    for (const r of announcedRows) {
+      try {
+        const p = JSON.parse(r.payload) as { planId?: string };
+        if (p.planId) announced.add(p.planId);
+      } catch {
+        // skip malformed
+      }
+    }
+    const out: PrAnnouncementCandidate[] = [];
+    const seen = new Set<string>();
+    for (const r of fired) {
+      try {
+        const p = JSON.parse(r.payload) as {
+          planId?: string;
+          mode?: string;
+          result?: {
+            done?: boolean;
+            prUrl?: string;
+            branch?: string;
+            numTurns?: number;
+          };
+        };
+        if (p.mode !== "execute") continue;
+        if (!p.planId || !p.result?.done || !p.result.prUrl) continue;
+        if (announced.has(p.planId)) continue;
+        if (seen.has(p.planId)) continue; // only the first qualifying fire per plan
+        seen.add(p.planId);
+        out.push({
+          planId: p.planId,
+          app: r.app_id,
+          vault: r.vault_id,
+          prUrl: p.result.prUrl,
+          ...(p.result.branch !== undefined && { branch: p.result.branch }),
+          ...(p.result.numTurns !== undefined && { numTurns: p.result.numTurns }),
+        });
+      } catch {
+        // skip malformed
+      }
+    }
+    return out;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Posts a single PR-ready message to the inbox channel and records the
+ * `slack-pr-announced` dedup event. Caller is responsible for filtering
+ * already-announced plans (via `findUnannouncedPrCompletions`).
+ */
+export async function announcePrCompletion(
+  ctx: SurfaceContext,
+  candidate: PrAnnouncementCandidate,
+): Promise<{ posted: boolean; messageTs?: string }> {
+  const planRecord = findPlan(ctx.dataDir, candidate.planId);
+  const planTitle =
+    planRecord?.plan.metadata.title ?? candidate.planId;
+  const lines: string[] = [];
+  lines.push(`:tada: *PR ready for review* — ${planTitle}`);
+  lines.push(`• App: \`${candidate.app}\``);
+  if (candidate.branch) lines.push(`• Branch: \`${candidate.branch}\``);
+  if (candidate.numTurns !== undefined) {
+    lines.push(`• Developer turns: ${candidate.numTurns}`);
+  }
+  lines.push(`• ${candidate.prUrl}`);
+
+  const post = await ctx.client.chat.postMessage({
+    channel: ctx.inboxChannelId,
+    text: lines.join("\n"),
+    unfurl_links: true,
+  });
+  if (!post.ok || !post.ts) {
+    return { posted: false };
+  }
+
+  const db = new Database(dbFile(ctx.dataDir));
+  try {
+    appendEvent(db, {
+      appId: candidate.app,
+      vaultId: candidate.vault,
+      kind: "slack-pr-announced",
+      payload: {
+        planId: candidate.planId,
+        channel: ctx.inboxChannelId,
+        messageTs: post.ts,
+        prUrl: candidate.prUrl,
+      },
+    });
+  } finally {
+    db.close();
+  }
+  return { posted: true, messageTs: post.ts };
+}
+
+/**
+ * Tick: announce every PR completion that hasn't been announced yet.
+ * Mirrors the shape of `runSurfaceTick` — one tick walks all candidates,
+ * accumulates errors per planId.
+ */
+export async function runPrAnnouncementTick(
+  ctx: SurfaceContext,
+): Promise<{
+  posted: string[];
+  errors: Array<{ planId: string; error: string }>;
+}> {
+  const candidates = findUnannouncedPrCompletions(dbFile(ctx.dataDir));
+  const posted: string[] = [];
+  const errors: Array<{ planId: string; error: string }> = [];
+  for (const c of candidates) {
+    try {
+      const result = await announcePrCompletion(ctx, c);
+      if (result.posted) posted.push(c.planId);
+    } catch (err) {
+      errors.push({
+        planId: c.planId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return { posted, errors };
+}

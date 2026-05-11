@@ -326,6 +326,32 @@ async function fireDeveloper(
       resume,
       ...(fire.transport !== undefined && { transport: fire.transport }),
     });
+
+    // On a successful execute (Developer opened a PR), return the local
+    // checkout to `main` so the operator's shell doesn't sit on the feature
+    // branch. Failures here are non-fatal — the PR is open regardless.
+    if (result.done && result.prUrl !== undefined) {
+      try {
+        execSync("git checkout main", {
+          cwd: fire.cwd,
+          stdio: "pipe",
+        });
+        fire.ctx.logger.info("plan-executor: checked out main after success", {
+          planId,
+          cwd: fire.cwd,
+        });
+      } catch (err) {
+        fire.ctx.logger.error(
+          "plan-executor: failed to checkout main after success",
+          err,
+          {
+            planId,
+            cwd: fire.cwd,
+          },
+        );
+      }
+    }
+
     return {
       planId,
       app,

@@ -15,6 +15,7 @@ import {
   runEscalationDeliveryTick,
   runPostReviewSurfaceTick,
   runSetupTaskDeliveryTick,
+  runPrAnnouncementTick,
   runSurfaceTick,
   runTriageDeliveryTick,
   type AlertContext,
@@ -225,6 +226,20 @@ export function createSlackService(opts: SlackServiceOptions): DaemonService {
           } catch (err) {
             ctx.logger.error("setup-task delivery tick errored", err);
           }
+        }
+        try {
+          const prAnnouncements = await runPrAnnouncementTick(surfaceCtxFor());
+          if (prAnnouncements.posted.length > 0) {
+            ctx.logger.info("announced PR completions to slack", {
+              count: prAnnouncements.posted.length,
+              planIds: prAnnouncements.posted,
+            });
+          }
+          for (const e of prAnnouncements.errors) {
+            ctx.logger.error("PR announcement failed", null, e);
+          }
+        } catch (err) {
+          ctx.logger.error("PR announcement tick errored", err);
         }
         try {
           const postReview = await runPostReviewSurfaceTick(surfaceCtxFor());
