@@ -6,7 +6,8 @@ import { runDaemon } from "./commands/daemon.ts";
 import { runDiscussCommand } from "./commands/discuss.ts";
 import { runDocs } from "./commands/docs.ts";
 import { runDoctor } from "./commands/doctor.ts";
-import { runFridayAuditCommand } from "./commands/friday-audit.ts";
+import { runDailyAuditCommand } from "./commands/daily-audit.ts";
+import { runProjectAuditCommand } from "./commands/project-audit.ts";
 import { runIdeas } from "./commands/ideas.ts";
 import { runInbox } from "./commands/inbox.ts";
 import { runInstall } from "./commands/install.ts";
@@ -171,13 +172,20 @@ Utilities:
                               transitions, override rate per plan-type,
                               average revise rounds, escalation count,
                               learning-loop activity.
-  friday-audit [--dry-run] [--force] [--format table|json]
-                              Manual trigger for the Strategist Friday
-                              self-audit. Daemon runs hourly; gates
-                              suppress outside Friday + project-throughput
-                              window. --dry-run records the audit but
-                              skips Strategist; --force bypasses
-                              day-of-week + throughput + idempotency.
+  daily-audit [--dry-run] [--force] [--format table|json]
+                              Manual trigger for the Strategist daily
+                              self-audit. Daemon runs hourly; the audit's
+                              own 24h idempotency holds it to once per day.
+                              --dry-run records the audit but skips
+                              Strategist; --force bypasses throughput +
+                              idempotency gates.
+  project-audit --app <name> | --all [--dry-run] [--force]
+                              Daily Strategist audit for each onboarded app
+                              (excluding jarvis). Gates: app-paused, already-
+                              ran-recently (24h), backlog-full (3-plan cap),
+                              no-context (no events in 7d). --force bypasses
+                              app-paused, already-ran-recently, no-context.
+                              --dry-run records event but skips Strategist.
   version                     Print Jarvis version
   help, --help, -h            Show this message
 
@@ -266,8 +274,10 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runUnsuppress(rest);
     case "suppressions":
       return runSuppressions(rest);
-    case "friday-audit":
-      return runFridayAuditCommand(rest);
+    case "daily-audit":
+      return runDailyAuditCommand(rest);
+    case "project-audit":
+      return runProjectAuditCommand(rest);
     case "version":
       return runVersion(rest);
     default:

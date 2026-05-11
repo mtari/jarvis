@@ -477,7 +477,7 @@ You can reorder at any time:
 
 `jarvis` is a project like any other, target backlog depth of 3. But self-improvement generation is **gated on project throughput** — the system should be shipping project work, not burning cycles on itself.
 
-**Rule:** Strategist tops up the `jarvis` backlog on **Fridays**, and only when **at least one project plan has reached `shipped-pending-impact` in the past 7 days**. No project merges that week → skip this week's self-audit.
+**Rule:** Strategist tops up the `jarvis` backlog **daily**, and only when **at least one project plan has reached `shipped-pending-impact` in the past 7 days**. No project merges in the rolling 7-day window → the audit skips with `no-throughput`. Until 2026-05-10 this ran only on Fridays; the day-of-week gate was dropped to give the audit a faster feedback loop. The 24h idempotency window enforces once-per-day cadence regardless of how often the daemon ticks.
 
 **Telemetry exceptions bypass the cadence:** circuit-breaker trip, budget > 80%, or a spike in user-override rate → auto-draft an urgent self-improvement plan immediately, regardless of day.
 
@@ -489,7 +489,8 @@ You can reorder at any time:
 | Scout weekly triage   | Monday 6am                                         | Ranked list → approved picks → app backlogs |
 | User brief            | Anytime                                            | Plan drafted → app backlog                  |
 | Post-merge regression | Analyst mid-window                                 | Rollback plan drafted                       |
-| Friday self-audit     | Friday, gated on project throughput                | Self-improvement plan → `jarvis` backlog    |
+| Daily self-audit      | Daily, gated on project throughput (7-day rolling) | Self-improvement plan → `jarvis` backlog    |
+| Project audit         | Daily, per non-jarvis onboarded app, gated on app status + backlog depth | Improvement plan → app backlog |
 | Telemetry alert       | Any time (circuit break / budget / override spike) | Urgent self-improvement plan                |
 
 ---
@@ -505,7 +506,7 @@ You can reorder at any time:
 - Loads brains (SQLite at `jarvis-data/jarvis.db` + `jarvis-data/brains/*/brain.json`).
 - Opens the Slack Socket Mode WebSocket.
 - Writes `jarvis-data/.daemon.pid` so `yarn jarvis doctor` can detect it.
-- Starts internal schedulers: hourly signal collectors; daily events-to-JSONL export + observation sampling + morning digest; Monday 6am Scout triage; Friday self-audit (gated on project throughput — see §5); weekly Umami data archival to the SQLite event log + suppression-expiry sweep.
+- Starts internal schedulers: hourly signal collectors; daily events-to-JSONL export + observation sampling + morning digest; Monday 6am Scout triage; daily self-audit (gated on 7-day project-throughput window — see §5); daily project-audit per non-jarvis app (gated on app status + backlog depth — see §5); weekly Umami data archival to the SQLite event log + suppression-expiry sweep.
 - Resumes any in-flight plans from `jarvis-data/logs/checkpoints/`.
 - Logs to `jarvis-data/logs/daemon-YYYY-MM-DD.log`.
 
@@ -791,7 +792,7 @@ Every structured user feedback action lands in SQLite (`feedback` table) with `i
 
 **Learning loop — proposal-based, never silent.** Jarvis does not mutate its own prompts, thresholds, or profile state directly from feedback:
 
-1. Analyst runs a periodic pass over `feedback` (weekly during the Friday self-audit, or ad-hoc via `yarn jarvis learn --scan`).
+1. Analyst runs a periodic pass over `feedback` (weekly via the learn-tick service, daily via the self-audit, or ad-hoc via `yarn jarvis learn --scan`).
 2. Detects recurrent patterns: clusters of rejects with the same reason, modification notes that repeat, Socratic answers that consistently contradict agent defaults.
 3. Proposes an improvement plan (type `improvement`, subtype `meta`). The plan's `App:` depends on the target:
    - `user-profile.json` (observedPatterns, preferences, strategies) → `App: jarvis`
@@ -1455,7 +1456,7 @@ Once the code-repo structure is in place, write `jarvis/CLAUDE.md` (the repo-lev
 
 **Note:** self-improvement against `jarvis/` started in Phase 0 (every Phase 0–3 capability you ship is itself a self-improvement plan you reviewed). Phase 4 closes the **autonomous** flywheel — meta plans flowing without you initiating them.
 
-- Friday self-audit (gated on project throughput per §5) running on schedule
+- Daily self-audit (gated on 7-day project throughput per §5) running on schedule
 - Analyst's learning loop on the feedback store running weekly + on-demand (`yarn jarvis learn --scan`)
 - Meta plans flowing for brain / profile / prompt / threshold updates without you prompting them
 - Self-telemetry (plan-success rate, your override rate, escalation frequency, bug rate per shipped plan, context-efficiency, feedback patterns) feeding the proposals
@@ -1633,7 +1634,7 @@ All commands prefixed `yarn jarvis ...`. Grouped by purpose.
 | `feedback`                       | Show recent feedback events. Filters: `--target <plan-id \| agent>`, `--kind <reject \| approve \| answer \| modify \| comment>`, `--since 24h`.       |
 | `feedback forget <id>`           | Mark a feedback entry as excluded from future learning passes (not deleted; auditability preserved).                                                   |
 | `comment --target <id> "<note>"` | Log a free-form feedback entry against a plan, agent, or signal.                                                                                       |
-| `learn --scan`                   | Trigger an ad-hoc pass over the feedback store. Analyst produces improvement plans if patterns warrant. Normally runs weekly in the Friday self-audit. |
+| `learn --scan`                   | Trigger an ad-hoc pass over the feedback store. Analyst produces improvement plans if patterns warrant. Normally runs weekly via the learn-tick service.    |
 | `learn --preview`                | Dry-run — show current feedback clusters and draft plan ideas without creating plans. Useful for sensing whether feedback has been "heard."            |
 
 ### Slack slash equivalents
@@ -1648,6 +1649,8 @@ All commands prefixed `yarn jarvis ...`. Grouped by purpose.
 | `/jarvis scout draft [--threshold N]` | `yarn jarvis scout draft [--threshold N]`                                                                                                                                                                                |
 | `/jarvis ideas add`                 | `yarn jarvis ideas add` — opens a thread; each thread reply is one user answer. Saves to `Business_Ideas.md` when the agent emits `<idea>`. Persistence: `idea-intake-started` / `idea-intake-message` / `idea-intake-closed` events. |
 | `/jarvis ideas list`                | `yarn jarvis ideas list` — ephemeral message, mrkdwn formatting.                                                                                                                                                          |
+| `/jarvis daily-audit [--dry-run] [--force]` | `yarn jarvis daily-audit ...` — manually fires the audit. Daemon already runs it once per day; this is for testing the gates or seeing the bundled brief.                                                          |
+| `/jarvis project-audit --app <name> \| --all [--dry-run] [--force]` | `yarn jarvis project-audit ...` — manually fires the per-app project audit. Daemon runs hourly; each app's 24h idempotency gate enforces once-per-day. `--app` targets one app; `--all` runs all non-jarvis apps. `--dry-run` records event but skips Strategist; `--force` bypasses app-paused, already-ran-recently, and no-context gates. |
 | `/jarvis notes <app> <text>`        | `yarn jarvis notes <app> --append "<text>"`                                                                                                                                                                               |
 | `/jarvis ask "<text>"`              | `yarn jarvis ask "<text>"`                                                                                                                                                                                                |
 | `/jarvis discuss <app> "<topic>"`   | `yarn jarvis discuss --app <app> "<topic>"` — opens a thread; replies become user turns. Shares the `app.message` thread router with `ideas add`.                                                                         |

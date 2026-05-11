@@ -39,6 +39,10 @@ import {
   scoreUnscoredIdeas,
 } from "../../agents/scout.ts";
 import {
+  runDailyAudit,
+  type DailyAuditResult,
+} from "../../agents/strategist-daily-audit.ts";
+import {
   buildInboxSummaryText,
   buildOnDemandTriageBlocks,
   formatDraftResults,
@@ -704,6 +708,8 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
         });
         return;
       }
+      case "daily-audit":
+        return runSlashDailyAudit(parts.slice(1), ctx, respond);
       case "notes":
         return runSlashNotes(parts.slice(1), ctx, respond, command);
       case "ask":
@@ -713,7 +719,7 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       default:
         await respond({
           response_type: "ephemeral",
-          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`ideas list\`, \`notes\`, \`ask\`, \`discuss\`.`,
+          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`ideas list\`, \`daily-audit\`, \`notes\`, \`ask\`, \`discuss\`.`,
         });
     }
   });
@@ -876,6 +882,7 @@ const SLASH_USAGE = [
   "• `/jarvis scout draft [--threshold N] [--vault <v>]` — auto-draft plans from high-scoring ideas",
   "• `/jarvis ideas add [--vault <v>]` — capture a new idea via thread interview, append to `Business_Ideas.md`",
   "• `/jarvis ideas list [--vault <v>]` — show every idea with its score (high → low, then unscored)",
+  "• `/jarvis daily-audit [--dry-run] [--force]` — manually fire the daily self-audit (daemon already runs it once per day)",
   "• `/jarvis notes <app> <text>` — append a free-text note read by Strategist / Scout / Developer",
   "• `/jarvis ask <text>` — natural-language router into the right Jarvis command",
   "• `/jarvis discuss <app> <topic>` — open a multi-turn co-owner conversation in a thread",
@@ -1009,6 +1016,84 @@ async function runSlashTriage(
       }`,
     });
   }
+}
+
+async function runSlashDailyAudit(
+  args: string[],
+  ctx: HandlerContext,
+  respond: SlashRespond,
+): Promise<void> {
+  // Light flag parsing — only --dry-run and --force.
+  let dryRun = false;
+  let force = false;
+  for (const a of args) {
+    if (a === "--dry-run") dryRun = true;
+    else if (a === "--force") force = true;
+  }
+
+  await respond({
+    response_type: "ephemeral",
+    text: ":calendar: Running daily self-audit…",
+  });
+
+  let result: DailyAuditResult;
+  try {
+    result = await runDailyAudit({
+      dataDir: ctx.dataDir,
+      client: ctx.getAnthropicClient(),
+      ...(dryRun && { dryRun: true }),
+      ...(force && { force: true }),
+    });
+  } catch (err) {
+    ctx.logError("/jarvis daily-audit failed", err, { dryRun, force });
+    await respond({
+      response_type: "ephemeral",
+      text: `✗ Daily audit failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    });
+    return;
+  }
+
+  ctx.log("daily-audit via slack", {
+    dryRun,
+    force,
+    ran: result.ran,
+    ...(result.skipReason !== undefined && { skipReason: result.skipReason }),
+    drafted: result.drafted.length,
+    errors: result.errors.length,
+  });
+
+  await respond({
+    response_type: "ephemeral",
+    text: formatDailyAuditResult(result),
+  });
+}
+
+function formatDailyAuditResult(result: DailyAuditResult): string {
+  const lines: string[] = [];
+  if (!result.ran) {
+    lines.push(`:fast_forward: *Daily audit skipped* — \`${result.skipReason}\``);
+    lines.push(`• \`jarvis\` backlog depth: ${result.backlogDepth}`);
+    lines.push(`• Project shipments (last 7d): ${result.projectShipments}`);
+    return lines.join("\n");
+  }
+  lines.push(":white_check_mark: *Daily audit ran*");
+  lines.push(`• \`jarvis\` backlog depth (before): ${result.backlogDepth}`);
+  lines.push(`• Project shipments (last 7d): ${result.projectShipments}`);
+  if (result.drafted.length === 0) {
+    lines.push("• Drafted: _(none — dry-run or no slots)_");
+  } else {
+    lines.push(`• Drafted ${result.drafted.length} plan(s):`);
+    for (const d of result.drafted) {
+      lines.push(`    • \`${d.planId}\``);
+    }
+  }
+  if (result.errors.length > 0) {
+    lines.push("• Errors:");
+    for (const e of result.errors) lines.push(`    • ${e}`);
+  }
+  return lines.join("\n");
 }
 
 async function runSlashScoutScore(

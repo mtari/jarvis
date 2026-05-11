@@ -72,7 +72,11 @@ export class DeveloperError extends Error {
   }
 }
 
-const DEFAULT_MAX_TURNS_DRAFT_IMPL = 30;
+// Draft-impl needs headroom to read existing files for grounding (each
+// Read/Glob/Grep counts as one SDK turn). 30 was tight for plans that
+// reference many existing modules; matching execute's 60 gives a safe
+// ceiling without uncapping the loop.
+const DEFAULT_MAX_TURNS_DRAFT_IMPL = 60;
 const DEFAULT_MAX_TURNS_EXECUTE = 60;
 
 // ---------- Mode A: draft implementation plan ----------

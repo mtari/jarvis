@@ -13,7 +13,7 @@ import {
   type ConsoleSilencer,
   type InstallSandbox,
 } from "./_test-helpers.ts";
-import { runFridayAuditCommand } from "./friday-audit.ts";
+import { runDailyAuditCommand } from "./daily-audit.ts";
 
 const PLAN_RESPONSE = `<plan>
 # Plan: Tighten Strategist scope rule
@@ -107,7 +107,7 @@ function seedSignal(sandbox: InstallSandbox): void {
   }
 }
 
-describe("runFridayAuditCommand", () => {
+describe("runDailyAuditCommand", () => {
   let sandbox: InstallSandbox;
   let silencer: ConsoleSilencer;
   let logSpy: ReturnType<typeof vi.spyOn>;
@@ -127,8 +127,8 @@ describe("runFridayAuditCommand", () => {
     sandbox.cleanup();
   });
 
-  it("prints a skip report when not Friday and no throughput", async () => {
-    const code = await runFridayAuditCommand([], {
+  it("prints a skip report when there's been no project throughput", async () => {
+    const code = await runDailyAuditCommand([], {
       buildClient: fakeClient,
       now: new Date("2026-05-05T12:00:00.000Z"),
     });
@@ -136,13 +136,13 @@ describe("runFridayAuditCommand", () => {
     const out = logSpy.mock.calls
       .map((c: unknown[]) => String(c[0]))
       .join("\n");
-    expect(out).toContain("Friday audit skipped");
-    expect(out).toContain("not-friday");
+    expect(out).toContain("Daily audit skipped");
+    expect(out).toContain("no-throughput");
   });
 
   it("--force --dry-run runs without drafting", async () => {
     seedSignal(sandbox);
-    const code = await runFridayAuditCommand(["--force", "--dry-run"], {
+    const code = await runDailyAuditCommand(["--force", "--dry-run"], {
       buildClient: fakeClient,
       now: A_FRIDAY,
     });
@@ -150,13 +150,13 @@ describe("runFridayAuditCommand", () => {
     const out = logSpy.mock.calls
       .map((c: unknown[]) => String(c[0]))
       .join("\n");
-    expect(out).toContain("Friday audit ran");
+    expect(out).toContain("Daily audit ran");
     expect(out).toContain("(none — dry-run or no slots)");
   });
 
   it("--force drafts a plan when signal is present", async () => {
     seedSignal(sandbox);
-    const code = await runFridayAuditCommand(["--force"], {
+    const code = await runDailyAuditCommand(["--force"], {
       buildClient: fakeClient,
       now: A_FRIDAY,
     });
@@ -173,7 +173,7 @@ describe("runFridayAuditCommand", () => {
       .spyOn(process.stdout, "write")
       .mockImplementation((() => true) as typeof process.stdout.write);
     try {
-      const code = await runFridayAuditCommand(
+      const code = await runDailyAuditCommand(
         ["--force", "--format", "json"],
         {
           buildClient: fakeClient,
@@ -196,7 +196,7 @@ describe("runFridayAuditCommand", () => {
   });
 
   it("rejects invalid --format", async () => {
-    const code = await runFridayAuditCommand(["--format", "xml"], {
+    const code = await runDailyAuditCommand(["--format", "xml"], {
       buildClient: fakeClient,
       now: A_FRIDAY,
     });
@@ -204,7 +204,7 @@ describe("runFridayAuditCommand", () => {
   });
 
   it("rejects unknown options", async () => {
-    const code = await runFridayAuditCommand(["--bogus"], {
+    const code = await runDailyAuditCommand(["--bogus"], {
       buildClient: fakeClient,
       now: A_FRIDAY,
     });
