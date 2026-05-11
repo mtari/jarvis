@@ -22,7 +22,9 @@ import { findPlan } from "../../orchestrator/plan-store.ts";
 import {
   assertCleanMain,
   createPlanExecutorService,
+  findOrphanedClaims,
   readFiredPlanIds,
+  recoverOrphanedClaims,
   runPlanExecutorTick,
 } from "./service.ts";
 import type { DaemonContext } from "../../cli/commands/daemon.ts";
@@ -771,6 +773,145 @@ describe("plan-executor execute-queue", () => {
     } finally {
       repo.cleanup();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findOrphanedClaims + recoverOrphanedClaims + startup sweep integration
+// ---------------------------------------------------------------------------
+
+describe("plan-executor orphaned-claim recovery", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  let db: Database.Database;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    db = new Database(dbFile(sandbox.dataDir));
+  });
+
+  afterEach(() => {
+    db.close();
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function writeFired(payload: Record<string, unknown>): void {
+    db.prepare(
+      "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(
+      payload["app"] ?? "jarvis",
+      "personal",
+      "plan-executor-fired",
+      JSON.stringify(payload),
+      new Date().toISOString(),
+    );
+  }
+
+  it("findOrphanedClaims: claim followed by a result row → 0 orphans", () => {
+    writeFired({
+      planId: "p-followed",
+      app: "jarvis",
+      mode: "skipped",
+      reason: "claimed; result pending",
+    });
+    writeFired({
+      planId: "p-followed",
+      app: "jarvis",
+      mode: "execute",
+      durationMs: 1000,
+      result: { done: true },
+    });
+    expect(findOrphanedClaims(dbFile(sandbox.dataDir))).toHaveLength(0);
+  });
+
+  it("findOrphanedClaims: claim with no follow-up → 1 orphan", () => {
+    writeFired({
+      planId: "p-orphan",
+      app: "jarvis",
+      mode: "skipped",
+      reason: "claimed; result pending",
+    });
+    const orphans = findOrphanedClaims(dbFile(sandbox.dataDir));
+    expect(orphans).toHaveLength(1);
+    expect(orphans[0]?.planId).toBe("p-orphan");
+    expect(orphans[0]?.app).toBe("jarvis");
+  });
+
+  it("findOrphanedClaims: mixed plans — one followed, one orphaned → 1 orphan", () => {
+    // Plan A: claim + result (not orphaned)
+    writeFired({
+      planId: "p-a",
+      app: "jarvis",
+      mode: "skipped",
+      reason: "claimed; result pending",
+    });
+    writeFired({
+      planId: "p-a",
+      app: "jarvis",
+      mode: "draft-impl",
+      durationMs: 500,
+      result: { numTurns: 3 },
+    });
+    // Plan B: claim only (orphaned)
+    writeFired({
+      planId: "p-b",
+      app: "jarvis",
+      mode: "skipped",
+      reason: "claimed; result pending",
+    });
+    const orphans = findOrphanedClaims(dbFile(sandbox.dataDir));
+    expect(orphans).toHaveLength(1);
+    expect(orphans[0]?.planId).toBe("p-b");
+  });
+
+  it("recoverOrphanedClaims: writes claim-recovered event; planId absent from readFiredPlanIds", () => {
+    writeFired({
+      planId: "p-stuck",
+      app: "jarvis",
+      mode: "skipped",
+      reason: "claimed; result pending",
+    });
+
+    // Before recovery the plan is locked
+    expect(readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-stuck")).toBe(true);
+
+    const logged: string[] = [];
+    const logger = {
+      ...fakeDaemonCtx().logger,
+      info: (msg: string) => { logged.push(msg); },
+    };
+    recoverOrphanedClaims(dbFile(sandbox.dataDir), logger);
+
+    // Recovery event was appended → plan is no longer locked
+    expect(readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-stuck")).toBe(false);
+    // Logger fired once for the recovered orphan
+    expect(logged.filter((m) => m.includes("recovered orphaned claim"))).toHaveLength(1);
+  });
+
+  it("createPlanExecutorService.start() recovers orphaned claim making planId eligible for re-fire", async () => {
+    writeFired({
+      planId: "p-refire",
+      app: "jarvis",
+      mode: "skipped",
+      reason: "claimed; result pending",
+    });
+
+    // Confirm stuck before start()
+    expect(readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-refire")).toBe(true);
+
+    const service = createPlanExecutorService({
+      dataDir: sandbox.dataDir,
+      tickMs: 60_000,
+      _tickBody: async () => {},
+    });
+
+    service.start(fakeDaemonCtx());
+    service.stop();
+
+    // After start() the recovery event has been appended synchronously
+    expect(readFiredPlanIds(dbFile(sandbox.dataDir)).has("p-refire")).toBe(false);
   });
 });
 

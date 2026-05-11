@@ -55,10 +55,99 @@ export interface PlanExecutorOptions {
 interface FiredPayload {
   planId: string;
   app: string;
-  mode: "draft-impl" | "execute" | "not-runnable" | "skipped";
+  mode: "draft-impl" | "execute" | "not-runnable" | "skipped" | "claim-recovered";
   reason?: string;
   result?: Record<string, unknown>;
   durationMs?: number;
+  priorClaimEventId?: number;
+}
+
+interface OrphanedClaim {
+  eventId: number;
+  planId: string;
+  app: string;
+  vaultId: string;
+  claimedAt: string;
+}
+
+/**
+ * Returns claim rows that have no later plan-executor-fired event for the
+ * same planId. These arise when the daemon is killed between writing the
+ * claim and writing the result — the plan stays stuck in "executing" until
+ * the executor rewrites a recovery event.
+ */
+export function findOrphanedClaims(dbFilePath: string): OrphanedClaim[] {
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    const rows = db
+      .prepare(
+        `SELECT e.id AS eventId,
+                json_extract(e.payload, '$.planId') AS planId,
+                e.app_id AS app,
+                e.vault_id AS vaultId,
+                e.created_at AS claimedAt
+         FROM events e
+         WHERE e.kind = 'plan-executor-fired'
+           AND json_extract(e.payload, '$.mode') = 'skipped'
+           AND json_extract(e.payload, '$.reason') = 'claimed; result pending'
+           AND NOT EXISTS (
+             SELECT 1 FROM events e2
+             WHERE e2.kind = 'plan-executor-fired'
+               AND json_extract(e2.payload, '$.planId') = json_extract(e.payload, '$.planId')
+               AND e2.id > e.id
+           )`,
+      )
+      .all() as Array<{
+        eventId: number;
+        planId: string;
+        app: string;
+        vaultId: string;
+        claimedAt: string;
+      }>;
+    return rows.filter((r) => r.planId != null);
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * For each orphaned claim, appends a plan-executor-fired event with
+ * mode = 'claim-recovered' so the planId re-enters the eligibility set
+ * on the next tick. Logs one info line per recovered orphan; emits nothing
+ * when the sweep finds zero.
+ */
+export function recoverOrphanedClaims(
+  dbFilePath: string,
+  logger: DaemonContext["logger"],
+): void {
+  const orphans = findOrphanedClaims(dbFilePath);
+  if (orphans.length === 0) return;
+
+  const recoveredAt = new Date().toISOString();
+  const db = new Database(dbFilePath);
+  try {
+    for (const orphan of orphans) {
+      appendEvent(db, {
+        appId: orphan.app,
+        vaultId: orphan.vaultId,
+        kind: "plan-executor-fired",
+        payload: {
+          planId: orphan.planId,
+          app: orphan.app,
+          mode: "claim-recovered",
+          reason: `orphaned by daemon restart at ${recoveredAt}`,
+          priorClaimEventId: orphan.eventId,
+        } satisfies FiredPayload,
+      });
+      logger.info("plan-executor: recovered orphaned claim", {
+        planId: orphan.planId,
+        claimedAt: orphan.claimedAt,
+        priorClaimEventId: orphan.eventId,
+      });
+    }
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -99,6 +188,10 @@ export function assertCleanMain(root?: string): void {
  * forever and the user has to delete events from jarvis.db by hand.
  */
 function isFinalFiredEvent(p: FiredPayload): boolean {
+  if (p.mode === "claim-recovered") {
+    // Recovery event written by startup sweep — plan re-enters eligibility.
+    return false;
+  }
   if (p.mode === "skipped") {
     // The only skipped row that locks is the in-flight claim written
     // before the fire. Every other "skipped" reason is a refusal whose
@@ -119,23 +212,28 @@ function isFinalFiredEvent(p: FiredPayload): boolean {
 
 /**
  * Returns the set of plan ids that have a *terminal* `plan-executor-fired`
- * event recorded. Used to keep the auto-fire idempotent across ticks while
- * letting plans whose only previous fire was a recoverable refusal re-fire
- * once the condition resolves. See `isFinalFiredEvent`.
+ * event recorded. Events are processed in insertion order; a
+ * `claim-recovered` event removes its planId from the set so the plan
+ * re-enters the eligibility set on the next tick. See `isFinalFiredEvent`.
  */
 export function readFiredPlanIds(dbFilePath: string): Set<string> {
   const db = new Database(dbFilePath, { readonly: true });
   try {
     const rows = db
       .prepare(
-        "SELECT payload FROM events WHERE kind = 'plan-executor-fired'",
+        "SELECT payload FROM events WHERE kind = 'plan-executor-fired' ORDER BY id ASC",
       )
       .all() as Array<{ payload: string }>;
     const ids = new Set<string>();
     for (const r of rows) {
       try {
         const p = JSON.parse(r.payload) as FiredPayload;
-        if (p.planId && isFinalFiredEvent(p)) ids.add(p.planId);
+        if (!p.planId) continue;
+        if (p.mode === "claim-recovered") {
+          ids.delete(p.planId);
+        } else if (isFinalFiredEvent(p)) {
+          ids.add(p.planId);
+        }
       } catch {
         // malformed → skip
       }
@@ -532,6 +630,8 @@ export function createPlanExecutorService(
   return {
     name: "plan-executor",
     start(ctx: DaemonContext): void {
+      recoverOrphanedClaims(dbFile(opts.dataDir), ctx.logger);
+
       const tickFn = async (): Promise<void> => {
         if (tickInFlight) {
           return;
