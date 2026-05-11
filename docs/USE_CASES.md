@@ -91,7 +91,7 @@ Format: **User wants to X.** Constraint or context.
 ## Self-improvement
 
 54. **Daily self-audit runs.** Strategist tops up `jarvis` improvement backlog IF ≥1 project plan shipped in the past 7 days. The daemon ticks hourly; the audit's 24h idempotency window holds it to one effective run per day. (Was Friday-only until 2026-05-10.)
-54a. **Jarvis runs a daily project audit for each onboarded app.** For every non-jarvis app, Strategist reviews plan-transition events and signals from the past 7 days and drafts at most one improvement plan if the app backlog is below the 3-plan cap. Gates: app status not paused/maintenance, no prior audit in the past 24h, no more than 2 eligible plans already queued.
+54a. **Jarvis runs a daily project audit for each onboarded app.** For every non-jarvis app, Strategist reviews plan-transition events and signals from the past 7 days and drafts at most one improvement plan if the app backlog is below the 3-plan cap. Gates: app status not paused/maintenance, no prior audit in the past 24h, no more than 2 eligible plans already queued. External research (competitor snapshots, Facebook Insights, Google Trends) is gathered per-project into a `ProjectResearchBundle` and folded into the audit context bundle (Phase C).
 55. **Telemetry trips an alert.** Circuit breaker / budget / override spike → urgent self-improvement plan drafted immediately.
 56. **User wants Jarvis to fix itself.** `plan --app jarvis "brief"` — same flow as app improvements.
 57. **Jarvis ships a PR against its own code.** Reviewed + merged by you; tagged post-merge.
