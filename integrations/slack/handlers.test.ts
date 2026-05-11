@@ -9,7 +9,7 @@ import {
   type ConsoleSilencer,
   type InstallSandbox,
 } from "../../cli/commands/_test-helpers.ts";
-import { brainDir, brainFile, checkpointsDir, dbFile, logsDir } from "../../cli/paths.ts";
+import { brainDir, brainFile, checkpointsDir, daemonPidFile, dbFile, logsDir } from "../../cli/paths.ts";
 import { todayLogPath } from "../../cli/commands/logs.ts";
 import { saveBrain } from "../../orchestrator/brain.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
@@ -883,3 +883,88 @@ describe("/jarvis logs slash command", () => {
 // Reference logsDir so the import isn't unused — runtime is otherwise covered
 // via todayLogPath in the runSlashLogs production path.
 void logsDir;
+
+// ---------------------------------------------------------------------------
+// /jarvis status slash command
+// ---------------------------------------------------------------------------
+
+describe("/jarvis status slash command", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("running daemon shows pid", async () => {
+    const pidPath = daemonPidFile(sandbox.dataDir);
+    fs.writeFileSync(
+      pidPath,
+      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
+    );
+
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string; response_type?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "status" },
+      respond: async (args) => { responds.push(args); },
+    });
+
+    expect(responds).toHaveLength(1);
+    expect(responds[0]?.response_type).toBe("ephemeral");
+    const text = responds[0]?.text ?? "";
+    expect(text).toContain("running");
+    expect(text).toContain(String(process.pid));
+  });
+
+  it("stopped daemon shows stopped", async () => {
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "status" },
+      respond: async (args) => { responds.push(args); },
+    });
+
+    expect(responds[0]?.text).toContain("stopped");
+  });
+
+  it("plan counts by status are shown", async () => {
+    dropPlan(sandbox, "2026-04-01-a1", { status: "awaiting-review" });
+    dropPlan(sandbox, "2026-04-01-a2", { status: "awaiting-review" });
+    dropPlan(sandbox, "2026-04-01-b1", { status: "approved" });
+
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "status" },
+      respond: async (args) => { responds.push(args); },
+    });
+
+    const text = responds[0]?.text ?? "";
+    expect(text).toContain("2 awaiting-review");
+    expect(text).toContain("1 approved");
+  });
+
+  it("empty state — no crash, all sections present, no null/undefined", async () => {
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "status" },
+      respond: async (args) => { responds.push(args); },
+    });
+
+    const text = responds[0]?.text ?? "";
+    expect(text).not.toContain("undefined");
+    expect(text).not.toContain("null");
+    expect(text).toContain("Daemon:");
+    expect(text).toContain("Plans:");
+    expect(text).toContain("Last transitions:");
+    expect(text).toContain("Last agent call:");
+    expect(text).toContain("Calls today:");
+  });
+});
