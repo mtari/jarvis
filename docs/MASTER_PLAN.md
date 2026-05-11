@@ -1660,6 +1660,14 @@ All commands prefixed `yarn jarvis ...`. Grouped by purpose.
 | Setup-task buttons in Slack         | `setup --done`, `setup --skip`                                                                                                                                                                                            |
 | Suppression-digest buttons          | `unblock`                                                                                                                                                                                                                 |
 
+### Daemon self-recovery
+
+On each startup the plan-executor service sweeps the SQLite `events` table for **orphaned claims** — rows where `kind = 'plan-executor-fired'`, `mode = 'skipped'`, `reason = 'claimed; result pending'`, and no later `plan-executor-fired` row exists for the same planId. These arise when the daemon is killed between writing the claim and writing the result, leaving a plan permanently stuck in `executing`.
+
+For each orphan found, the service appends a `plan-executor-fired` event with `mode = 'claim-recovered'`. This removes the plan from the fired-ids set so it is re-eligible on the next tick without any manual `DELETE` on the `events` table.
+
+Log line: `plan-executor: recovered orphaned claim` (one per orphan; nothing emitted when the sweep finds zero).
+
 ---
 
 ## 18. Resource model
