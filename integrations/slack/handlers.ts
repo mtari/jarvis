@@ -18,6 +18,8 @@ import {
 import Database from "better-sqlite3";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { interpretAsk } from "../../cli/commands/ask.ts";
+import { todayLogPath } from "../../cli/commands/logs.ts";
+import fs from "node:fs";
 import { appendNote } from "../../orchestrator/notes.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
 import {
@@ -717,6 +719,8 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
         return runSlashDailyAudit(parts.slice(1), ctx, respond);
       case "project-audit":
         return runSlashProjectAudit(parts.slice(1), ctx, respond);
+      case "logs":
+        return runSlashLogs(parts.slice(1), ctx, respond);
       case "notes":
         return runSlashNotes(parts.slice(1), ctx, respond, command);
       case "ask":
@@ -726,7 +730,7 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       default:
         await respond({
           response_type: "ephemeral",
-          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`ideas list\`, \`daily-audit\`, \`project-audit\`, \`notes\`, \`ask\`, \`discuss\`.`,
+          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`ideas list\`, \`daily-audit\`, \`project-audit\`, \`logs\`, \`notes\`, \`ask\`, \`discuss\`.`,
         });
     }
   });
@@ -891,6 +895,7 @@ const SLASH_USAGE = [
   "• `/jarvis ideas list [--vault <v>]` — show every idea with its score (high → low, then unscored)",
   "• `/jarvis daily-audit [--dry-run] [--force]` — manually fire the daily self-audit (daemon already runs it once per day)",
   "• `/jarvis project-audit --app <name> | --all [--dry-run] [--force] [--no-research]` — manually fire per-app project audit",
+  "• `/jarvis logs [--lines N]` — snapshot of last N lines of today's daemon log (default 50, max 200)",
   "• `/jarvis notes <app> <text>` — append a free-text note read by Strategist / Scout / Developer",
   "• `/jarvis ask <text>` — natural-language router into the right Jarvis command",
   "• `/jarvis discuss <app> <topic>` — open a multi-turn co-owner conversation in a thread",
@@ -1240,6 +1245,72 @@ function formatProjectAuditResult(app: string, result: ProjectAuditResult): stri
     for (const e of result.errors) lines.push(`    • ${e}`);
   }
   return lines.join("\n");
+}
+
+const LOGS_DEFAULT_LINES = 50;
+const LOGS_MAX_LINES = 200;
+// Slack ephemeral text caps at ~40k chars; leave headroom for the code-fence
+// wrapper and the truncation notice.
+const LOGS_MAX_BODY_CHARS = 35_000;
+
+async function runSlashLogs(
+  args: string[],
+  ctx: HandlerContext,
+  respond: SlashRespond,
+): Promise<void> {
+  let lines = LOGS_DEFAULT_LINES;
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === "--lines" && args[i + 1]) {
+      const parsed = Number.parseInt(args[i + 1]!, 10);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        await respond({
+          response_type: "ephemeral",
+          text: `Invalid --lines value \`${args[i + 1]}\` — must be a positive integer.`,
+        });
+        return;
+      }
+      lines = Math.min(parsed, LOGS_MAX_LINES);
+      i += 1;
+    }
+  }
+
+  const logFile = todayLogPath(ctx.dataDir);
+  if (!fs.existsSync(logFile)) {
+    await respond({
+      response_type: "ephemeral",
+      text: `:warning: Today's daemon log not found at \`${logFile}\`. The daemon may not have started yet.`,
+    });
+    return;
+  }
+
+  let body: string;
+  try {
+    const text = fs.readFileSync(logFile, "utf8");
+    const allLines = text.split("\n").filter((l) => l.length > 0);
+    body = allLines.slice(-lines).join("\n");
+  } catch (err) {
+    await respond({
+      response_type: "ephemeral",
+      text: `:x: Failed to read log file: ${err instanceof Error ? err.message : String(err)}`,
+    });
+    return;
+  }
+
+  let truncationNotice = "";
+  if (body.length > LOGS_MAX_BODY_CHARS) {
+    body = body.slice(body.length - LOGS_MAX_BODY_CHARS);
+    // Drop any partial line at the start so the head isn't a half-line.
+    const firstNewline = body.indexOf("\n");
+    if (firstNewline > 0) body = body.slice(firstNewline + 1);
+    truncationNotice =
+      "_…older lines truncated to fit Slack's message limit._\n";
+  }
+
+  const header = `:scroll: Last ${lines} line(s) of \`${logFile.split("/").pop()}\`:`;
+  await respond({
+    response_type: "ephemeral",
+    text: `${header}\n${truncationNotice}\`\`\`\n${body}\n\`\`\``,
+  });
 }
 
 async function runSlashScoutScore(

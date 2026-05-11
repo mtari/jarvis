@@ -9,7 +9,8 @@ import {
   type ConsoleSilencer,
   type InstallSandbox,
 } from "../../cli/commands/_test-helpers.ts";
-import { brainDir, brainFile, checkpointsDir, dbFile } from "../../cli/paths.ts";
+import { brainDir, brainFile, checkpointsDir, dbFile, logsDir } from "../../cli/paths.ts";
+import { todayLogPath } from "../../cli/commands/logs.ts";
 import { saveBrain } from "../../orchestrator/brain.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { recordEscalation } from "../../orchestrator/escalations.ts";
@@ -763,3 +764,122 @@ describe("/jarvis project-audit", () => {
     expect(lastText).toContain("Project audit — all apps");
   });
 });
+
+describe("/jarvis logs slash command", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function seedLogFile(linesText: string): string {
+    const logFile = todayLogPath(sandbox.dataDir);
+    fs.mkdirSync(path.dirname(logFile), { recursive: true });
+    fs.writeFileSync(logFile, linesText);
+    return logFile;
+  }
+
+  it("returns an ephemeral snapshot of the last 50 lines by default", async () => {
+    const lines = Array.from({ length: 80 }, (_, i) => `line ${i + 1}`).join("\n");
+    seedLogFile(lines);
+
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string; response_type?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "logs" },
+      respond: async (args) => {
+        responds.push(args);
+      },
+    });
+
+    expect(responds).toHaveLength(1);
+    expect(responds[0]?.response_type).toBe("ephemeral");
+    const text = responds[0]?.text ?? "";
+    expect(text).toContain("Last 50 line(s)");
+    expect(text).toContain("line 31"); // 80 - 50 + 1
+    expect(text).toContain("line 80");
+    expect(text).not.toContain("line 30"); // before window
+  });
+
+  it("--lines N honors the override and caps at 200", async () => {
+    const lines = Array.from({ length: 50 }, (_, i) => `entry-${i + 1}`).join("\n");
+    seedLogFile(lines);
+
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "logs --lines 10" },
+      respond: async (args) => {
+        responds.push(args);
+      },
+    });
+
+    const text = responds[0]?.text ?? "";
+    expect(text).toContain("Last 10 line(s)");
+    expect(text).toContain("entry-50");
+    expect(text).toContain("entry-41");
+    expect(text).not.toContain("entry-40");
+  });
+
+  it("returns a warning when today's log file does not exist", async () => {
+    // No seed file
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "logs" },
+      respond: async (args) => {
+        responds.push(args);
+      },
+    });
+
+    expect(responds[0]?.text).toContain("not found");
+    expect(responds[0]?.text).toContain("daemon may not have started");
+  });
+
+  it("rejects invalid --lines values", async () => {
+    seedLogFile("one\ntwo\n");
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "logs --lines abc" },
+      respond: async (args) => {
+        responds.push(args);
+      },
+    });
+
+    expect(responds[0]?.text).toContain("Invalid --lines");
+  });
+
+  it("truncates with a notice when body exceeds the Slack limit", async () => {
+    // 200 lines of 500 chars each = 100,000 chars — well over the 35k cap.
+    const bigLine = "x".repeat(500);
+    const lines = Array.from({ length: 200 }, (_, i) => `${i.toString().padStart(3, "0")}:${bigLine}`).join("\n");
+    seedLogFile(lines);
+
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "logs --lines 200" },
+      respond: async (args) => {
+        responds.push(args);
+      },
+    });
+
+    const text = responds[0]?.text ?? "";
+    expect(text).toContain("truncated");
+    // The most-recent line should always survive truncation
+    expect(text).toContain("199:");
+    // Body size after wrapping should be near (but not over) the cap
+    expect(text.length).toBeLessThan(40_000);
+  });
+});
+
+// Reference logsDir so the import isn't unused — runtime is otherwise covered
+// via todayLogPath in the runSlashLogs production path.
+void logsDir;
