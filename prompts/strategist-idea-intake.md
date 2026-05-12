@@ -50,6 +50,7 @@ Hard rules:
 - The `<idea>` block is emitted exactly once, at the end.
 - `Title`, `App`, and `Brief` are required. Tags + body are optional but the body should almost always be present — Scout uses it heavily.
 - `App` matches an existing tracked app (look at the list passed in STATE) or is the literal string `new`.
+- When the user's brief contains identifiers that look similar but differ structurally (app slug like foo-bar vs domain like foo.bar), reproduce them exactly as given in the brief; never substitute one form for the other.
 
 ## State you receive each turn
 

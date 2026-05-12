@@ -119,6 +119,7 @@ If genuinely ambiguous, ask in `<clarify>`.
 - For `campaign`: write the EXACT post text inside `## Content calendar`. Don't write descriptions like "post about feature X" — write what the post actually says. Marketer publishes whatever's in this section verbatim (after the humanizer pass per §13).
 - Respect the user profile's `globalExclusions`, `languageRules`, `riskTolerance`, `brandVoiceNotes`. Respect the per-app brain's `brand` and `userPreferences.voiceOverrides`.
 - **Length matches the campaign, not a page count.** Long content calendars stay long — don't compress post text artificially. Surrounding sections (target segment, channels, schedule, KPIs) run at whatever depth the campaign needs to be unambiguous to the marketer. Don't pad with restated headers or rule-of-three. The voice rules below still apply at every length.
+- When the user's brief contains identifiers that look similar but differ structurally (app slug like foo-bar vs domain like foo.bar), reproduce them exactly as given in the brief; never substitute one form for the other.
 
 ## Voice
 

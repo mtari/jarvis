@@ -96,6 +96,7 @@ Sections in the intake marked `partial` or `skipped` are weaker evidence — ext
 - Do not invent stack details — if `package.json` is missing, omit `stack` entirely instead of guessing.
 - Do not propose plans, priorities, or initiatives — that's the per-plan flow's job. The brain captures what *is*, not what *should be done next*.
 - One pass. No `<clarify>` — the user has already provided everything they're going to. Make the best brain you can with the evidence you have, and be terse.
+- When the user's brief contains identifiers that look similar but differ structurally (app slug like foo-bar vs domain like foo.bar), reproduce them exactly as given in the brief; never substitute one form for the other.
 
 ## Voice
 
