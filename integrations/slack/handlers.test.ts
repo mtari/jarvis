@@ -9,7 +9,12 @@ import {
   type ConsoleSilencer,
   type InstallSandbox,
 } from "../../cli/commands/_test-helpers.ts";
-import { brainDir, brainFile, checkpointsDir, daemonPidFile, dbFile, logsDir } from "../../cli/paths.ts";
+import { brainDir, brainFile, businessIdeasFile, checkpointsDir, daemonPidFile, dbFile, logsDir } from "../../cli/paths.ts";
+import {
+  findIdeaByQuery,
+  type BusinessIdea,
+  type BusinessIdeasFile,
+} from "../../orchestrator/business-ideas.ts";
 import { todayLogPath } from "../../cli/commands/logs.ts";
 import { saveBrain } from "../../orchestrator/brain.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
@@ -130,6 +135,7 @@ describe("registerHandlers", () => {
         "plan_revise_submit",
         "setup_task_skip_submit",
         "post_skip_submit",
+        "ideas_edit_submit",
       ]),
     );
     expect(fake.registeredCommandIds()).toEqual(["/jarvis"]);
@@ -969,7 +975,67 @@ describe("/jarvis status slash command", () => {
   });
 });
 
-describe("/jarvis ideas edit slash command", () => {
+// ---------------------------------------------------------------------------
+// findIdeaByQuery — pure unit tests (no sandbox, no file I/O)
+// ---------------------------------------------------------------------------
+
+describe("findIdeaByQuery resolver", () => {
+  function makeFile(ideas: BusinessIdea[]): BusinessIdeasFile {
+    return { ideas, unparseable: [], preamble: "" };
+  }
+
+  const base: BusinessIdea = {
+    id: "my-great-idea",
+    title: "My Great Idea",
+    app: "new",
+    brief: "A brief",
+    tags: [],
+    body: "some body text",
+  };
+
+  it("exact id match returns kind:'exact'", () => {
+    const result = findIdeaByQuery(makeFile([base]), "my-great-idea");
+    expect(result.kind).toBe("exact");
+    if (result.kind === "exact") expect(result.idea.id).toBe("my-great-idea");
+  });
+
+  it("case-insensitive id match", () => {
+    const result = findIdeaByQuery(makeFile([base]), "MY-GREAT-IDEA");
+    expect(result.kind).toBe("exact");
+    if (result.kind === "exact") expect(result.idea.id).toBe("my-great-idea");
+  });
+
+  it("title substring match (single result)", () => {
+    const result = findIdeaByQuery(makeFile([base]), "Great");
+    expect(result.kind).toBe("exact");
+    if (result.kind === "exact") expect(result.idea.id).toBe("my-great-idea");
+  });
+
+  it("title substring match (multiple results) returns candidates capped at 10", () => {
+    const idea2: BusinessIdea = { ...base, id: "great-idea-2", title: "Great Idea 2" };
+    const result = findIdeaByQuery(makeFile([base, idea2]), "Great");
+    expect(result.kind).toBe("multiple");
+    if (result.kind === "multiple") expect(result.candidates).toHaveLength(2);
+  });
+
+  it("no match returns kind:'none'", () => {
+    const result = findIdeaByQuery(makeFile([base]), "unknownxyz");
+    expect(result.kind).toBe("none");
+  });
+
+  it("smart-quote stripping resolves correctly", () => {
+    const idea: BusinessIdea = { ...base, id: "cemetery-saas", title: "Cemetery SaaS" };
+    const result = findIdeaByQuery(makeFile([idea]), "“Cemetery SaaS”");
+    expect(result.kind).toBe("exact");
+    if (result.kind === "exact") expect(result.idea.id).toBe("cemetery-saas");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /jarvis ideas edit command + ideas_edit_submit view
+// ---------------------------------------------------------------------------
+
+describe("/jarvis ideas edit command + ideas_edit_submit view", () => {
   let sandbox: InstallSandbox;
   let silencer: ConsoleSilencer;
 
@@ -982,47 +1048,119 @@ describe("/jarvis ideas edit slash command", () => {
     sandbox.cleanup();
   });
 
-  it("returns an ephemeral pointer to the CLI command", async () => {
+  function seedIdeasFile(dataDir: string, content: string): void {
+    fs.writeFileSync(businessIdeasFile(dataDir), content, "utf8");
+  }
+
+  const scoredIdeaMarkdown = [
+    "## Test Idea Alpha",
+    "App: new",
+    "Brief: An idea for testing",
+    "Score: 72",
+    "ScoredAt: 2026-01-01T00:00:00.000Z",
+    "Rationale: Looks good",
+    "",
+    "Original body text here.",
+    "",
+  ].join("\n");
+
+  it("exact id → views.open called with pre-filled body", async () => {
+    const recording = recordingClient();
     const { fake } = setupHarness(sandbox);
-    const responds: Array<{ text?: string; response_type?: string }> = [];
+    seedIdeasFile(sandbox.dataDir, scoredIdeaMarkdown);
+    const responds: Array<{ text?: string }> = [];
     await fake.invokeCommand("/jarvis", {
-      command: { text: "ideas edit my-idea-id" },
+      command: { text: "ideas edit test-idea-alpha", trigger_id: "T-abc" },
+      respond: async (args) => {
+        responds.push(args);
+      },
+      client: recording.client,
+    });
+    expect(recording.viewsOpened).toHaveLength(1);
+    const view = recording.viewsOpened[0]?.view as {
+      blocks?: Array<{ element?: { initial_value?: string } }>;
+    };
+    const bodyBlock = view?.blocks?.[1];
+    expect(bodyBlock?.element?.initial_value).toBe("Original body text here.");
+    expect(responds).toHaveLength(0);
+  });
+
+  it("no-match query → ephemeral with 'ideas list' hint", async () => {
+    const { fake } = setupHarness(sandbox);
+    seedIdeasFile(sandbox.dataDir, scoredIdeaMarkdown);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "ideas edit unknownxyz", trigger_id: "T-abc" },
       respond: async (args) => {
         responds.push(args);
       },
     });
     expect(responds).toHaveLength(1);
-    expect(responds[0]?.response_type).toBe("ephemeral");
-    const text = responds[0]?.text ?? "";
-    expect(text).toContain("yarn jarvis ideas edit my-idea-id");
-    expect(text).toContain("$EDITOR");
-    expect(text).toContain("--rescore");
+    expect(responds[0]?.text).toContain("ideas list");
   });
 
-  it("includes --rescore in the suggested command when passed", async () => {
+  it("view-submit saves new body and strips Score/ScoredAt/Rationale", async () => {
+    const recording = recordingClient();
     const { fake } = setupHarness(sandbox);
-    const responds: Array<{ text?: string }> = [];
-    await fake.invokeCommand("/jarvis", {
-      command: { text: "ideas edit my-idea --rescore" },
-      respond: async (args) => {
-        responds.push(args);
+    seedIdeasFile(sandbox.dataDir, scoredIdeaMarkdown);
+
+    await fake.invokeView("ideas_edit_submit", {
+      body: { user: { id: "U-tester" } },
+      view: {
+        private_metadata: JSON.stringify({ ideaId: "test-idea-alpha", rescoreDefault: false }),
+        state: {
+          values: {
+            body_block: { body_input: { value: "Updated body text." } },
+            rescore_block: { rescore_checkbox: { selected_options: [] } },
+          },
+        },
       },
+      client: recording.client,
     });
-    const text = responds[0]?.text ?? "";
-    expect(text).toContain("yarn jarvis ideas edit my-idea --rescore");
+
+    const saved = fs.readFileSync(businessIdeasFile(sandbox.dataDir), "utf8");
+    expect(saved).toContain("Updated body text.");
+    expect(saved).not.toContain("Score:");
+    expect(saved).not.toContain("ScoredAt:");
+    expect(saved).not.toContain("Rationale:");
+    expect(recording.posts[0]?.text).toContain("Scout will rescore on next tick");
   });
 
-  it("shows usage when no id is given", async () => {
-    const { fake } = setupHarness(sandbox);
-    const responds: Array<{ text?: string }> = [];
-    await fake.invokeCommand("/jarvis", {
-      command: { text: "ideas edit" },
-      respond: async (args) => {
-        responds.push(args);
+  it("rescore checkbox triggers scoreUnscoredIdeas and posts follow-up score", async () => {
+    const recording = recordingClient();
+    const scoreClient: AnthropicClient = {
+      async chat() {
+        return {
+          text: '<score>{"score":85,"rationale":"solid fit","suggestedPriority":"high"}</score>',
+          blocks: [],
+          stopReason: "end_turn",
+          model: "claude-sonnet-4-6",
+          usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheCreationTokens: 0 },
+          redactions: [],
+        };
       },
+    };
+    const { fake } = setupHarness(sandbox, { anthropic: scoreClient });
+    seedIdeasFile(sandbox.dataDir, scoredIdeaMarkdown);
+
+    await fake.invokeView("ideas_edit_submit", {
+      body: { user: { id: "U-tester" } },
+      view: {
+        private_metadata: JSON.stringify({ ideaId: "test-idea-alpha", rescoreDefault: false }),
+        state: {
+          values: {
+            body_block: { body_input: { value: "Updated body for rescore." } },
+            rescore_block: {
+              rescore_checkbox: { selected_options: [{ value: "rescore" }] },
+            },
+          },
+        },
+      },
+      client: recording.client,
     });
-    const text = responds[0]?.text ?? "";
-    expect(text).toContain("Usage:");
-    expect(text).toContain("ideas list");
+
+    expect(recording.posts[0]?.text).toContain("Rescoring now");
+    const followUp = recording.posts[1]?.text ?? "";
+    expect(followUp).toContain("85");
   });
 });
