@@ -56,7 +56,7 @@ export interface PlanExecutorOptions {
 interface FiredPayload {
   planId: string;
   app: string;
-  mode: "draft-impl" | "execute" | "not-runnable" | "skipped" | "claim-recovered";
+  mode: "draft-impl" | "execute" | "not-runnable" | "skipped" | "claim-recovered" | "recovery-exhausted";
   reason?: string;
   result?: Record<string, unknown>;
   durationMs?: number;
@@ -227,6 +227,38 @@ function countDoneFalseAttempts(db: Database.Database, planId: string): number {
 }
 
 /**
+ * Counts plan-executor-fired events with mode=claim-recovered for a planId
+ * that occurred after the most recent agent-call event for the same planId
+ * (or after windowCutoffIso if no such agent-call exists), bounded by the
+ * 24-hour window. Used to enforce the stale-executing recovery cap.
+ */
+export function countRecoveriesSinceLastAgentCall(
+  db: Database.Database,
+  planId: string,
+  windowCutoffIso: string,
+): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS cnt
+       FROM events
+       WHERE kind = 'plan-executor-fired'
+         AND json_extract(payload, '$.mode') = 'claim-recovered'
+         AND json_extract(payload, '$.planId') = ?
+         AND created_at > MAX(
+           COALESCE(
+             (SELECT MAX(created_at) FROM events
+              WHERE kind = 'agent-call'
+                AND json_extract(payload, '$.planId') = ?),
+             '1970-01-01T00:00:00.000Z'
+           ),
+           ?
+         )`,
+    )
+    .get(planId, planId, windowCutoffIso) as { cnt: number };
+  return row?.cnt ?? 0;
+}
+
+/**
  * Returns plans that are currently in executing state (per event log: latest
  * plan-transition has to='executing' with no later plan-transition) AND whose
  * last plan-transition or agent-call event is older than `nowMs - thresholdMs`.
@@ -279,9 +311,10 @@ export function findStaleExecuting(
 /**
  * For each plan stuck in executing with no recent activity, transitions it
  * back to approved and writes a claim-recovered event so the next tick
- * can re-fire it.
+ * can re-fire it. After 3 recoveries within 24h with no intervening
+ * agent-call, transitions the plan to blocked instead.
  */
-function recoverStaleExecuting(
+export function recoverStaleExecuting(
   dbFilePath: string,
   logger: DaemonContext["logger"],
   nowMs = Date.now(),
@@ -291,29 +324,59 @@ function recoverStaleExecuting(
   if (stale.length === 0) return;
 
   const dataDir = path.dirname(dbFilePath);
+  const windowCutoffIso = new Date(nowMs - 24 * 3600_000).toISOString();
   const db = new Database(dbFilePath);
   try {
     for (const entry of stale) {
-      const record = findPlan(dataDir, entry.planId);
-      if (record && record.plan.metadata.status === "executing") {
-        applyPlanTransition(dataDir, record, "approved", "plan-executor", "stale-executing recovery");
-      }
-      appendEvent(db, {
-        appId: entry.app,
-        vaultId: entry.vaultId,
-        kind: "plan-executor-fired",
-        payload: {
+      const count = countRecoveriesSinceLastAgentCall(db, entry.planId, windowCutoffIso);
+      if (count >= 3) {
+        const record = findPlan(dataDir, entry.planId);
+        if (record && record.plan.metadata.status === "executing") {
+          applyPlanTransition(
+            dataDir,
+            record,
+            "blocked",
+            "plan-executor",
+            `recovered ${count} times in 24h without Developer progress — manual intervention required`,
+          );
+        }
+        appendEvent(db, {
+          appId: entry.app,
+          vaultId: entry.vaultId,
+          kind: "plan-executor-fired",
+          payload: {
+            planId: entry.planId,
+            app: entry.app,
+            mode: "recovery-exhausted",
+            reason: `stale-executing recovery exhausted after ${count} recoveries — plan blocked`,
+          } satisfies FiredPayload,
+        });
+        logger.info("plan-executor: recovery exhausted — plan blocked", {
           planId: entry.planId,
-          app: entry.app,
-          mode: "claim-recovered",
-          reason: `stale-executing recovery — last activity at ${entry.lastEventAt}`,
-        } satisfies FiredPayload,
-      });
-      logger.info("plan-executor: recovered stale executing plan", {
-        planId: entry.planId,
-        trigger: "stale-executing",
-        lastEventAt: entry.lastEventAt,
-      });
+          recoveryCount: count,
+        });
+      } else {
+        const record = findPlan(dataDir, entry.planId);
+        if (record && record.plan.metadata.status === "executing") {
+          applyPlanTransition(dataDir, record, "approved", "plan-executor", "stale-executing recovery");
+        }
+        appendEvent(db, {
+          appId: entry.app,
+          vaultId: entry.vaultId,
+          kind: "plan-executor-fired",
+          payload: {
+            planId: entry.planId,
+            app: entry.app,
+            mode: "claim-recovered",
+            reason: `stale-executing recovery — last activity at ${entry.lastEventAt}`,
+          } satisfies FiredPayload,
+        });
+        logger.info("plan-executor: recovered stale executing plan", {
+          planId: entry.planId,
+          trigger: "stale-executing",
+          lastEventAt: entry.lastEventAt,
+        });
+      }
     }
   } finally {
     db.close();
@@ -367,6 +430,10 @@ function isFinalFiredEvent(p: FiredPayload): boolean {
     // before the fire. Every other "skipped" reason is a refusal whose
     // condition may change.
     return p.reason === "claimed; result pending";
+  }
+  if (p.mode === "recovery-exhausted") {
+    // Recovery cap hit — plan blocked; no further auto-recovery.
+    return true;
   }
   if (p.mode === "not-runnable") {
     // Plan is in the wrong state for Developer; needs human action.
