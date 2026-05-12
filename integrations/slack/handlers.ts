@@ -79,6 +79,12 @@ import {
   formatIdeaListing,
   listIdeasWithStatus,
 } from "../../orchestrator/idea-listing.ts";
+import {
+  findIdeaByQuery,
+  loadBusinessIdeas,
+  saveBusinessIdeas,
+} from "../../orchestrator/business-ideas.ts";
+import { buildIdeasEditModal } from "./blocks/ideas-edit-modal.ts";
 
 export interface HandlerContext {
   dataDir: string;
@@ -712,7 +718,7 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
           return runSlashIdeasList(parts.slice(2), ctx, respond);
         }
         if (sub === "edit") {
-          return runSlashIdeasEdit(parts.slice(2), respond);
+          return runSlashIdeasEdit(parts.slice(2), ctx, respond, command, client);
         }
         await respond({
           response_type: "ephemeral",
@@ -815,6 +821,101 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
     }
   });
 
+  app.view("ideas_edit_submit", async ({ ack, body, view, client }) => {
+    let ideaId: string;
+    let rescoreDefault: boolean;
+    try {
+      const meta = JSON.parse(view.private_metadata) as { ideaId?: unknown; rescoreDefault?: unknown };
+      if (typeof meta.ideaId !== "string" || !meta.ideaId) throw new Error("missing ideaId");
+      ideaId = meta.ideaId;
+      rescoreDefault = meta.rescoreDefault === true;
+    } catch {
+      await ack({
+        response_action: "errors",
+        errors: { body_block: "Invalid metadata. Try opening the modal again." },
+      });
+      return;
+    }
+    await ack();
+
+    const userId = body.user.id ?? "<slack>";
+    const newBody = view.state.values["body_block"]?.["body_input"]?.value ?? "";
+    const rescoreBlock = (
+      view.state.values["rescore_block"]?.["rescore_checkbox"] as
+        | { selected_options?: Array<{ value: string }> }
+        | undefined
+    );
+    const doRescore = (rescoreBlock?.selected_options ?? []).some((o) => o.value === "rescore");
+
+    const file = loadBusinessIdeas(ctx.dataDir);
+    const idx = file.ideas.findIndex((i) => i.id === ideaId);
+    if (idx < 0) {
+      await postDmOrEphemeral(client, userId, userId, `✗ Idea \`${ideaId}\` not found.`);
+      return;
+    }
+
+    const oldBodyLength = file.ideas[idx]!.body.length;
+    const ideaTitle = file.ideas[idx]!.title;
+    const { score: _s, scoredAt: _sa, rationale: _r, ...ideaRest } = file.ideas[idx]!;
+    void _s; void _sa; void _r;
+    file.ideas[idx] = { ...ideaRest, body: newBody };
+    saveBusinessIdeas(ctx.dataDir, file);
+
+    const conn = new Database(dbFile(ctx.dataDir));
+    try {
+      appendEvent(conn, {
+        appId: "jarvis",
+        vaultId: "personal",
+        kind: "idea-edited",
+        payload: {
+          ideaId,
+          bytesDelta: newBody.length - oldBodyLength,
+          source: "slack",
+          actor: `slack:${userId}`,
+        },
+      });
+    } finally {
+      conn.close();
+    }
+
+    await postDmOrEphemeral(
+      client,
+      userId,
+      userId,
+      doRescore
+        ? `✓ Updated ${ideaTitle}. Rescoring now…`
+        : `✓ Updated ${ideaTitle}. Scout will rescore on next tick.`,
+    );
+
+    void rescoreDefault; // used only to populate the modal's default state
+
+    if (doRescore) {
+      try {
+        const result = await scoreUnscoredIdeas({
+          dataDir: ctx.dataDir,
+          client: ctx.getAnthropicClient(),
+          vault: "personal",
+        });
+        const scored = result.entries.find((e) => e.ideaId === ideaId && e.score !== undefined);
+        if (scored !== undefined) {
+          await postDmOrEphemeral(
+            client,
+            userId,
+            userId,
+            `Score: ${scored.score}`,
+          );
+        }
+      } catch (err) {
+        await postDmOrEphemeral(
+          client,
+          userId,
+          userId,
+          `✗ Rescore failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  });
+
   app.view("post_skip_submit", async ({ ack, body, view, client }) => {
     const postId = view.private_metadata;
     const reason =
@@ -900,7 +1001,7 @@ const SLASH_USAGE = [
   "• `/jarvis scout draft [--threshold N] [--vault <v>]` — auto-draft plans from high-scoring ideas",
   "• `/jarvis ideas add [--vault <v>]` — capture a new idea via thread interview, append to `Business_Ideas.md`",
   "• `/jarvis ideas list [--vault <v>]` — show every idea with its score (high → low, then unscored)",
-  "• `/jarvis ideas edit <id>` — pointer to the CLI editor flow (file editing isn't a Slack thing)",
+  "• `/jarvis ideas edit <query> [--rescore]` — opens a modal to edit the idea body (3000 char max); `--rescore` rescores on save; CLI handles title/app/tags and long bodies",
   "• `/jarvis daily-audit [--dry-run] [--force]` — manually fire the daily self-audit (daemon already runs it once per day)",
   "• `/jarvis project-audit --app <name> | --all [--dry-run] [--force] [--no-research]` — manually fire per-app project audit",
   "• `/jarvis logs [--lines N]` — snapshot of last N lines of today's daemon log (default 50, max 200)",
@@ -1455,28 +1556,69 @@ async function runSlashAsk(
 
 async function runSlashIdeasEdit(
   args: string[],
+  ctx: HandlerContext,
   respond: SlashRespond,
+  command: { trigger_id?: string; channel_id?: string; user_id?: string },
+  client: BoltApp["client"],
 ): Promise<void> {
-  const id = args[0];
-  if (!id) {
+  const rescoreFlag = args.includes("--rescore");
+  const queryParts = args.filter((a) => a !== "--rescore");
+  const rawQuery = queryParts.join(" ").replace(/["""'']/g, "").trim();
+
+  if (rawQuery.length === 0) {
     await respond({
       response_type: "ephemeral",
       text:
-        ":pencil: Usage: `/jarvis ideas edit <id> [--rescore]`\n" +
-        "Run `/jarvis ideas list` to see available ids.",
+        "Usage: `/jarvis ideas edit <query> [--rescore]` — opens a modal to edit the idea body.\n" +
+        "Run `/jarvis ideas list` to see ids.",
     });
     return;
   }
-  const rescoreFlag = args.includes("--rescore") ? " --rescore" : "";
-  await respond({
-    response_type: "ephemeral",
-    text:
-      `:pencil: \`ideas edit\` needs \`$EDITOR\` which isn't available in Slack.\n` +
-      `Run this in your terminal:\n\`\`\`\nyarn jarvis ideas edit ${id}${rescoreFlag}\n\`\`\`` +
-      (rescoreFlag === ""
-        ? "\n_Add `--rescore` to chain a fresh Scout score after save._"
-        : ""),
-  });
+
+  const file = loadBusinessIdeas(ctx.dataDir);
+  const result = findIdeaByQuery(file, rawQuery);
+
+  if (result.kind === "none") {
+    await respond({
+      response_type: "ephemeral",
+      text:
+        `No idea found matching \`${rawQuery}\`.\n` +
+        "Run `/jarvis ideas list` to see ids.",
+    });
+    return;
+  }
+
+  if (result.kind === "multiple") {
+    const lines = [
+      `Multiple ideas match \`${rawQuery}\` — narrow your search or use the exact id:`,
+      ...result.candidates.map((c, i) => `${i + 1}. \`${c.id}\` — ${c.title}`),
+    ];
+    await respond({ response_type: "ephemeral", text: lines.join("\n") });
+    return;
+  }
+
+  const triggerId = command.trigger_id;
+  if (!triggerId) {
+    await respond({
+      response_type: "ephemeral",
+      text:
+        `Couldn't open modal (no trigger_id). Edit via CLI:\n\`\`\`\nyarn jarvis ideas edit ${result.idea.id}\n\`\`\``,
+    });
+    return;
+  }
+
+  try {
+    await client.views.open({
+      trigger_id: triggerId,
+      view: buildIdeasEditModal({ idea: result.idea, rescoreDefault: rescoreFlag }),
+    });
+  } catch (err) {
+    ctx.logError("opening ideas edit modal failed", err, { ideaId: result.idea.id });
+    await respond({
+      response_type: "ephemeral",
+      text: `✗ Couldn't open modal: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
 }
 
 async function runSlashIdeasList(

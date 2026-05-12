@@ -54,14 +54,14 @@ export interface ViewHandlerArgs {
   body: { user: { id: string } };
   view: {
     private_metadata: string;
-    state: { values: Record<string, Record<string, { value?: string }>> };
+    state: { values: Record<string, Record<string, { value?: string; selected_options?: Array<{ value: string }> }>> };
   };
   client?: FakeWebClient;
 }
 
 export interface CommandHandlerArgs {
   ack: () => Promise<void>;
-  command: { text?: string; channel_id?: string; user_id?: string };
+  command: { text?: string; channel_id?: string; user_id?: string; trigger_id?: string };
   respond: (args: {
     response_type: "ephemeral" | "in_channel";
     text?: string;

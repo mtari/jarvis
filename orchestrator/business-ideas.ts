@@ -327,6 +327,31 @@ function slugify(s: string): string {
     .slice(0, 80);
 }
 
+export type FindIdeaByQueryResult =
+  | { kind: "exact"; idea: BusinessIdea }
+  | { kind: "multiple"; candidates: BusinessIdea[] }
+  | { kind: "none" };
+
+export function findIdeaByQuery(
+  file: BusinessIdeasFile,
+  rawQuery: string,
+): FindIdeaByQueryResult {
+  const query = rawQuery.replace(/["“”‘’]/g, "").trim();
+  if (query.length === 0) return { kind: "none" };
+
+  const exactId = file.ideas.find((i) => i.id === query);
+  if (exactId) return { kind: "exact", idea: exactId };
+
+  const ciId = file.ideas.find((i) => i.id.toLowerCase() === query.toLowerCase());
+  if (ciId) return { kind: "exact", idea: ciId };
+
+  const q = query.toLowerCase();
+  const matches = file.ideas.filter((i) => i.title.toLowerCase().includes(q));
+  if (matches.length === 1) return { kind: "exact", idea: matches[0]! };
+  if (matches.length > 1) return { kind: "multiple", candidates: matches.slice(0, 10) };
+  return { kind: "none" };
+}
+
 export class IdeaSectionParseError extends Error {
   constructor(reason: string) {
     super(reason);
