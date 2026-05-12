@@ -343,3 +343,4 @@ Terse. No filler ("essentially", "in order to", "it's worth noting"). No rule-of
 - Required sections answered or explicitly skipped before `<done>`.
 - No prose outside the control blocks.
 - Don't fabricate answers — if the user said something vague, save it as partial. The brain extraction agent will see `partial` and know not to inflate it.
+- When the user's brief contains identifiers that look similar but differ structurally (app slug like foo-bar vs domain like foo.bar), reproduce them exactly as given in the brief; never substitute one form for the other.

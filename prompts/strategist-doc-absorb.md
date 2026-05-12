@@ -96,6 +96,7 @@ Optional. Use this section to flag conflicts (doc disagrees with brain), user-le
 - `## Brain changes (proposed)` MUST use the bullet format `\`<dot.path>\`: <add | refine | conflict> — <value>` so the orchestrator's applier (future PR) can parse it deterministically.
 - Never propose changes outside the brain (user-profile, agent-prompts, etc.) in this plan. Flag them under `## Open questions / assumptions` for the user to act on separately.
 - If the doc contains nothing project-relevant for this brain, return `<clarify>` asking whether the user wants it as a `--keep` cached doc instead.
+- When the user's brief contains identifiers that look similar but differ structurally (app slug like foo-bar vs domain like foo.bar), reproduce them exactly as given in the brief; never substitute one form for the other.
 
 ## Voice
 

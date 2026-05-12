@@ -113,11 +113,26 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       confirmDestructive: true, // The Block Kit confirm dialog already gated this
     });
     if (!result.ok) {
-      ctx.logError("approve via slack failed", null, {
-        planId,
-        reason: result.reason,
-      });
-      await postEphemeral(client, body, `✗ Approve failed: ${result.message}`);
+      if (result.reason === "wrong-state") {
+        const currentStatus = result.record?.plan.metadata.status;
+        if (currentStatus === "approved") {
+          ctx.log("approve via slack noop", { planId });
+          await postEphemeral(client, body, `✓ Plan ${planId} already approved`);
+        } else {
+          ctx.logError("approve via slack failed", null, { planId, reason: result.reason });
+          await postEphemeral(
+            client,
+            body,
+            `✗ Approve failed: plan ${planId} is currently ${currentStatus ?? "unknown"} — expected awaiting-review.`,
+          );
+        }
+      } else {
+        ctx.logError("approve via slack failed", null, {
+          planId,
+          reason: result.reason,
+        });
+        await postEphemeral(client, body, `✗ Approve failed: ${result.message}`);
+      }
       return;
     }
     ctx.log("approved via slack", { planId, userId });

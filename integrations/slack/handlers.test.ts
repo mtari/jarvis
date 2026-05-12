@@ -214,6 +214,48 @@ describe("plan_approve action", () => {
     expect(recording.postEphemerals).toHaveLength(1);
     expect(recording.postEphemerals[0]?.text).toContain("Approve failed");
   });
+
+  it("plan already approved — posts friendly ephemeral and does not call logError", async () => {
+    const planId = "2026-04-28-already-approved";
+    dropPlan(sandbox, planId, { status: "approved" });
+
+    const logErrorCalls: string[] = [];
+    const { fake, recording, ctx } = setupHarness(sandbox);
+    ctx.logError = (msg) => { logErrorCalls.push(msg); };
+
+    await fake.invokeAction("plan_approve", {
+      action: { type: "button", value: planId },
+      body: {
+        type: "block_actions",
+        user: { id: "U-x" },
+        channel: { id: "C-INBOX" },
+      },
+      client: recording.client,
+    });
+
+    expect(logErrorCalls).toHaveLength(0);
+    expect(recording.postEphemerals).toHaveLength(1);
+    expect(recording.postEphemerals[0]?.text).toContain("already approved");
+  });
+
+  it("plan in executing — ephemeral contains 'currently executing'", async () => {
+    const planId = "2026-04-28-executing";
+    dropPlan(sandbox, planId, { status: "executing" });
+
+    const { fake, recording } = setupHarness(sandbox);
+    await fake.invokeAction("plan_approve", {
+      action: { type: "button", value: planId },
+      body: {
+        type: "block_actions",
+        user: { id: "U-x" },
+        channel: { id: "C-INBOX" },
+      },
+      client: recording.client,
+    });
+
+    expect(recording.postEphemerals).toHaveLength(1);
+    expect(recording.postEphemerals[0]?.text).toContain("currently executing");
+  });
 });
 
 // ---------------------------------------------------------------------------

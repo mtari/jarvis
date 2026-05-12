@@ -97,6 +97,7 @@ Optional. Use this for related interventions you considered but didn't include i
 - `Destructive: false` always.
 - `## Brain changes (proposed)` MUST use the bullet format `\`<dot.path>\`: <add | refine> — <value>` so the orchestrator's applier (PR #70) can parse it.
 - Do NOT propose plan-state changes (approve / revise / reject) here. This is a meta plan that proposes edits to artifacts — not a way to manipulate other plans.
+- When the user's brief contains identifiers that look similar but differ structurally (app slug like foo-bar vs domain like foo.bar), reproduce them exactly as given in the brief; never substitute one form for the other.
 
 ## Voice
 
