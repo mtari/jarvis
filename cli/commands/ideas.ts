@@ -1,3 +1,7 @@
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { parseArgs } from "node:util";
 import Database from "better-sqlite3";
 import {
@@ -5,11 +9,19 @@ import {
   runIdeaIntakeAgent,
   type DraftIdea,
 } from "../../agents/idea-intake.ts";
+import { scoreUnscoredIdeas } from "../../agents/scout.ts";
 import { makeStdioIntakeIO, type IntakeIO } from "../../agents/intake.ts";
-import type { RunAgentTransport } from "../../orchestrator/agent-sdk-runtime.ts";
+import {
+  createSdkClient,
+  type AnthropicClient,
+  type RunAgentTransport,
+} from "../../orchestrator/agent-sdk-runtime.ts";
 import { listOnboardedApps } from "../../orchestrator/brain.ts";
 import {
+  IdeaSectionParseError,
   loadBusinessIdeas,
+  parseIdeaSection,
+  renderIdeaSection,
   saveBusinessIdeas,
   type BusinessIdea,
 } from "../../orchestrator/business-ideas.ts";
@@ -36,6 +48,10 @@ export interface IdeasDeps {
   io?: IntakeIO;
   /** Test injection — overrides the TTY check. */
   hasTty?: () => boolean;
+  /** Test injection — replaces the $EDITOR spawn for `ideas edit`. */
+  spawnEditor?: (editor: string, file: string) => { status: number | null };
+  /** Test injection — supplies the Anthropic client for `ideas edit --rescore`. */
+  buildScoutClient?: () => AnthropicClient;
 }
 
 export async function runIdeas(
@@ -45,13 +61,14 @@ export async function runIdeas(
   const [subcommand, ...rest] = rawArgs;
   if (subcommand === "add") return runIdeasAdd(rest, deps);
   if (subcommand === "list") return runIdeasList(rest);
+  if (subcommand === "edit") return runIdeasEdit(rest, deps);
   if (subcommand === undefined) {
     console.error(
-      "ideas: missing subcommand. Usage: yarn jarvis ideas <add|list> [--vault <name>]",
+      "ideas: missing subcommand. Usage: yarn jarvis ideas <add|list|edit> [--vault <name>]",
     );
   } else {
     console.error(
-      `ideas: unknown subcommand "${subcommand}". Available: add, list`,
+      `ideas: unknown subcommand "${subcommand}". Available: add, list, edit`,
     );
   }
   return 1;
@@ -236,6 +253,151 @@ async function runIdeasList(rest: string[]): Promise<number> {
     `${rows.length} idea(s). yarn jarvis scout score → score unscored. yarn jarvis scout draft → auto-draft high scorers.`,
   );
   return 0;
+}
+
+async function runIdeasEdit(
+  rest: string[],
+  deps: IdeasDeps,
+): Promise<number> {
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args: rest,
+      options: {
+        vault: { type: "string" },
+        rescore: { type: "boolean" },
+      },
+      allowPositionals: true,
+      strict: true,
+    });
+  } catch (err) {
+    console.error(`ideas edit: ${(err as Error).message}`);
+    return 1;
+  }
+
+  if (parsed.positionals.length === 0) {
+    console.error("ideas edit: missing <id>. Usage: yarn jarvis ideas edit <id> [--rescore] [--vault <v>]");
+    return 1;
+  }
+  if (parsed.positionals.length > 1) {
+    console.error(`ideas edit: unexpected extra positional: ${parsed.positionals.slice(1).join(" ")}`);
+    return 1;
+  }
+
+  const id = parsed.positionals[0]!;
+  const vault = parsed.values.vault ?? "personal";
+  const rescore = parsed.values.rescore ?? false;
+  const dataDir = getDataDir();
+
+  const file = loadBusinessIdeas(dataDir);
+  const ideaIdx = file.ideas.findIndex((i) => i.id === id);
+  if (ideaIdx === -1) {
+    console.error(`idea "${id}" not found; run yarn jarvis ideas list to see available ids`);
+    return 1;
+  }
+
+  const idea = file.ideas[ideaIdx]!;
+  const stripped: BusinessIdea = {
+    id: idea.id,
+    title: idea.title,
+    app: idea.app,
+    brief: idea.brief,
+    tags: idea.tags,
+    body: idea.body,
+  };
+  const seedText = renderIdeaSection(stripped);
+
+  const tmpFile = path.join(os.tmpdir(), `jarvis-idea-${id}-${Date.now()}.md`);
+  try {
+    fs.writeFileSync(tmpFile, seedText, "utf8");
+
+    const editor = process.env["EDITOR"] ?? process.env["VISUAL"] ?? "vi";
+    const spawn = deps.spawnEditor ?? defaultSpawnEditor;
+    const result = spawn(editor, tmpFile);
+    if (result.status !== 0) {
+      console.error(`ideas edit: editor "${editor}" exited with status ${result.status ?? "unknown"}`);
+      return 1;
+    }
+
+    const editedText = fs.readFileSync(tmpFile, "utf8");
+
+    if (editedText === seedText) {
+      console.log("No changes.");
+      return 0;
+    }
+
+    let newIdea: BusinessIdea;
+    try {
+      newIdea = parseIdeaSection(editedText);
+    } catch (err) {
+      if (err instanceof IdeaSectionParseError) {
+        console.error(`ideas edit: parse error — ${err.message}`);
+        return 1;
+      }
+      throw err;
+    }
+
+    // Strip any scoring fields the editor may have reintroduced.
+    delete newIdea.score;
+    delete newIdea.scoredAt;
+    delete newIdea.rationale;
+
+    // Resolve id collision after a title change.
+    const oldId = idea.id;
+    const otherIds = file.ideas.filter((i) => i.id !== oldId).map((i) => i.id);
+    if (otherIds.includes(newIdea.id)) {
+      let suffix = 2;
+      while (otherIds.includes(`${newIdea.id}-${suffix}`)) suffix += 1;
+      newIdea = { ...newIdea, id: `${newIdea.id}-${suffix}` };
+    }
+
+    file.ideas[ideaIdx] = newIdea;
+    saveBusinessIdeas(dataDir, file);
+
+    const db = new Database(dbFile(dataDir));
+    try {
+      appendEvent(db, {
+        appId: newIdea.app,
+        vaultId: vault,
+        kind: "idea-edited",
+        payload: {
+          ideaId: oldId,
+          ...(newIdea.id !== oldId && { newId: newIdea.id }),
+          titleChanged: newIdea.title !== idea.title,
+          bodyDelta: { from: idea.body, to: newIdea.body },
+        },
+      });
+    } finally {
+      db.close();
+    }
+
+    console.log(`✓ Updated "${newIdea.title}" in ${businessIdeasFile(dataDir)}`);
+
+    if (rescore) {
+      const client = deps.buildScoutClient ? deps.buildScoutClient() : createSdkClient();
+      const scoreResult = await scoreUnscoredIdeas({ dataDir, client, vault });
+      for (const entry of scoreResult.entries) {
+        if (entry.error !== undefined) {
+          console.log(`✗ ${entry.ideaId} — ${entry.error}`);
+        } else {
+          console.log(`✓ ${entry.ideaId} — score ${entry.score ?? "?"}`);
+        }
+      }
+      return scoreResult.errorCount > 0 ? 1 : 0;
+    }
+
+    return 0;
+  } finally {
+    fs.rmSync(tmpFile, { force: true });
+  }
+}
+
+function defaultSpawnEditor(
+  editor: string,
+  file: string,
+): { status: number | null } {
+  const result = spawnSync(editor, [file], { stdio: "inherit" });
+  return { status: result.status };
 }
 
 function defaultHasTty(): boolean {

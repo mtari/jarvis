@@ -119,6 +119,10 @@ Utilities:
                               List every idea with its score, sorted high
                               score first (unscored last). Marks ideas that
                               already have an auto-drafted plan.
+  ideas edit <id> [--rescore] [--vault <v>]
+                              Open idea in $EDITOR. Strips stale Score/ScoredAt/
+                              Rationale on save. With --rescore, re-runs scout
+                              score for the vault after saving.
   scout score [--vault <v>]   Score unscored ideas in Business_Ideas.md. Writes
                               score, scoredAt, rationale back to the file and
                               records an idea-scored event per idea.

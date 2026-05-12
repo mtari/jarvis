@@ -2,6 +2,8 @@ import fs from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import type {
+  AnthropicClient,
+  ChatResponse,
   RunAgentResult,
   RunAgentTransport,
 } from "../../orchestrator/agent-sdk-runtime.ts";
@@ -280,5 +282,208 @@ body
         hasTty: () => false,
       }),
     ).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ideas edit tests
+// ---------------------------------------------------------------------------
+
+const SCORE_RESPONSE_TEXT = `<score>${JSON.stringify({
+  score: 75,
+  rationale: "Good strategic fit.",
+  suggestedPriority: "normal",
+})}</score>`;
+
+function makeScoutClient(): AnthropicClient {
+  return {
+    async chat(): Promise<ChatResponse> {
+      return {
+        text: SCORE_RESPONSE_TEXT,
+        blocks: [{ type: "text", text: SCORE_RESPONSE_TEXT }],
+        stopReason: "end_turn",
+        model: "claude-sonnet-4-6",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cachedInputTokens: 0,
+          cacheCreationTokens: 0,
+        },
+        redactions: [],
+      };
+    },
+  };
+}
+
+const SEEDED_IDEA = `## Original Title
+App: myapp
+Brief: Original brief.
+Score: 60
+ScoredAt: 2026-01-01T00:00:00Z
+Rationale: Old rationale.
+
+Original body.
+
+`;
+
+describe("ideas edit", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("happy-path: edit mutates title + body, strips Score/ScoredAt/Rationale", async () => {
+    fs.writeFileSync(businessIdeasFile(sandbox.dataDir), SEEDED_IDEA);
+
+    const code = await runIdeas(["edit", "original-title"], {
+      spawnEditor: (_editor, file) => {
+        fs.writeFileSync(
+          file,
+          `## Updated Title\nApp: myapp\nBrief: Updated brief.\n\nUpdated body.\n`,
+        );
+        return { status: 0 };
+      },
+    });
+
+    expect(code).toBe(0);
+    const loaded = loadBusinessIdeas(sandbox.dataDir);
+    expect(loaded.ideas).toHaveLength(1);
+    expect(loaded.ideas[0]?.title).toBe("Updated Title");
+    expect(loaded.ideas[0]?.brief).toBe("Updated brief.");
+    expect(loaded.ideas[0]?.body).toBe("Updated body.");
+    expect(loaded.ideas[0]?.score).toBeUndefined();
+    expect(loaded.ideas[0]?.scoredAt).toBeUndefined();
+    expect(loaded.ideas[0]?.rationale).toBeUndefined();
+    expect(loaded.ideas[0]?.id).toBe("updated-title");
+    expect(loaded.ideas.find((i) => i.id === "original-title")).toBeUndefined();
+  });
+
+  it("no-op when editor exits 0 with unchanged content", async () => {
+    fs.writeFileSync(businessIdeasFile(sandbox.dataDir), SEEDED_IDEA);
+    const beforeFile = loadBusinessIdeas(sandbox.dataDir);
+
+    const code = await runIdeas(["edit", "original-title"], {
+      spawnEditor: (_editor, _file) => ({ status: 0 }),
+    });
+
+    expect(code).toBe(0);
+    const afterFile = loadBusinessIdeas(sandbox.dataDir);
+    expect(afterFile.ideas).toEqual(beforeFile.ideas);
+
+    const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
+    try {
+      const events = db
+        .prepare("SELECT payload FROM events WHERE kind = 'idea-edited'")
+        .all() as Array<{ payload: string }>;
+      expect(events).toHaveLength(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("--rescore invokes buildScoutClient exactly once and prints score line", async () => {
+    fs.writeFileSync(businessIdeasFile(sandbox.dataDir), SEEDED_IDEA);
+
+    let clientCalls = 0;
+    const lines: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]): void => {
+      lines.push(args.map(String).join(" "));
+    };
+
+    try {
+      const code = await runIdeas(["edit", "original-title", "--rescore"], {
+        spawnEditor: (_editor, file) => {
+          fs.writeFileSync(file, `## Original Title\nApp: myapp\nBrief: Changed brief.\n`);
+          return { status: 0 };
+        },
+        buildScoutClient: () => {
+          clientCalls += 1;
+          return makeScoutClient();
+        },
+      });
+      expect(code).toBe(0);
+    } finally {
+      console.log = origLog;
+    }
+
+    expect(clientCalls).toBe(1);
+    expect(lines.some((l) => l.includes("score"))).toBe(true);
+  });
+
+  it("title change recomputes id, old id no longer resolves", async () => {
+    fs.writeFileSync(
+      businessIdeasFile(sandbox.dataDir),
+      `## Old Title\nApp: a\nBrief: b.\n`,
+    );
+
+    const code = await runIdeas(["edit", "old-title"], {
+      spawnEditor: (_editor, file) => {
+        fs.writeFileSync(file, `## New Title\nApp: a\nBrief: b.\n`);
+        return { status: 0 };
+      },
+    });
+
+    expect(code).toBe(0);
+    const loaded = loadBusinessIdeas(sandbox.dataDir);
+    expect(loaded.ideas.find((i) => i.id === "new-title")).toBeDefined();
+    expect(loaded.ideas.find((i) => i.id === "old-title")).toBeUndefined();
+  });
+
+  it("id collision after rename disambiguates with -2 suffix", async () => {
+    fs.writeFileSync(
+      businessIdeasFile(sandbox.dataDir),
+      `## Alpha\nApp: a\nBrief: x.\n\n## Beta\nApp: a\nBrief: y.\n`,
+    );
+
+    const code = await runIdeas(["edit", "alpha"], {
+      spawnEditor: (_editor, file) => {
+        fs.writeFileSync(file, `## Beta\nApp: a\nBrief: x renamed.\n`);
+        return { status: 0 };
+      },
+    });
+
+    expect(code).toBe(0);
+    const loaded = loadBusinessIdeas(sandbox.dataDir);
+    const ids = loaded.ideas.map((i) => i.id).sort();
+    expect(ids).toContain("beta");
+    expect(ids).toContain("beta-2");
+  });
+
+  it("editor non-zero exit aborts, original file untouched, exits 1", async () => {
+    fs.writeFileSync(businessIdeasFile(sandbox.dataDir), SEEDED_IDEA);
+    const beforeText = fs.readFileSync(businessIdeasFile(sandbox.dataDir), "utf8");
+
+    const code = await runIdeas(["edit", "original-title"], {
+      spawnEditor: () => ({ status: 1 }),
+    });
+
+    expect(code).toBe(1);
+    const afterText = fs.readFileSync(businessIdeasFile(sandbox.dataDir), "utf8");
+    expect(afterText).toBe(beforeText);
+  });
+
+  it("parse failure on edited buffer aborts with exit 1, original file untouched", async () => {
+    fs.writeFileSync(businessIdeasFile(sandbox.dataDir), SEEDED_IDEA);
+    const beforeText = fs.readFileSync(businessIdeasFile(sandbox.dataDir), "utf8");
+
+    const code = await runIdeas(["edit", "original-title"], {
+      spawnEditor: (_editor, file) => {
+        fs.writeFileSync(file, `## \nApp: myapp\nBrief: missing title.\n`);
+        return { status: 0 };
+      },
+    });
+
+    expect(code).toBe(1);
+    const afterText = fs.readFileSync(businessIdeasFile(sandbox.dataDir), "utf8");
+    expect(afterText).toBe(beforeText);
   });
 });
