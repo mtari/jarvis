@@ -1124,6 +1124,9 @@ describe("/jarvis ideas edit command + ideas_edit_submit view", () => {
     expect(saved).not.toContain("ScoredAt:");
     expect(saved).not.toContain("Rationale:");
     expect(recording.posts[0]?.text).toContain("Scout will rescore on next tick");
+    // Confirmation lands in the inbox channel, not as a DM to the user
+    expect(recording.posts[0]?.channel).toBe("C-INBOX");
+    expect(recording.posts[0]?.channel).not.toBe("U-tester");
   });
 
   it("rescore checkbox triggers scoreUnscoredIdeas and posts follow-up score", async () => {
@@ -1162,5 +1165,8 @@ describe("/jarvis ideas edit command + ideas_edit_submit view", () => {
     expect(recording.posts[0]?.text).toContain("Rescoring now");
     const followUp = recording.posts[1]?.text ?? "";
     expect(followUp).toContain("85");
+    // Both posts (confirmation + score) land in the inbox channel, not DMs
+    expect(recording.posts[0]?.channel).toBe("C-INBOX");
+    expect(recording.posts[1]?.channel).toBe("C-INBOX");
   });
 });
