@@ -356,7 +356,8 @@ export function generatePlanId(
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
-    .slice(0, 40);
+    .slice(0, 40)
+    .replace(/^-|-$/g, "");
   const base = slug ? `${date}-${slug}` : date;
   let candidate = base;
   let counter = 2;

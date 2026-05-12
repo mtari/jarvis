@@ -160,6 +160,39 @@ describe("parsePlan", () => {
   it("rejects a missing title", () => {
     expect(() => parsePlan("Type: improvement\n")).toThrow(/Plan/);
   });
+
+  it("parses cleanly when one blank line separates title from headers", () => {
+    const text = VALID_IMPROVEMENT.replace(
+      "# Plan: Add status command\nType:",
+      "# Plan: Add status command\n\nType:",
+    );
+    const plan = parsePlan(text);
+    expect(plan.metadata.title).toBe("Add status command");
+    expect(plan.metadata.confidence).toEqual({
+      score: 75,
+      rationale: "based on similar past CLI additions",
+    });
+  });
+
+  it("parses cleanly when two blank lines separate title from headers", () => {
+    const text = VALID_IMPROVEMENT.replace(
+      "# Plan: Add status command\nType:",
+      "# Plan: Add status command\n\n\nType:",
+    );
+    const plan = parsePlan(text);
+    expect(plan.metadata.title).toBe("Add status command");
+    expect(plan.metadata.confidence.score).toBe(75);
+  });
+
+  it("blank line between two header lines still ends header parsing", () => {
+    // A blank line after Type: causes header parsing to stop — Confidence and
+    // other required fields are not collected, so the parser throws.
+    const text = VALID_IMPROVEMENT.replace(
+      "Type: improvement\nSubtype:",
+      "Type: improvement\n\nSubtype:",
+    );
+    expect(() => parsePlan(text)).toThrow(/Confidence is required/);
+  });
 });
 
 describe("serializePlan", () => {
