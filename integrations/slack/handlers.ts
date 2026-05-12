@@ -711,9 +711,12 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
         if (sub === "list") {
           return runSlashIdeasList(parts.slice(2), ctx, respond);
         }
+        if (sub === "edit") {
+          return runSlashIdeasEdit(parts.slice(2), respond);
+        }
         await respond({
           response_type: "ephemeral",
-          text: "Usage: `/jarvis ideas add|list [--vault <v>]`",
+          text: "Usage: `/jarvis ideas add|list|edit [--vault <v>]`",
         });
         return;
       }
@@ -734,7 +737,7 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       default:
         await respond({
           response_type: "ephemeral",
-          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`ideas list\`, \`daily-audit\`, \`project-audit\`, \`logs\`, \`notes\`, \`ask\`, \`discuss\`, \`status\`.`,
+          text: `Unknown subcommand \`${subcommand}\`. Available: \`plan\`, \`bug\`, \`inbox\`, \`triage\`, \`scout score\`, \`scout draft\`, \`ideas add\`, \`ideas list\`, \`ideas edit\`, \`daily-audit\`, \`project-audit\`, \`logs\`, \`notes\`, \`ask\`, \`discuss\`, \`status\`.`,
         });
     }
   });
@@ -897,6 +900,7 @@ const SLASH_USAGE = [
   "• `/jarvis scout draft [--threshold N] [--vault <v>]` — auto-draft plans from high-scoring ideas",
   "• `/jarvis ideas add [--vault <v>]` — capture a new idea via thread interview, append to `Business_Ideas.md`",
   "• `/jarvis ideas list [--vault <v>]` — show every idea with its score (high → low, then unscored)",
+  "• `/jarvis ideas edit <id>` — pointer to the CLI editor flow (file editing isn't a Slack thing)",
   "• `/jarvis daily-audit [--dry-run] [--force]` — manually fire the daily self-audit (daemon already runs it once per day)",
   "• `/jarvis project-audit --app <name> | --all [--dry-run] [--force] [--no-research]` — manually fire per-app project audit",
   "• `/jarvis logs [--lines N]` — snapshot of last N lines of today's daemon log (default 50, max 200)",
@@ -1447,6 +1451,32 @@ async function runSlashAsk(
       }`,
     });
   }
+}
+
+async function runSlashIdeasEdit(
+  args: string[],
+  respond: SlashRespond,
+): Promise<void> {
+  const id = args[0];
+  if (!id) {
+    await respond({
+      response_type: "ephemeral",
+      text:
+        ":pencil: Usage: `/jarvis ideas edit <id> [--rescore]`\n" +
+        "Run `/jarvis ideas list` to see available ids.",
+    });
+    return;
+  }
+  const rescoreFlag = args.includes("--rescore") ? " --rescore" : "";
+  await respond({
+    response_type: "ephemeral",
+    text:
+      `:pencil: \`ideas edit\` needs \`$EDITOR\` which isn't available in Slack.\n` +
+      `Run this in your terminal:\n\`\`\`\nyarn jarvis ideas edit ${id}${rescoreFlag}\n\`\`\`` +
+      (rescoreFlag === ""
+        ? "\n_Add `--rescore` to chain a fresh Scout score after save._"
+        : ""),
+  });
 }
 
 async function runSlashIdeasList(

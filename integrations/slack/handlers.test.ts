@@ -968,3 +968,61 @@ describe("/jarvis status slash command", () => {
     expect(text).toContain("Calls today:");
   });
 });
+
+describe("/jarvis ideas edit slash command", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("returns an ephemeral pointer to the CLI command", async () => {
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string; response_type?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "ideas edit my-idea-id" },
+      respond: async (args) => {
+        responds.push(args);
+      },
+    });
+    expect(responds).toHaveLength(1);
+    expect(responds[0]?.response_type).toBe("ephemeral");
+    const text = responds[0]?.text ?? "";
+    expect(text).toContain("yarn jarvis ideas edit my-idea-id");
+    expect(text).toContain("$EDITOR");
+    expect(text).toContain("--rescore");
+  });
+
+  it("includes --rescore in the suggested command when passed", async () => {
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "ideas edit my-idea --rescore" },
+      respond: async (args) => {
+        responds.push(args);
+      },
+    });
+    const text = responds[0]?.text ?? "";
+    expect(text).toContain("yarn jarvis ideas edit my-idea --rescore");
+  });
+
+  it("shows usage when no id is given", async () => {
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "ideas edit" },
+      respond: async (args) => {
+        responds.push(args);
+      },
+    });
+    const text = responds[0]?.text ?? "";
+    expect(text).toContain("Usage:");
+    expect(text).toContain("ideas list");
+  });
+});
