@@ -14,6 +14,7 @@ import { runInstall } from "./commands/install.ts";
 import { runLearn } from "./commands/learn.ts";
 import { runLogs } from "./commands/logs.ts";
 import { runMarketer } from "./commands/marketer.ts";
+import { runMigrate } from "./commands/migrate.ts";
 import { runNotes } from "./commands/notes.ts";
 import { runObserveImpact } from "./commands/observe-impact.ts";
 import { runOnboard } from "./commands/onboard.ts";
@@ -72,6 +73,9 @@ Inbox:
   inbox                       Show pending plan reviews + setup tasks
 
 Utilities:
+  migrate [--dry-run] [--dir <db|brain|profile|all>]
+                              Apply pending DB migrations (default all). --dry-run
+                              lists pending without applying.
   run developer <plan-id>     Fire Developer (auto-detects: draft impl plan vs execute)
   run <agent> <task>          Other agents not yet wired (Phase 1+)
   cost [--cap N] [--warn-at R] [--format table|json]
@@ -262,6 +266,8 @@ export async function dispatch(argv: string[]): Promise<number> {
       return runLearn(rest);
     case "marketer":
       return runMarketer(rest);
+    case "migrate":
+      return runMigrate(rest);
     case "posts":
       return runPosts(rest);
     case "observe-impact":

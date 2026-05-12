@@ -15,6 +15,32 @@ export interface MigrationRunResult {
 
 const MIGRATION_FILE_PATTERN = /^(\d{3})-[a-z0-9-]+\.ts$/;
 
+export async function listPendingMigrations(
+  db: Database,
+  dir: string,
+): Promise<string[]> {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _migrations (
+      name TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    )
+  `);
+
+  const files = fs
+    .readdirSync(dir)
+    .filter((f) => MIGRATION_FILE_PATTERN.test(f))
+    .sort();
+
+  const appliedRows = db
+    .prepare("SELECT name FROM _migrations")
+    .all() as Array<{ name: string }>;
+  const appliedSet = new Set(appliedRows.map((r) => r.name));
+
+  return files
+    .map((f) => f.replace(/\.ts$/, ""))
+    .filter((name) => !appliedSet.has(name));
+}
+
 export async function runMigrations(
   db: Database,
   dir: string,

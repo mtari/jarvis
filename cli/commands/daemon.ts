@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import Database from "better-sqlite3";
 import {
   createDaemonLogger,
   type DaemonLogger,
@@ -23,12 +24,14 @@ import {
   createSlackService,
   readSlackEnv,
 } from "../../integrations/slack/service.ts";
+import { runMigrations, type MigrationRunResult } from "../../migrations/runner.ts";
 import {
   daemonPidFile,
   dbFile,
   envFile,
   getDataDir,
   logsDir,
+  migrationsDbDir,
 } from "../paths.ts";
 
 export interface DaemonContext {
@@ -48,6 +51,7 @@ export interface BootstrapOptions {
   services?: DaemonService[];
   now?: () => Date;
   echo?: boolean;
+  _runMigrations?: (db: Database.Database, dir: string) => Promise<MigrationRunResult>;
 }
 
 export interface DaemonHandle {
@@ -90,6 +94,21 @@ export async function bootstrapDaemon(
   };
   const logger = createDaemonLogger(loggerOpts);
   logger.info("daemon starting", { pid: pidFile.pid });
+
+  const migrateFn = opts._runMigrations ?? runMigrations;
+  const migDb = new Database(dbFile(dataDir));
+  try {
+    const migResult = await migrateFn(migDb, migrationsDbDir());
+    for (const name of migResult.applied) {
+      logger.info("migration applied", { migration: name });
+    }
+  } catch (migErr) {
+    migDb.close();
+    logger.close();
+    releasePidFile(pidPath, { pid: pidFile.pid });
+    throw migErr;
+  }
+  migDb.close();
 
   const ctx: DaemonContext = { dataDir, logger, pidFile };
 

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { runMigrations } from "./runner.ts";
+import { listPendingMigrations, runMigrations } from "./runner.ts";
 
 interface TempDirHandle {
   dir: string;
@@ -125,6 +125,59 @@ describe("runMigrations", () => {
     const result = await runMigrations(db, tmp.dir);
 
     expect(result.applied).toEqual(["001-foo"]);
+  });
+});
+
+describe("listPendingMigrations", () => {
+  let tmp: TempDirHandle;
+  let db: Database.Database;
+
+  beforeEach(() => {
+    tmp = makeTempDir();
+    db = new Database(":memory:");
+  });
+
+  afterEach(() => {
+    db.close();
+    tmp.cleanup();
+  });
+
+  it("returns pending names when some are not yet applied", async () => {
+    writeMigration(tmp.dir, "001-foo.ts", SIMPLE_TABLE_MIGRATION);
+    writeMigration(tmp.dir, "002-bar.ts", SECOND_TABLE_MIGRATION);
+
+    await runMigrations(db, tmp.dir);
+
+    // Delete the 002 row to simulate it being pending
+    db.prepare("DELETE FROM _migrations WHERE name='002-bar'").run();
+
+    const pending = await listPendingMigrations(db, tmp.dir);
+    expect(pending).toEqual(["002-bar"]);
+  });
+
+  it("returns empty array when all migrations are applied", async () => {
+    writeMigration(tmp.dir, "001-foo.ts", SIMPLE_TABLE_MIGRATION);
+    writeMigration(tmp.dir, "002-bar.ts", SECOND_TABLE_MIGRATION);
+
+    await runMigrations(db, tmp.dir);
+
+    const pending = await listPendingMigrations(db, tmp.dir);
+    expect(pending).toEqual([]);
+  });
+
+  it("returns all names when _migrations table is absent (fresh DB)", async () => {
+    writeMigration(tmp.dir, "001-foo.ts", SIMPLE_TABLE_MIGRATION);
+    writeMigration(tmp.dir, "002-bar.ts", SECOND_TABLE_MIGRATION);
+
+    const pending = await listPendingMigrations(db, tmp.dir);
+    expect(pending).toEqual(["001-foo", "002-bar"]);
+  });
+
+  it("returns empty array when dir has no matching files", async () => {
+    writeMigration(tmp.dir, "README.md", "# notes");
+
+    const pending = await listPendingMigrations(db, tmp.dir);
+    expect(pending).toEqual([]);
   });
 });
 

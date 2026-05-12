@@ -114,6 +114,14 @@ export function migrationsDbDir(): string {
   return path.join(REPO_ROOT, "migrations", "db");
 }
 
+export function migrationsBrainDir(): string {
+  return path.join(REPO_ROOT, "migrations", "brain");
+}
+
+export function migrationsProfileDir(): string {
+  return path.join(REPO_ROOT, "migrations", "profile");
+}
+
 export function planTemplatesDir(): string {
   return path.join(REPO_ROOT, "plan-templates");
 }
