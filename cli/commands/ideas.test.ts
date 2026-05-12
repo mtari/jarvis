@@ -18,7 +18,7 @@ import {
   type ConsoleSilencer,
   type InstallSandbox,
 } from "./_test-helpers.ts";
-import { runIdeas } from "./ideas.ts";
+import { runIdeas, slugify } from "./ideas.ts";
 
 function fixedRunResult(text: string): RunAgentResult {
   return {
@@ -487,3 +487,19 @@ describe("ideas edit", () => {
     expect(afterText).toBe(beforeText);
   });
 });
+
+describe("slugify", () => {
+  it("never produces a trailing dash when slice lands on a dash boundary", () => {
+    // 60 chars of "a-b-c-..." — make a title long enough that the 60th char is a dash
+    const title = "aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd eeeeeeeeeee fffff";
+    const result = slugify(title);
+    expect(result).not.toMatch(/-$/);
+    expect(result).not.toMatch(/^-/);
+    expect(result.length).toBeLessThanOrEqual(60);
+  });
+
+  it("never produces a leading dash", () => {
+    expect(slugify("---hello world")).not.toMatch(/^-/);
+  });
+});
+

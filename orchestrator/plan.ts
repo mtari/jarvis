@@ -166,6 +166,11 @@ export function parsePlan(text: string): Plan {
   const title = titleMatch[1]!.trim();
   i += 1;
 
+  // Tolerate one or more blank lines between the title and the first header
+  // line. Header parsing then runs strictly until the next blank line or ##
+  // section.
+  while (i < lines.length && lines[i]?.trim() === "") i += 1;
+
   const headerRaw: Record<string, string> = {};
   while (i < lines.length) {
     const line = lines[i]!;

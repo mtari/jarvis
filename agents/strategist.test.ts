@@ -240,6 +240,34 @@ describe("generatePlanId", () => {
     );
     expect(id).toBe("2026-04-27-foo-3");
   });
+
+  it("never returns an id with a trailing dash when slice lands on a dash boundary", () => {
+    // "Fix slack slash flag parsing for jarvis service" slugifies to
+    // "fix-slack-slash-flag-parsing-for-jarvis-servi" at 45 chars; slicing to
+    // 40 lands on "fix-slack-slash-flag-parsing-for-jarvis-" — trailing dash
+    // must be trimmed.
+    const id = generatePlanId(
+      "Fix slack slash flag parsing for jarvis service",
+      "jarvis",
+      sandbox.dataDir,
+      "personal",
+      new Date("2026-05-12T00:00:00Z"),
+    );
+    expect(id).not.toMatch(/-$/);
+    expect(id).toMatch(/^2026-05-12-/);
+  });
+
+  it("trims leading dashes that survive a post-slice re-trim", () => {
+    // Title that starts with punctuation should still produce no leading dash.
+    const id = generatePlanId(
+      "---fix something",
+      "jarvis",
+      sandbox.dataDir,
+      "personal",
+      new Date("2026-05-12T00:00:00Z"),
+    );
+    expect(id).not.toMatch(/^2026-05-12--/);
+  });
 });
 
 describe("runStrategist", () => {
