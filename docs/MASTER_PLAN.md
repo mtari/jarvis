@@ -1481,7 +1481,14 @@ Two complementary tracks:
 **Track B — A purpose-built public showcase project.**
 
 - Promote `vaults/showcase/` to a public-remote home — at Phase 5 entry, pick the architecture per §15 → "Phase 5 — public showcase architecture" (separate repo or git submodule). The other vaults stay in the private `jarvis-data` repo unchanged.
-- Onboard a new project into this vault: `yarn jarvis onboard --app <showcase-name> --vault showcase ...`. E.g., a Hungarian IT community resource: job board, event aggregator, OSS contribution leaderboard, monthly newsletter. Owned by Jarvis from day one.
+- Onboard **`huntech.dev`** into this vault from day one — a bilingual (HU + EN) Hungarian dev community site. Scope locked 2026-05-12:
+  - **Three pillars.** Event aggregator (conferences + meetups + online events with any HU connection — held in HU, HU organizer, Hungarian-language, HU speaker, or HU sponsor); OSS leaderboard (90-day public contributions for devs + HU-founded repos by 90d star delta, top 50 visible + full JSON dump, no follower threshold); monthly bilingual newsletter (two language editions per issue, subscriber picks at signup, ~800–1200 words, 5 sections: intro / events ahead / devs this month / OSS this month / closing). Job board excluded — saturated market, weak newsletter content angle.
+  - **Hungarian-ness rule.** Auto-include via GitHub `location` match (Hungary + major HU cities: Budapest, Debrecen, Szeged, Pécs, Miskolc, Győr, Veszprém, Szombathely); diaspora allowlist (hand-curated YAML, PR-able); self-submit form. Active connection to HU scene beats genealogy.
+  - **Stack.** Astro + Tailwind + TypeScript, data as YAML/JSON in repo (no DB at MVP), hosted on Vercel. Single mono-repo `huntech-dev/huntech.dev` under a new GitHub org `huntech-dev`. Public from day 1; newsletter form gates the issues.
+  - **Data pipeline.** GitHub Actions cron — weekly leaderboard refresh (GitHub API), daily event scrape (Meetup.com + Eventbrite + GDG + PR submissions), manually maintained diaspora YAML.
+  - **Launch sequence (~8 weeks to first issue).** Weeks 1–2 site skeleton + language toggle + events page; weeks 3–4 leaderboard + signup form; weeks 5–6 scraper pipeline stable + community submission template; weeks 7–8 first newsletter issue (HU + EN editions) drafted, reviewed, sent.
+  - **Jarvis-agent fit (the actual Phase 5 justification).** Scout discovers new HU devs/meetups/repos; Analyst validates Hungarian-ness and filters noise; Strategist drafts the monthly issue outline from the month's signals; Developer maintains site code and fixes scrapers when sources change shape; Marketer drafts copy in HU and EN and runs both through `tools/humanizer.ts`. All five agents have non-trivial work.
+  - **Deferred until issue 1 drafting.** Newsletter platform (Substack vs Buttondown) — does not block earlier work.
 - The showcase project's code repo is open-sourced; its brain + plans + research live in the `showcase` vault (public via the chosen architecture).
 - Marketing plans for the showcase double as content for the personal-brand project (videos / blog posts: "how Jarvis built X this week"). Hits your "become known in Hungarian IT" goal.
 - Provides external metrics (visits, signups, GitHub stars, newsletter subs) that demonstrate Jarvis-driven outcomes without exposing your apps or consulting clients.
@@ -1492,8 +1499,6 @@ Two complementary tracks:
 - The gitignored shared root layer (`jarvis.db`, `user-profile.json`, `setup-queue.jsonl`, `sandbox/`, `ideas/`, `logs/`, `.env`, `.daemon.pid`, brain `.lock` files) — never committed, anywhere.
 - IT-consulting business details (clients, deliverables, rates) — `consulting` vault inside the private data repo.
 - User profile + observed patterns + feedback table + learning-loop history — shared root layer, always gitignored.
-
-**Choice of showcase project deferred** — see §19 → Open items.
 
 ### Deferred to later phases
 
@@ -1749,7 +1754,6 @@ Pick up these when relevant — none blocks Phase 0.
 7. **OS-level daemon autostart** (launchd on macOS) — deferred. Accept manual `yarn jarvis daemon` start for now. Reconsider after a few weeks of real use if "I forgot to start" becomes annoying.
 8. **Phase 0 seed self-improvement** — pick a concrete first improvement plan against the `jarvis` project itself before starting Phase 0 build (so there's a real target for the first self-bootstrap run). Candidate shapes: "add a `status --app` summary command", "tighten the Strategist plan-length prompt", "add a Slack message preview for plan reviews". User picks.
 9. **Vector DB for doc / research retrieval** (e.g., `pgvector` on existing Supabase) — defer. Revisit only when self-telemetry shows retrieval-miss rate > 10%, or doc + research corpus exceeds ~100 entries per app. Tag-based retrieval is sufficient at smaller scale.
-10. **Phase 5 showcase project pick** — choose a purpose-built public project to onboard as proof Jarvis works. Candidates: Hungarian IT job board, conference / meetup event aggregator, OSS contribution leaderboard for Hungarian devs, monthly Hungarian IT newsletter. Constraints: small, open-sourceable, provides a clear content angle for the personal-brand project. Decide when Phase 4 (full self-improvement flywheel) is stable.
 
 ---
 
