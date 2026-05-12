@@ -22,11 +22,13 @@ import { appendEvent } from "../../orchestrator/event-log.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
 import {
   assertCleanMain,
+  countRecoveriesSinceLastAgentCall,
   createPlanExecutorService,
   findOrphanedClaims,
   findStaleExecuting,
   readFiredPlanIds,
   recoverOrphanedClaims,
+  recoverStaleExecuting,
   runPlanExecutorTick,
 } from "./service.ts";
 import type { DaemonContext } from "../../cli/commands/daemon.ts";
@@ -1236,6 +1238,180 @@ describe("findStaleExecuting boundary", () => {
     seedTransition("p-completed", "done", new Date(nowMs - 10 * 60_000).toISOString());
     const stale = findStaleExecuting(dbFile(sandbox.dataDir), nowMs);
     expect(stale.map((s) => s.planId)).not.toContain("p-completed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// recoverStaleExecuting — recovery cap
+// ---------------------------------------------------------------------------
+
+describe("recoverStaleExecuting — recovery cap", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  let db: Database.Database;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    db = new Database(dbFile(sandbox.dataDir));
+  });
+
+  afterEach(() => {
+    db.close();
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function seedStaleExecutingPlan(planId: string, app = "jarvis"): void {
+    dropPlan(sandbox, planId, { status: "executing", app });
+    appendEvent(db, {
+      appId: app,
+      vaultId: "personal",
+      kind: "plan-transition",
+      payload: { planId, from: "approved", to: "executing", actor: "test" },
+      createdAt: new Date(Date.now() - 31 * 60_000).toISOString(),
+    });
+  }
+
+  function writeFiredRow(payload: Record<string, unknown>, createdAt?: string): void {
+    db.prepare(
+      "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(
+      payload["app"] ?? "jarvis",
+      "personal",
+      "plan-executor-fired",
+      JSON.stringify(payload),
+      createdAt ?? new Date().toISOString(),
+    );
+  }
+
+  it("under threshold: 2 claim-recovered events, no agent-call → emits claim-recovered, plan stays approved", () => {
+    const planId = "2026-05-12-cap-under-2";
+    seedStaleExecutingPlan(planId);
+    for (let i = 0; i < 2; i++) {
+      writeFiredRow({ planId, app: "jarvis", mode: "claim-recovered", reason: `prior recovery ${i + 1}` });
+    }
+
+    recoverStaleExecuting(dbFile(sandbox.dataDir), fakeDaemonCtx().logger);
+
+    const claimed = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM events WHERE kind = 'plan-executor-fired' AND json_extract(payload, '$.mode') = 'claim-recovered' AND json_extract(payload, '$.planId') = ?",
+    ).get(planId) as { cnt: number };
+    expect(claimed.cnt).toBe(3);
+
+    expect(findPlan(sandbox.dataDir, planId)?.plan.metadata.status).toBe("approved");
+
+    const exhausted = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM events WHERE kind = 'plan-executor-fired' AND json_extract(payload, '$.mode') = 'recovery-exhausted' AND json_extract(payload, '$.planId') = ?",
+    ).get(planId) as { cnt: number };
+    expect(exhausted.cnt).toBe(0);
+  });
+
+  it("at threshold: 3 claim-recovered in 24h, no agent-call → plan blocked, recovery-exhausted emitted, zero further claim-recovered", () => {
+    const planId = "2026-05-12-cap-at-3";
+    seedStaleExecutingPlan(planId);
+    for (let i = 0; i < 3; i++) {
+      writeFiredRow({ planId, app: "jarvis", mode: "claim-recovered", reason: `prior recovery ${i + 1}` });
+    }
+
+    recoverStaleExecuting(dbFile(sandbox.dataDir), fakeDaemonCtx().logger);
+
+    expect(findPlan(sandbox.dataDir, planId)?.plan.metadata.status).toBe("blocked");
+
+    const exhausted = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM events WHERE kind = 'plan-executor-fired' AND json_extract(payload, '$.mode') = 'recovery-exhausted' AND json_extract(payload, '$.planId') = ?",
+    ).get(planId) as { cnt: number };
+    expect(exhausted.cnt).toBe(1);
+
+    const claimed = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM events WHERE kind = 'plan-executor-fired' AND json_extract(payload, '$.mode') = 'claim-recovered' AND json_extract(payload, '$.planId') = ?",
+    ).get(planId) as { cnt: number };
+    expect(claimed.cnt).toBe(3);
+  });
+
+  it("intervening agent-call resets counter: 3 + agent-call + 2 more recoveries → count is 2, still recoverable", () => {
+    const planId = "2026-05-12-cap-agent-call-reset";
+    seedStaleExecutingPlan(planId);
+
+    const nowMs = Date.now();
+    const windowCutoffIso = new Date(nowMs - 24 * 3600_000).toISOString();
+    const beforeAgentCallTs = new Date(nowMs - 2 * 3600_000).toISOString();
+    const agentCallTs = new Date(nowMs - 1 * 3600_000).toISOString();
+
+    // 3 recoveries before the agent-call
+    for (let i = 0; i < 3; i++) {
+      writeFiredRow({ planId, app: "jarvis", mode: "claim-recovered", reason: `old ${i + 1}` }, beforeAgentCallTs);
+    }
+    // agent-call resets the counter
+    db.prepare(
+      "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).run("jarvis", "personal", "agent-call", JSON.stringify({ planId, mode: "execute" }), agentCallTs);
+    // 2 new recoveries after the agent-call
+    for (let i = 0; i < 2; i++) {
+      writeFiredRow({ planId, app: "jarvis", mode: "claim-recovered", reason: `new ${i + 1}` });
+    }
+
+    expect(countRecoveriesSinceLastAgentCall(db, planId, windowCutoffIso)).toBe(2);
+
+    recoverStaleExecuting(dbFile(sandbox.dataDir), fakeDaemonCtx().logger);
+
+    expect(findPlan(sandbox.dataDir, planId)?.plan.metadata.status).toBe("approved");
+    const claimed = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM events WHERE kind = 'plan-executor-fired' AND json_extract(payload, '$.mode') = 'claim-recovered' AND json_extract(payload, '$.planId') = ?",
+    ).get(planId) as { cnt: number };
+    expect(claimed.cnt).toBe(6); // 3 old + 2 new + 1 from this recovery
+  });
+
+  it("regression: 5 successive stale-executing ticks → exactly 3 claim-recovered, then blocked, then zero more", () => {
+    const planId = "2026-05-12-cap-regression-5ticks";
+    const app = "regression-no-repo";
+    const baseMs = Date.now();
+    const logger = fakeDaemonCtx().logger;
+    // Executing transitions are seeded 1h before baseMs — they appear stale at
+    // nowMs = baseMs + N*3600_000 (cutoff = baseMs + N*3600_000 - 30min > baseMs - 1h).
+    // The approved transitions written by recovery at real-time ≈ baseMs also appear
+    // stale on subsequent ticks since baseMs < baseMs + N*3600_000 - 30min for N >= 1.
+    const execTs = new Date(baseMs - 3600_000).toISOString();
+
+    function seedExecutingForTick(): void {
+      dropPlan(sandbox, planId, { status: "executing", app });
+      db.prepare(
+        "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+      ).run(app, "personal", "plan-transition",
+        JSON.stringify({ planId, from: "approved", to: "executing", actor: "test" }),
+        execTs);
+    }
+
+    // Ticks 1–3: each recovery increments claim-recovered count, stays under cap
+    for (let tick = 1; tick <= 3; tick++) {
+      seedExecutingForTick();
+      recoverStaleExecuting(dbFile(sandbox.dataDir), logger, baseMs + tick * 3600_000);
+    }
+
+    const claimedAfter3 = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM events WHERE kind = 'plan-executor-fired' AND json_extract(payload, '$.mode') = 'claim-recovered' AND json_extract(payload, '$.planId') = ?",
+    ).get(planId) as { cnt: number };
+    expect(claimedAfter3.cnt).toBe(3);
+
+    // Tick 4: count == 3 → exhausted → plan blocked
+    seedExecutingForTick();
+    recoverStaleExecuting(dbFile(sandbox.dataDir), logger, baseMs + 4 * 3600_000);
+
+    expect(findPlan(sandbox.dataDir, planId)?.plan.metadata.status).toBe("blocked");
+
+    const exhausted = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM events WHERE kind = 'plan-executor-fired' AND json_extract(payload, '$.mode') = 'recovery-exhausted' AND json_extract(payload, '$.planId') = ?",
+    ).get(planId) as { cnt: number };
+    expect(exhausted.cnt).toBe(1);
+
+    // Tick 5: latest plan-transition is now to=blocked (written by applyPlanTransition
+    // on tick 4), so findStaleExecuting does not return the plan — no-op.
+    recoverStaleExecuting(dbFile(sandbox.dataDir), logger, baseMs + 5 * 3600_000);
+
+    const finalClaimed = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM events WHERE kind = 'plan-executor-fired' AND json_extract(payload, '$.mode') = 'claim-recovered' AND json_extract(payload, '$.planId') = ?",
+    ).get(planId) as { cnt: number };
+    expect(finalClaimed.cnt).toBe(3);
   });
 });
 
