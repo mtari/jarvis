@@ -103,13 +103,13 @@ export function formatBusinessIdeas(file: BusinessIdeasFile): string {
     out += file.preamble.replace(/\n+$/, "") + "\n\n";
   }
   for (const idea of file.ideas) {
-    out += formatIdea(idea);
+    out += renderIdeaSection(idea);
   }
   return out;
 }
 
 /** Renders one section, including its trailing blank-line separator. */
-function formatIdea(idea: BusinessIdea): string {
+export function renderIdeaSection(idea: BusinessIdea): string {
   const lines: string[] = [];
   lines.push(`## ${idea.title}`);
   lines.push(`App: ${idea.app}`);
@@ -325,4 +325,27 @@ function slugify(s: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 80);
+}
+
+export class IdeaSectionParseError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "IdeaSectionParseError";
+  }
+}
+
+/**
+ * Parses a single `## <title>` section from `text` and returns the
+ * `BusinessIdea`. Throws `IdeaSectionParseError` if the text cannot be
+ * parsed (missing heading, missing required field, bad Score, etc.).
+ *
+ * Delegates to `parseBusinessIdeas` so the same field rules apply.
+ */
+export function parseIdeaSection(text: string): BusinessIdea {
+  const { ideas, unparseable } = parseBusinessIdeas(text);
+  if (ideas[0] !== undefined) return ideas[0];
+  if (unparseable[0] !== undefined) throw new IdeaSectionParseError(unparseable[0].reason);
+  throw new IdeaSectionParseError(
+    'no idea section found — ensure the text starts with a ## heading',
+  );
 }

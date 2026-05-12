@@ -5,8 +5,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { businessIdeasFile } from "../cli/paths.ts";
 import {
   formatBusinessIdeas,
+  IdeaSectionParseError,
   loadBusinessIdeas,
   parseBusinessIdeas,
+  parseIdeaSection,
   saveBusinessIdeas,
 } from "./business-ideas.ts";
 
@@ -366,6 +368,26 @@ Brief: weekly portfolio digest
     const reparsed = parseBusinessIdeas(reformatted);
     expect(reparsed.ideas).toEqual(parsed.ideas);
     expect(reparsed.preamble).toBe(parsed.preamble);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseIdeaSection — single-section parser
+// ---------------------------------------------------------------------------
+
+describe("parseIdeaSection", () => {
+  it("returns a BusinessIdea for a well-formed single section", () => {
+    const text = `## My Idea\nApp: demo\nBrief: do the thing\n`;
+    const idea = parseIdeaSection(text);
+    expect(idea.title).toBe("My Idea");
+    expect(idea.app).toBe("demo");
+    expect(idea.brief).toBe("do the thing");
+    expect(idea.id).toBe("my-idea");
+  });
+
+  it("throws IdeaSectionParseError when the heading is empty (## with no title)", () => {
+    const text = `## \nApp: demo\nBrief: y\n`;
+    expect(() => parseIdeaSection(text)).toThrow(IdeaSectionParseError);
   });
 });
 
