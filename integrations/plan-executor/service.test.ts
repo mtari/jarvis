@@ -18,11 +18,13 @@ import {
   type InstallSandbox,
 } from "../../cli/commands/_test-helpers.ts";
 import { saveBrain } from "../../orchestrator/brain.ts";
+import { appendEvent } from "../../orchestrator/event-log.ts";
 import { findPlan } from "../../orchestrator/plan-store.ts";
 import {
   assertCleanMain,
   createPlanExecutorService,
   findOrphanedClaims,
+  findStaleExecuting,
   readFiredPlanIds,
   recoverOrphanedClaims,
   runPlanExecutorTick,
@@ -1014,4 +1016,314 @@ describe("createPlanExecutorService tickInFlight guard", () => {
     // tickInFlight must have been reset by finally; tick #2 was allowed in.
     expect(tickCallCount).toBeGreaterThanOrEqual(2);
   }, 3000);
+});
+
+// ---------------------------------------------------------------------------
+// done:false handling
+// ---------------------------------------------------------------------------
+
+describe("done:false handling", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  let db: Database.Database;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    db = new Database(dbFile(sandbox.dataDir));
+  });
+
+  afterEach(() => {
+    db.close();
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("done=false first time → plan back to approved, event has BLOCKED prefix, plan not locked", async () => {
+    const planId = "2026-05-12-done-false-1";
+    const repo = makeCleanMainRepo();
+    try {
+      dropPlan(sandbox, planId, { status: "approved", implementationReview: "skip" });
+      const { transport } = scriptedTransport(["Nothing here, no done or blocked."]);
+
+      const result = await runPlanExecutorTick({
+        dataDir: sandbox.dataDir,
+        transport,
+        ctx: fakeDaemonCtx(),
+        repoRoot: repo.dir,
+      });
+
+      expect(result.fired).toHaveLength(1);
+      expect(result.fired[0]?.mode).toBe("execute");
+      expect(result.fired[0]?.reason).toMatch(/^BLOCKED: done=false attempt 1/);
+
+      const plan = findPlan(sandbox.dataDir, planId);
+      expect(plan?.plan.metadata.status).toBe("approved");
+
+      // No plan-transition to blocked was written
+      const blockedRows = db
+        .prepare(
+          "SELECT 1 FROM events WHERE kind = 'plan-transition' AND json_extract(payload, '$.to') = 'blocked' AND json_extract(payload, '$.planId') = ?",
+        )
+        .all(planId) as unknown[];
+      expect(blockedRows).toHaveLength(0);
+
+      // Plan NOT in readFiredPlanIds — claim-recovered was written to unlock it
+      expect(readFiredPlanIds(dbFile(sandbox.dataDir)).has(planId)).toBe(false);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it("done=false three times → blocked after count ≥ 2", async () => {
+    const planId = "2026-05-12-done-false-max";
+    const repo = makeCleanMainRepo();
+    try {
+      dropPlan(sandbox, planId, { status: "approved", implementationReview: "skip" });
+
+      // Seed 2 prior BLOCKED:done=false attempts so countDoneFalseAttempts returns 2
+      for (let i = 1; i <= 2; i++) {
+        db.prepare(
+          "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
+        ).run(
+          "jarvis",
+          "personal",
+          "plan-executor-fired",
+          JSON.stringify({
+            planId,
+            app: "jarvis",
+            mode: "execute",
+            reason: `BLOCKED: done=false attempt ${i} — queued for resume`,
+          }),
+          new Date().toISOString(),
+        );
+      }
+
+      const { transport } = scriptedTransport(["Nothing here, no done or blocked."]);
+
+      const result = await runPlanExecutorTick({
+        dataDir: sandbox.dataDir,
+        transport,
+        ctx: fakeDaemonCtx(),
+        repoRoot: repo.dir,
+      });
+
+      expect(result.fired).toHaveLength(1);
+
+      // Plan is now permanently blocked
+      const plan = findPlan(sandbox.dataDir, planId);
+      expect(plan?.plan.metadata.status).toBe("blocked");
+
+      // plan-transition to blocked exists
+      const blockedRows = db
+        .prepare(
+          "SELECT 1 FROM events WHERE kind = 'plan-transition' AND json_extract(payload, '$.to') = 'blocked' AND json_extract(payload, '$.planId') = ?",
+        )
+        .all(planId) as unknown[];
+      expect(blockedRows.length).toBeGreaterThan(0);
+
+      // Plan IS in readFiredPlanIds — terminal event without BLOCKED prefix was written
+      expect(readFiredPlanIds(dbFile(sandbox.dataDir)).has(planId)).toBe(true);
+    } finally {
+      repo.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findOrphanedClaims regression — BLOCKED event after claim
+// ---------------------------------------------------------------------------
+
+describe("findOrphanedClaims regression — BLOCKED event after claim", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  let db: Database.Database;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    db = new Database(dbFile(sandbox.dataDir));
+  });
+
+  afterEach(() => {
+    db.close();
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function writeFired(payload: Record<string, unknown>): void {
+    db.prepare(
+      "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(
+      payload["app"] ?? "jarvis",
+      "personal",
+      "plan-executor-fired",
+      JSON.stringify(payload),
+      new Date().toISOString(),
+    );
+  }
+
+  it("claim followed by non-final BLOCKED execute → findOrphanedClaims returns the planId (954→955 regression)", () => {
+    // Before the fix, the BLOCKED execute event (non-final) matched the NOT
+    // EXISTS sub-query and masked the orphan — findOrphanedClaims returned
+    // length 0. After the fix the inline final-event predicate excludes BLOCKED
+    // rows, so the claim is correctly identified as orphaned.
+    const planId = "p-954-955-regression";
+    writeFired({ planId, app: "jarvis", mode: "skipped", reason: "claimed; result pending" });
+    writeFired({ planId, app: "jarvis", mode: "execute", reason: "BLOCKED: assertCleanMain: working tree is dirty" });
+
+    const orphans = findOrphanedClaims(dbFile(sandbox.dataDir));
+    expect(orphans).toHaveLength(1);
+    expect(orphans[0]?.planId).toBe(planId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findStaleExecuting boundary
+// ---------------------------------------------------------------------------
+
+describe("findStaleExecuting boundary", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  let db: Database.Database;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    db = new Database(dbFile(sandbox.dataDir));
+  });
+
+  afterEach(() => {
+    db.close();
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  function seedTransition(planId: string, to: string, createdAt: string): void {
+    appendEvent(db, {
+      appId: "jarvis",
+      vaultId: "personal",
+      kind: "plan-transition",
+      payload: { planId, from: "approved", to, actor: "plan-executor" },
+      createdAt,
+    });
+  }
+
+  it("last event 31 min ago → returned as stale", () => {
+    const nowMs = Date.now();
+    seedTransition("p-stale-31", "executing", new Date(nowMs - 31 * 60_000).toISOString());
+    const stale = findStaleExecuting(dbFile(sandbox.dataDir), nowMs);
+    expect(stale.map((s) => s.planId)).toContain("p-stale-31");
+  });
+
+  it("last event 29 min ago → not returned (below threshold)", () => {
+    const nowMs = Date.now();
+    seedTransition("p-fresh-29", "executing", new Date(nowMs - 29 * 60_000).toISOString());
+    const stale = findStaleExecuting(dbFile(sandbox.dataDir), nowMs);
+    expect(stale.map((s) => s.planId)).not.toContain("p-fresh-29");
+  });
+
+  it("exactly 30 min ago → not returned (exclusive boundary: lastEventAt < cutoff, not ≤)", () => {
+    const nowMs = Date.now();
+    seedTransition("p-exact-30", "executing", new Date(nowMs - 30 * 60_000).toISOString());
+    const stale = findStaleExecuting(dbFile(sandbox.dataDir), nowMs);
+    expect(stale.map((s) => s.planId)).not.toContain("p-exact-30");
+  });
+
+  it("later plan-transition away from executing → not returned", () => {
+    const nowMs = Date.now();
+    seedTransition("p-completed", "executing", new Date(nowMs - 60 * 60_000).toISOString());
+    seedTransition("p-completed", "done", new Date(nowMs - 10 * 60_000).toISOString());
+    const stale = findStaleExecuting(dbFile(sandbox.dataDir), nowMs);
+    expect(stale.map((s) => s.planId)).not.toContain("p-completed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// End-to-end recovery — all three patterns in one tick
+// ---------------------------------------------------------------------------
+
+describe("end-to-end recovery — all three patterns in one tick", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+  let db: Database.Database;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+    db = new Database(dbFile(sandbox.dataDir));
+  });
+
+  afterEach(() => {
+    db.close();
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("orphaned claim, stale executing, and done:false are all unlocked after one tick", async () => {
+    // Plans A and B use apps with no brain.repo. After recovery transitions
+    // them back to approved, the tick skips them with a non-terminal refusal
+    // ("no brain.repo configured"), keeping them absent from the locked set.
+    // Plan C uses the "jarvis" app backed by a brain that points at a real
+    // clean repo — it is the only plan that actually fires.
+
+    // Plan A: orphaned claim masked by a non-final BLOCKED follow event
+    // (the 954→955 pattern).
+    const planA = "2026-05-12-e2e-plan-a";
+    dropPlan(sandbox, planA, { status: "executing", app: "app-no-repo-a", implementationReview: "skip" });
+    db.prepare(
+      "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
+    ).run("app-no-repo-a", "personal", "plan-executor-fired",
+      JSON.stringify({ planId: planA, app: "app-no-repo-a", mode: "skipped", reason: "claimed; result pending" }),
+      new Date().toISOString());
+    db.prepare(
+      "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
+    ).run("app-no-repo-a", "personal", "plan-executor-fired",
+      JSON.stringify({ planId: planA, app: "app-no-repo-a", mode: "execute", reason: "BLOCKED: assertCleanMain: dirty" }),
+      new Date().toISOString());
+
+    // Plan B: stale — plan file in executing, last activity 31 min ago.
+    const planB = "2026-05-12-e2e-plan-b";
+    dropPlan(sandbox, planB, { status: "executing", app: "app-no-repo-b", implementationReview: "skip" });
+    const staleTs = new Date(Date.now() - 31 * 60_000).toISOString();
+    db.prepare(
+      "INSERT INTO events (app_id, vault_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
+    ).run("app-no-repo-b", "personal", "plan-executor-fired",
+      JSON.stringify({ planId: planB, app: "app-no-repo-b", mode: "skipped", reason: "claimed; result pending" }),
+      staleTs);
+    appendEvent(db, {
+      appId: "app-no-repo-b",
+      vaultId: "personal",
+      kind: "plan-transition",
+      payload: { planId: planB, from: "approved", to: "executing", actor: "plan-executor" },
+      createdAt: staleTs,
+    });
+
+    // Plan C: done:false — fired by the tick via brain-based cwd resolution.
+    // We seed a brain for "jarvis" that points at a clean fixture repo.
+    const planC = "2026-05-12-e2e-plan-c";
+    dropPlan(sandbox, planC, { status: "approved", implementationReview: "skip" });
+
+    const { transport } = scriptedTransport(["Nothing here, no done or blocked."]);
+    const repo = makeCleanMainRepo();
+    try {
+      // Seed a brain for jarvis so resolveAppCwd returns repo.dir for Plan C.
+      seedBrain(sandbox, "jarvis", { repo: { rootPath: repo.dir } });
+
+      await runPlanExecutorTick({
+        dataDir: sandbox.dataDir,
+        transport,
+        ctx: fakeDaemonCtx(),
+        // No repoRoot override — Plans A and B use brain lookup which returns
+        // null (no brain), so they are skipped rather than fired.
+      });
+
+      const locked = readFiredPlanIds(dbFile(sandbox.dataDir));
+      expect(locked.has(planA)).toBe(false);
+      expect(locked.has(planB)).toBe(false);
+      expect(locked.has(planC)).toBe(false);
+    } finally {
+      repo.cleanup();
+    }
+  });
 });

@@ -16,7 +16,8 @@ import {
 import { recordEscalation } from "../../orchestrator/escalations.ts";
 import { appendEvent } from "../../orchestrator/event-log.ts";
 import { loadBrain } from "../../orchestrator/brain.ts";
-import { listPlans, type PlanRecord } from "../../orchestrator/plan-store.ts";
+import { findPlan, listPlans, savePlan, type PlanRecord } from "../../orchestrator/plan-store.ts";
+import { transitionPlan, type PlanStatus } from "../../orchestrator/plan.ts";
 import { readTodayCallCount } from "../../cli/commands/cost.ts";
 import { brainFile, dbFile } from "../../cli/paths.ts";
 import type { DaemonContext, DaemonService } from "../../cli/commands/daemon.ts";
@@ -62,6 +63,13 @@ interface FiredPayload {
   priorClaimEventId?: number;
 }
 
+export interface StaleExecutingPlan {
+  planId: string;
+  app: string;
+  vaultId: string;
+  lastEventAt: string;
+}
+
 interface OrphanedClaim {
   eventId: number;
   planId: string;
@@ -95,6 +103,15 @@ export function findOrphanedClaims(dbFilePath: string): OrphanedClaim[] {
              WHERE e2.kind = 'plan-executor-fired'
                AND json_extract(e2.payload, '$.planId') = json_extract(e.payload, '$.planId')
                AND e2.id > e.id
+               AND (
+                 (json_extract(e2.payload, '$.mode') = 'skipped'
+                  AND json_extract(e2.payload, '$.reason') = 'claimed; result pending')
+                 OR json_extract(e2.payload, '$.mode') = 'not-runnable'
+                 OR (json_extract(e2.payload, '$.mode') IN ('draft-impl', 'execute')
+                     AND (json_extract(e2.payload, '$.reason') IS NULL
+                          OR (json_extract(e2.payload, '$.reason') NOT LIKE 'BLOCKED:%'
+                              AND json_extract(e2.payload, '$.reason') NOT LIKE 'RATE_LIMITED:%')))
+               )
            )`,
       )
       .all() as Array<{
@@ -123,10 +140,18 @@ export function recoverOrphanedClaims(
   const orphans = findOrphanedClaims(dbFilePath);
   if (orphans.length === 0) return;
 
+  const dataDir = path.dirname(dbFilePath);
   const recoveredAt = new Date().toISOString();
   const db = new Database(dbFilePath);
   try {
     for (const orphan of orphans) {
+      // If the plan is stuck in executing, transition it back to approved so
+      // the next tick can re-fire it. Skip the transition if it's already in
+      // a non-executing state (e.g., user manually moved it).
+      const record = findPlan(dataDir, orphan.planId);
+      if (record && record.plan.metadata.status === "executing") {
+        applyPlanTransition(dataDir, record, "approved", "plan-executor", "orphaned-claim recovery");
+      }
       appendEvent(db, {
         appId: orphan.app,
         vaultId: orphan.vaultId,
@@ -143,6 +168,151 @@ export function recoverOrphanedClaims(
         planId: orphan.planId,
         claimedAt: orphan.claimedAt,
         priorClaimEventId: orphan.eventId,
+      });
+    }
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Writes a plan-transition event and updates the plan file atomically.
+ * Callers are responsible for guarding against invalid transitions (e.g.,
+ * check `record.plan.metadata.status` before calling).
+ */
+function applyPlanTransition(
+  dataDir: string,
+  record: PlanRecord,
+  to: PlanStatus,
+  actor: string,
+  reason: string,
+): void {
+  const next = transitionPlan(record.plan, to);
+  const db = new Database(dbFile(dataDir));
+  try {
+    appendEvent(db, {
+      appId: record.app,
+      vaultId: record.vault,
+      kind: "plan-transition",
+      payload: {
+        planId: record.id,
+        from: record.plan.metadata.status,
+        to,
+        actor,
+        reason,
+      },
+    });
+  } finally {
+    db.close();
+  }
+  savePlan(record.path, next);
+}
+
+/**
+ * Counts plan-executor-fired events for a planId where the fire was an
+ * execute that returned done=false (identified by the BLOCKED:done=false
+ * reason prefix). Used to decide whether to retry or permanently block.
+ */
+function countDoneFalseAttempts(db: Database.Database, planId: string): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS cnt FROM events
+       WHERE kind = 'plan-executor-fired'
+         AND json_extract(payload, '$.planId') = ?
+         AND json_extract(payload, '$.mode') = 'execute'
+         AND json_extract(payload, '$.reason') LIKE 'BLOCKED: done=false%'`,
+    )
+    .get(planId) as { cnt: number };
+  return row?.cnt ?? 0;
+}
+
+/**
+ * Returns plans that are currently in executing state (per event log: latest
+ * plan-transition has to='executing' with no later plan-transition) AND whose
+ * last plan-transition or agent-call event is older than `nowMs - thresholdMs`.
+ * Default threshold: 30 minutes.
+ */
+export function findStaleExecuting(
+  dbFilePath: string,
+  nowMs: number,
+  thresholdMs = 30 * 60_000,
+): StaleExecutingPlan[] {
+  const db = new Database(dbFilePath, { readonly: true });
+  const cutoff = new Date(nowMs - thresholdMs).toISOString();
+  try {
+    const rows = db
+      .prepare(
+        `SELECT
+           json_extract(e.payload, '$.planId') AS planId,
+           e.app_id                            AS app,
+           e.vault_id                          AS vaultId,
+           (
+             SELECT MAX(e3.created_at)
+             FROM events e3
+             WHERE (e3.kind = 'plan-transition' OR e3.kind = 'agent-call')
+               AND json_extract(e3.payload, '$.planId') = json_extract(e.payload, '$.planId')
+           ) AS lastEventAt
+         FROM events e
+         WHERE e.kind = 'plan-transition'
+           AND json_extract(e.payload, '$.to') = 'executing'
+           AND json_extract(e.payload, '$.planId') IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM events e2
+             WHERE e2.kind = 'plan-transition'
+               AND json_extract(e2.payload, '$.planId') = json_extract(e.payload, '$.planId')
+               AND e2.id > e.id
+           )
+           AND (
+             SELECT MAX(e3.created_at)
+             FROM events e3
+             WHERE (e3.kind = 'plan-transition' OR e3.kind = 'agent-call')
+               AND json_extract(e3.payload, '$.planId') = json_extract(e.payload, '$.planId')
+           ) < ?`,
+      )
+      .all(cutoff) as StaleExecutingPlan[];
+    return rows;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * For each plan stuck in executing with no recent activity, transitions it
+ * back to approved and writes a claim-recovered event so the next tick
+ * can re-fire it.
+ */
+function recoverStaleExecuting(
+  dbFilePath: string,
+  logger: DaemonContext["logger"],
+  nowMs = Date.now(),
+  thresholdMs?: number,
+): void {
+  const stale = findStaleExecuting(dbFilePath, nowMs, thresholdMs);
+  if (stale.length === 0) return;
+
+  const dataDir = path.dirname(dbFilePath);
+  const db = new Database(dbFilePath);
+  try {
+    for (const entry of stale) {
+      const record = findPlan(dataDir, entry.planId);
+      if (record && record.plan.metadata.status === "executing") {
+        applyPlanTransition(dataDir, record, "approved", "plan-executor", "stale-executing recovery");
+      }
+      appendEvent(db, {
+        appId: entry.app,
+        vaultId: entry.vaultId,
+        kind: "plan-executor-fired",
+        payload: {
+          planId: entry.planId,
+          app: entry.app,
+          mode: "claim-recovered",
+          reason: `stale-executing recovery — last activity at ${entry.lastEventAt}`,
+        } satisfies FiredPayload,
+      });
+      logger.info("plan-executor: recovered stale executing plan", {
+        planId: entry.planId,
+        trigger: "stale-executing",
+        lastEventAt: entry.lastEventAt,
       });
     }
   } finally {
@@ -547,6 +717,11 @@ export async function runPlanExecutorTick(
   const fired: FiredPayload[] = [];
   const skipped: Array<{ planId: string; reason: string }> = [];
 
+  // Run recovery sweeps at the top of every tick so a single tick surfaces
+  // and re-enables all three stall patterns before the daily-cap gate.
+  recoverOrphanedClaims(dbFile(input.dataDir), input.ctx.logger);
+  recoverStaleExecuting(dbFile(input.dataDir), input.ctx.logger);
+
   // Daily cap gate. If today's UTC call count is at or over the cap,
   // skip *all* fires for this tick. Resumes automatically at 00:00 UTC.
   const dailyCap = input.dailyCallCap ?? DEFAULT_DAILY_CALL_CAP;
@@ -605,8 +780,68 @@ export async function runPlanExecutorTick(
       const firedRef: FiredPayload[] = fired;
       const dataDirRef = input.dataDir;
       executeQueue = executeQueue.then(async () => {
-        const payload = await runExecute(capturedCandidate, capturedFire);
+        let payload = await runExecute(capturedCandidate, capturedFire);
+
+        // done:false hook: Developer finished without a DONE/BLOCKED/AMEND
+        // marker. Retry up to 2 times (transition back to approved); on the
+        // third done:false permanently block the plan.
+        const result = payload.result as Record<string, unknown> | undefined;
+        if (
+          payload.mode === "execute" &&
+          result?.done === false &&
+          !result?.blocked &&
+          result?.subtype === "success"
+        ) {
+          const db = new Database(dbFile(dataDirRef));
+          const attempts = countDoneFalseAttempts(db, capturedCandidate.id);
+          db.close();
+          const attemptN = attempts + 1;
+          if (attempts < 2) {
+            payload = {
+              ...payload,
+              reason: `BLOCKED: done=false attempt ${attemptN} — queued for resume`,
+            };
+            const record = findPlan(dataDirRef, capturedCandidate.id);
+            if (record && record.plan.metadata.status === "executing") {
+              applyPlanTransition(dataDirRef, record, "approved", "plan-executor", `done=false attempt ${attemptN}`);
+            }
+            capturedFire.ctx.logger.info("plan-executor: done=false — queued for resume", {
+              planId: capturedCandidate.id,
+              attemptN,
+            });
+          } else {
+            payload = {
+              ...payload,
+              reason: `developer returned done=false after ${attemptN} attempts — manual intervention required`,
+            };
+            const record = findPlan(dataDirRef, capturedCandidate.id);
+            if (record && record.plan.metadata.status === "executing") {
+              applyPlanTransition(dataDirRef, record, "blocked", "plan-executor", "done=false max attempts");
+            }
+            capturedFire.ctx.logger.info("plan-executor: done=false — blocking after max attempts", {
+              planId: capturedCandidate.id,
+              attemptN,
+            });
+          }
+        }
+
         writeFiredEvent(dataDirRef, capturedCandidate, payload);
+
+        // For retry cases, also write a claim-recovered event so the plan
+        // re-enters eligibility on this tick's readFiredPlanIds pass rather
+        // than waiting for the next tick's orphan sweep.
+        if (
+          typeof payload.reason === "string" &&
+          payload.reason.startsWith("BLOCKED: done=false")
+        ) {
+          writeFiredEvent(dataDirRef, capturedCandidate, {
+            planId: capturedCandidate.id,
+            app: capturedCandidate.app,
+            mode: "claim-recovered",
+            reason: payload.reason,
+          });
+        }
+
         firedRef.push(payload);
       });
       // Await the queue so the tick result includes this fire's outcome.
@@ -657,6 +892,7 @@ export function createPlanExecutorService(
     name: "plan-executor",
     start(ctx: DaemonContext): void {
       recoverOrphanedClaims(dbFile(opts.dataDir), ctx.logger);
+      recoverStaleExecuting(dbFile(opts.dataDir), ctx.logger);
 
       const tickFn = async (): Promise<void> => {
         if (tickInFlight) {
