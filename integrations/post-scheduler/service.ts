@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import {
   flagStaleWindowPosts,
@@ -17,6 +18,12 @@ import {
   type RegisteredAdapter,
 } from "../../tools/channels/types.ts";
 import type { DaemonContext, DaemonService } from "../../cli/commands/daemon.ts";
+
+function fingerprint(err: unknown): string {
+  const str =
+    err instanceof Error ? `${err.name}:${err.message}` : String(err);
+  return createHash("sha1").update(str).digest("hex").slice(0, 12);
+}
 
 /**
  * Daemon service: every ~60s, picks up due `pending` rows from
@@ -244,6 +251,9 @@ export function createPostSchedulerService(
 
   let timer: NodeJS.Timeout | null = null;
   let tickInFlight = false;
+  let lastErrorFingerprint: string | null = null;
+  let lastErrorLoggedAt: number | null = null;
+  let suppressedCount = 0;
 
   return {
     name: "post-scheduler",
@@ -265,17 +275,44 @@ export function createPostSchedulerService(
         try {
           if (opts._tickBody !== undefined) {
             await opts._tickBody(ctx);
-            return;
+          } else {
+            await runPostSchedulerTick({
+              dataDir: opts.dataDir,
+              registry: registry!,
+              ctx,
+              ...(opts.now !== undefined && { now: opts.now() }),
+              ...(staleGraceMs !== undefined && { staleGraceMs }),
+            });
           }
-          await runPostSchedulerTick({
-            dataDir: opts.dataDir,
-            registry: registry!,
-            ctx,
-            ...(opts.now !== undefined && { now: opts.now() }),
-            ...(staleGraceMs !== undefined && { staleGraceMs }),
-          });
+          // Success: flush any pending suppressed count, then clear dedup state.
+          if (suppressedCount > 0) {
+            ctx.logger.warn(
+              `post-scheduler tick errored (suppressed ${suppressedCount} repeats, last seen ${new Date(lastErrorLoggedAt!).toISOString()})`,
+            );
+          }
+          lastErrorFingerprint = null;
+          lastErrorLoggedAt = null;
+          suppressedCount = 0;
         } catch (err) {
-          ctx.logger.error("post-scheduler tick errored", err);
+          const fp = fingerprint(err);
+          if (fp === lastErrorFingerprint) {
+            suppressedCount += 1;
+            const now = Date.now();
+            if (
+              lastErrorLoggedAt !== null &&
+              now - lastErrorLoggedAt >= 5 * 60_000
+            ) {
+              ctx.logger.warn(
+                `post-scheduler tick errored (suppressed ${suppressedCount} repeats, last seen ${new Date(lastErrorLoggedAt).toISOString()})`,
+              );
+              lastErrorLoggedAt = now;
+            }
+          } else {
+            ctx.logger.error("post-scheduler tick errored", err);
+            lastErrorFingerprint = fp;
+            lastErrorLoggedAt = Date.now();
+            suppressedCount = 0;
+          }
         } finally {
           tickInFlight = false;
         }

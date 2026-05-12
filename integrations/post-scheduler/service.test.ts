@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { dbFile } from "../../cli/paths.ts";
 import {
   makeInstallSandbox,
@@ -14,7 +14,10 @@ import {
   listScheduledPosts,
   type ScheduledPostInput,
 } from "../../orchestrator/scheduled-posts.ts";
-import { createDaemonLogger } from "../../orchestrator/daemon-logger.ts";
+import {
+  createDaemonLogger,
+  type DaemonLogger,
+} from "../../orchestrator/daemon-logger.ts";
 import {
   buildAdapterRegistry,
   type ChannelAdapter,
@@ -738,5 +741,189 @@ describe("buildAdapterRegistry priorities", () => {
     expect(desc).toHaveLength(3);
     const byName = desc.map((e) => e.adapterName).sort();
     expect(byName).toEqual(["fb-erdei", "stub", "stub"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Error dedup in createPostSchedulerService
+// ---------------------------------------------------------------------------
+
+describe("createPostSchedulerService: error dedup", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  type LogCall = {
+    level: "info" | "warn" | "error";
+    message: string;
+    error?: unknown;
+  };
+
+  function makeTestCtx(): { ctx: DaemonContext; calls: LogCall[] } {
+    const calls: LogCall[] = [];
+    const logger: DaemonLogger = {
+      info: (message) => calls.push({ level: "info", message }),
+      warn: (message) => calls.push({ level: "warn", message }),
+      error: (message, error) => calls.push({ level: "error", message, error }),
+      flush: () => {},
+      close: () => {},
+    };
+    const ctx: DaemonContext = {
+      dataDir: "/nonexistent",
+      pidFile: { pid: 1, startedAt: "2026-01-01T00:00:00.000Z" },
+      logger,
+    };
+    return { ctx, calls };
+  }
+
+  async function drainAsync(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  /**
+   * Drives `bodies.length` ticks through the service using fake timers.
+   * Starts fake clock at t=0. Advances by `tickMs` between each tick unless
+   * `advanceMsBetweenTicks[i]` overrides for tick i.
+   */
+  async function runTicks(
+    bodies: Array<() => void | Promise<void>>,
+    opts: { tickMs?: number; advanceMsBetweenTicks?: number[] } = {},
+  ): Promise<LogCall[]> {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(0));
+    const tickMs = opts.tickMs ?? 100;
+    let callIndex = 0;
+    const { ctx, calls } = makeTestCtx();
+    const service = createPostSchedulerService({
+      dataDir: "/nonexistent",
+      tickMs,
+      registry: buildAdapterRegistry([]),
+      _tickBody: async () => {
+        const body = bodies[callIndex++];
+        if (body) await body();
+      },
+    });
+
+    service.start(ctx);
+    await drainAsync(); // drain initial fire (tick 0)
+
+    for (let i = 1; i < bodies.length; i++) {
+      const advance = opts.advanceMsBetweenTicks?.[i - 1] ?? tickMs;
+      vi.advanceTimersByTime(advance);
+      await drainAsync();
+    }
+
+    service.stop();
+    return calls;
+  }
+
+  it("10 same-error ticks within 5-min window → 1 ERROR, 0 suppressed WARNs", async () => {
+    const err = new Error("no such column: next_retry_at");
+    err.name = "SqliteError";
+    const bodies = Array.from({ length: 10 }, () => async () => {
+      throw err;
+    });
+    const calls = await runTicks(bodies);
+    const errors = calls.filter(
+      (c) => c.level === "error" && c.message === "post-scheduler tick errored",
+    );
+    const suppressed = calls.filter(
+      (c) => c.level === "warn" && c.message.includes("suppressed"),
+    );
+    expect(errors).toHaveLength(1);
+    expect(suppressed).toHaveLength(0);
+  });
+
+  it("suppressed WARN emitted after 5-min window elapses, not before", async () => {
+    // Use a 10-min tick interval so we can advance Date.now past 5 min
+    // without firing thousands of ticks.
+    const TICK_MS = 10 * 60_000;
+    const err = new Error("stuck connection");
+    err.name = "DbError";
+    const bodies = [
+      async () => { throw err; }, // tick 0: new fingerprint → ERROR
+      async () => { throw err; }, // tick 1: at t=10min, past 5-min window → WARN
+    ];
+    // Between tick 0 and tick 1, advance 10 min (= tickMs).
+    const calls = await runTicks(bodies, {
+      tickMs: TICK_MS,
+      advanceMsBetweenTicks: [TICK_MS],
+    });
+    const errors = calls.filter(
+      (c) => c.level === "error" && c.message === "post-scheduler tick errored",
+    );
+    const suppressed = calls.filter(
+      (c) => c.level === "warn" && c.message.includes("suppressed"),
+    );
+    expect(errors).toHaveLength(1);
+    expect(suppressed).toHaveLength(1);
+    expect(suppressed[0]?.message).toMatch(/suppressed 1 repeats/);
+  });
+
+  it("10 distinct errors → 10 ERRORs, no suppressed WARNs", async () => {
+    const bodies = Array.from({ length: 10 }, (_, i) => async () => {
+      throw new Error(`unique error ${i}`);
+    });
+    const calls = await runTicks(bodies);
+    const errors = calls.filter(
+      (c) => c.level === "error" && c.message === "post-scheduler tick errored",
+    );
+    const suppressed = calls.filter(
+      (c) => c.level === "warn" && c.message.includes("suppressed"),
+    );
+    expect(errors).toHaveLength(10);
+    expect(suppressed).toHaveLength(0);
+  });
+
+  it("[error, error, error, success, error] → 2 ERRORs, flush WARN with count=2", async () => {
+    const err = new Error("repeated db error");
+    err.name = "SqliteError";
+    const bodies: Array<() => Promise<void>> = [
+      async () => { throw err; }, // tick 0: ERROR, suppressed=0
+      async () => { throw err; }, // tick 1: suppressed=1, no WARN (< 5 min)
+      async () => { throw err; }, // tick 2: suppressed=2, no WARN (< 5 min)
+      async () => {},             // tick 3: success → flush WARN count=2, clear state
+      async () => { throw err; }, // tick 4: state cleared → new ERROR
+    ];
+    const calls = await runTicks(bodies);
+    const errors = calls.filter(
+      (c) => c.level === "error" && c.message === "post-scheduler tick errored",
+    );
+    const suppressed = calls.filter(
+      (c) => c.level === "warn" && c.message.includes("suppressed"),
+    );
+    expect(errors).toHaveLength(2);
+    expect(suppressed).toHaveLength(1);
+    expect(suppressed[0]?.message).toMatch(/suppressed 2 repeats/);
+  });
+
+  it("fingerprint stable: same name+message deduped; different message not deduped", async () => {
+    // Same name+message (different object instances) → same fingerprint → 1 ERROR
+    const errA1 = Object.assign(new Error("conn refused"), { name: "DbError" });
+    const errA2 = Object.assign(new Error("conn refused"), { name: "DbError" });
+    const callsA = await runTicks([
+      async () => { throw errA1; },
+      async () => { throw errA2; },
+    ]);
+    expect(
+      callsA.filter(
+        (c) => c.level === "error" && c.message === "post-scheduler tick errored",
+      ),
+    ).toHaveLength(1);
+
+    // Different messages → different fingerprints → 2 ERRORs
+    const errB1 = Object.assign(new Error("conn refused"), { name: "DbError" });
+    const errB2 = Object.assign(new Error("conn timeout"), { name: "DbError" });
+    const callsB = await runTicks([
+      async () => { throw errB1; },
+      async () => { throw errB2; },
+    ]);
+    expect(
+      callsB.filter(
+        (c) => c.level === "error" && c.message === "post-scheduler tick errored",
+      ),
+    ).toHaveLength(2);
   });
 });
