@@ -137,6 +137,42 @@ describe("bootstrapDaemon", () => {
     expect(text).toContain('"message":"service started"');
     expect(text).toContain('"message":"daemon stopped"');
   });
+
+  it("logs each applied migration via the _runMigrations seam", async () => {
+    const handle = await bootstrapDaemon({
+      dataDir: sandbox.dataDir,
+      services: [],
+      now: () => new Date("2026-04-27T10:00:00Z"),
+      _runMigrations: async () => ({
+        applied: ["002-scheduled-posts-retry"],
+        alreadyApplied: ["001-initial-schema"],
+      }),
+    });
+    await handle.shutdown("test");
+    const logFile = path.join(
+      logsDir(sandbox.dataDir),
+      "daemon-2026-04-27.log",
+    );
+    const text = fs.readFileSync(logFile, "utf8");
+    expect(text).toContain('"message":"migration applied"');
+    expect(text).toContain('"migration":"002-scheduled-posts-retry"');
+  });
+
+  it("aborts startup and releases PID/logger if migration throws", async () => {
+    const svc = recordingService("should-not-start");
+    await expect(
+      bootstrapDaemon({
+        dataDir: sandbox.dataDir,
+        services: [svc],
+        _runMigrations: async () => {
+          throw new Error("migration exploded");
+        },
+      }),
+    ).rejects.toThrow(/migration exploded/);
+
+    expect(svc.startedWith).toBeUndefined();
+    expect(fs.existsSync(daemonPidFile(sandbox.dataDir))).toBe(false);
+  });
 });
 
 describe("createHeartbeatService", () => {
