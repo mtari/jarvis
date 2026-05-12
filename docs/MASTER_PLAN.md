@@ -1311,14 +1311,13 @@ Writes to tracked files in `jarvis-data/` (anything under `vaults/`) commit to t
 
 **Push debouncing:** automatic pushes are debounced with a 30-second coalesce window. Multiple plan completions in quick succession produce a single push, not N. Manual `data push` bypasses debouncing.
 
-### Phase 5 — public showcase architecture
+### Phase 5 — public showcase architecture (resolved 2026-05-12)
 
-`personal`, `consulting`, and any other private vaults all share the data repo's remote. The Phase 5 public showcase (Track B) is the only case where vault-level privacy must differ. When that phase lands, choose one of:
+`personal`, `consulting`, and any other vaults all share the data repo's single private remote. The Phase 5 public showcase (Track B) does **not** require a separate or public vault: the showcase project's own code repo (e.g., `github.com/huntech-dev/huntech.dev`) is the public artifact, while the showcase project's brain + plans + research stay inside the private `jarvis-data` repo alongside every other vault.
 
-- **Separate repo** for `vaults/showcase/` (extract at Phase 5 entry; the `showcase` vault becomes its own git repo with a public remote, sibling to the others). Simplest, but `vault move --to showcase` becomes a cross-repo operation.
-- **Git submodule** at `vaults/showcase/` pointing at a public remote. Keeps the addressing the same; adds submodule plumbing to install/clone.
+Public proof of Jarvis comes from (a) the showcase project's PR history with `Co-Authored-By` agent commits and (b) marketing content (blog posts / videos) the user writes about the work. Strategic deliberation, draft revisions, rejected signals, and scout research stay private.
 
-Decision deferred to Phase 5 entry — both are tractable, the choice depends on how often projects move into/out of `showcase`.
+Earlier draft alternatives — separate repo for `vaults/showcase/`, or git submodule pointing at a public remote — were dropped: the simpler "code repo public, brain private" split provides enough public-proof surface without extraction or submodule plumbing.
 
 **File-write atomicity:** the "atomic with SQLite transaction" guarantee in the table is implemented as tempfile + fsync + atomic rename, sequenced **after** the SQLite transaction commits. On SQLite rollback, the prior file version is preserved (no partial writes ever land on disk). This is the standard pattern; mentioned here so the implementer knows the guarantee isn't free.
 
@@ -1480,16 +1479,29 @@ Two complementary tracks:
 
 **Track B — A purpose-built public showcase project.**
 
-- Promote `vaults/showcase/` to a public-remote home — at Phase 5 entry, pick the architecture per §15 → "Phase 5 — public showcase architecture" (separate repo or git submodule). The other vaults stay in the private `jarvis-data` repo unchanged.
+- No separate `showcase` vault needed (decision 2026-05-12 — see §15 → "Phase 5 — public showcase architecture"). The showcase project's brain + plans + research live in the existing private jarvis-data repo alongside every other vault. The public artifact is the project's own code repo (e.g., `github.com/huntech-dev/huntech.dev`), not the brain.
 - Onboard **`huntech.dev`** into this vault from day one — a bilingual (HU + EN) Hungarian dev community site. Scope locked 2026-05-12:
   - **Three pillars.** Event aggregator (conferences + meetups + online events with any HU connection — held in HU, HU organizer, Hungarian-language, HU speaker, or HU sponsor); OSS leaderboard (90-day public contributions for devs + HU-founded repos by 90d star delta, top 50 visible + full JSON dump, no follower threshold); monthly bilingual newsletter (two language editions per issue, subscriber picks at signup, ~800–1200 words, 5 sections: intro / events ahead / devs this month / OSS this month / closing). Job board excluded — saturated market, weak newsletter content angle.
   - **Hungarian-ness rule.** Auto-include via GitHub `location` match (Hungary + major HU cities: Budapest, Debrecen, Szeged, Pécs, Miskolc, Győr, Veszprém, Szombathely); diaspora allowlist (hand-curated YAML, PR-able); self-submit form. Active connection to HU scene beats genealogy.
   - **Stack.** Astro + Tailwind + TypeScript, data as YAML/JSON in repo (no DB at MVP), hosted on Vercel. Single mono-repo `huntech-dev/huntech.dev` under a new GitHub org `huntech-dev`. Public from day 1; newsletter form gates the issues.
   - **Data pipeline.** GitHub Actions cron — weekly leaderboard refresh (GitHub API), daily event scrape (Meetup.com + Eventbrite + GDG + PR submissions), manually maintained diaspora YAML.
-  - **Launch sequence (~8 weeks to first issue).** Weeks 1–2 site skeleton + language toggle + events page; weeks 3–4 leaderboard + signup form; weeks 5–6 scraper pipeline stable + community submission template; weeks 7–8 first newsletter issue (HU + EN editions) drafted, reviewed, sent.
+  - **MVP polish features (Tier 1 — ship inside the 8-week launch).**
+    - **CFP tracker** — upcoming HU conferences with open Call-for-Papers windows. Extends the events pipeline (same data source, different filter). Newsletter section: "CFPs closing this month."
+    - **Project of the month** — one long-form post per month per HU-founded OSS project (architecture, why-it-exists, how-to-contribute). One markdown file per month in `content/projects/`, no new infra. Permanent anchor for the newsletter's "OSS this month" section.
+    - **Public read-only JSON API + RSS feeds** — `huntech.dev/api/events.json`, `feed/devs.xml`, etc. Zero net new code; exposes the data files Astro already generates. Invites ecosystem use (third-party VS Code extensions, dashboards).
+    - **Shields.io-style README badges** — `huntech.dev/badge/dev/<github-username>.svg` and `/badge/project/<repo>.svg`. Devs paste them into GitHub READMEs. Static SVG generation from leaderboard data; no accounts; auto-updates weekly. Every embedded badge is a backlink — viral by construction.
+  - **Launch sequence (~8 weeks to first issue).** Weeks 1–2 site skeleton + language toggle + events page; weeks 3–4 leaderboard + signup form + badge SVG route; weeks 5–6 scraper pipeline stable + CFP tracker + API/RSS endpoints + community submission template; weeks 7–8 first newsletter issue + first Project of the month deep dive.
+  - **v1.1 roadmap (Tier 2 — post-MVP, no commit date).** Each gated on a specific MVP signal before promotion:
+    - **Hiring-companies directory** — company-level (not jobs) list of HU companies actively hiring devs. Gate: 3+ newsletter issues shipped, audience exists to justify the editorial work.
+    - **Junior-friendly filter** — "beginner-welcome" event tag + "open to mentoring" dev tag. Gate: submission flow + moderation pattern proven on community PR submissions.
+    - **Speaker directory** — HU devs available to speak at meetups/conferences. Gate: CFP tracker live ~6 months, inbound traffic from conference organizers.
+    - **Podcast** — interviews with HU devs from the leaderboard. Gate: 1,000+ newsletter subscribers, audio-content pull felt.
+    - **Event-attendance badges (POAP-style)** — heavier infra than README badges (QR codes at events, claim flow, identity). Gate: organizer relationships exist; revisit only after MVP stable.
+  - **Scheduled flagship (Tier 3 — recurring annual piece).**
+    - **"State of HU Dev" annual report** — every December issue, replaces that month's regular newsletter. Aggregates the year's leaderboard, events count, language/stack trends, notable releases, with editorial commentary. First issue: December of launch year. Viral potential; recurring marketing asset; forcing function to keep data clean.
   - **Jarvis-agent fit (the actual Phase 5 justification).** Scout discovers new HU devs/meetups/repos; Analyst validates Hungarian-ness and filters noise; Strategist drafts the monthly issue outline from the month's signals; Developer maintains site code and fixes scrapers when sources change shape; Marketer drafts copy in HU and EN and runs both through `tools/humanizer.ts`. All five agents have non-trivial work.
   - **Deferred until issue 1 drafting.** Newsletter platform (Substack vs Buttondown) — does not block earlier work.
-- The showcase project's code repo is open-sourced; its brain + plans + research live in the `showcase` vault (public via the chosen architecture).
+- The showcase project's code repo is open-sourced. Its brain + plans + research stay in the private jarvis-data repo per §15 — public proof comes from the project's PR history (with `Co-Authored-By` agent commits) plus the marketing content described below, not from exposing the brain.
 - Marketing plans for the showcase double as content for the personal-brand project (videos / blog posts: "how Jarvis built X this week"). Hits your "become known in Hungarian IT" goal.
 - Provides external metrics (visits, signups, GitHub stars, newsletter subs) that demonstrate Jarvis-driven outcomes without exposing your apps or consulting clients.
 

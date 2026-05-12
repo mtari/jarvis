@@ -270,7 +270,7 @@ Format: **User wants to X.** Constraint or context.
 ## Vaults (multi-repo data partitioning)
 
 169. **User wants to keep consulting separate from personal side projects.** Create a `consulting` vault with its own private git remote: `yarn jarvis vault create consulting --remote <private-url>`. Onboard consulting projects with `--vault consulting`. NDA-protected client data lives in a different repo from personal apps — backups, sharing, and access control happen per vault.
-170. **User wants a public vault for the Phase 5 showcase project.** `yarn jarvis vault create showcase --remote <public-github-url>`; then `onboard --app <showcase-name> --vault showcase ...`. Showcase brain + plans go to the public remote; everything else stays in private vaults.
+170. **User wants the Phase 5 showcase project in an existing vault.** No public vault is required (decision 2026-05-12 — see MASTER_PLAN.md §15). Onboard the showcase project into any existing vault: `yarn jarvis onboard --app <showcase-name> --vault personal ...`. Public proof comes from the project's own code repo, not the brain — the brain + plans stay private alongside every other vault.
 171. **User wants to see all their vaults.** `yarn jarvis vault list` — name, project count, git remote, default flag, last push timestamp.
 172. **User wants to set a different default vault.** `yarn jarvis vault set-default <name>` — subsequent `onboard` calls without `--vault` use the new default.
 173. **User wants to push / pull a vault.** `yarn jarvis vault push <name>` / `vault pull <name>` — commits and syncs with the vault's remote.

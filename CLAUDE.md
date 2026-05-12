@@ -38,4 +38,4 @@ Per §13 of MASTER_PLAN.md, any user-facing text Developer writes (in apps Jarvi
 
 ## Plan-flow status
 
-Phase 0 is in progress (see §16). Until Phase 0 ships, changes to this repo are made by hand and reviewed via normal GitHub PR flow. After Phase 0 exit, self-improvement plans flow through `yarn jarvis plan --app jarvis "<brief>"`.
+Phase 0–2 complete (see §16); Phase 2.5 conversational interface and Phase 3 Marketer are built; Phase 4 self-improvement flywheel components are in place. The Phase 5 showcase pick is locked — `huntech.dev` per §16 Track B — and onboarding is the immediate next step. Self-improvement plans for this repo flow through `yarn jarvis plan --app jarvis "<brief>"`. Hand-edits with normal GitHub PR review still happen alongside, especially for docs.
