@@ -282,7 +282,7 @@ const TRANSITIONS: Record<PlanStatus, ReadonlyArray<PlanStatus>> = {
   draft: ["awaiting-review"],
   "awaiting-review": ["approved", "draft", "rejected"],
   approved: ["executing", "paused", "blocked", "cancelled"],
-  executing: ["done", "awaiting-review", "paused", "blocked", "cancelled"],
+  executing: ["done", "awaiting-review", "approved", "paused", "blocked", "cancelled"],
   paused: ["executing", "cancelled"],
   blocked: ["executing", "cancelled"],
   done: ["shipped-pending-impact"],
