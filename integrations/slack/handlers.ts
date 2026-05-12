@@ -850,7 +850,10 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
     const file = loadBusinessIdeas(ctx.dataDir);
     const idx = file.ideas.findIndex((i) => i.id === ideaId);
     if (idx < 0) {
-      await postDmOrEphemeral(client, userId, userId, `✗ Idea \`${ideaId}\` not found.`);
+      await client.chat.postMessage({
+        channel: ctx.surfaceCtx.inboxChannelId,
+        text: `✗ <@${userId}> tried to edit idea \`${ideaId}\` but it wasn't found.`,
+      });
       return;
     }
 
@@ -878,14 +881,12 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       conn.close();
     }
 
-    await postDmOrEphemeral(
-      client,
-      userId,
-      userId,
-      doRescore
-        ? `✓ Updated ${ideaTitle}. Rescoring now…`
-        : `✓ Updated ${ideaTitle}. Scout will rescore on next tick.`,
-    );
+    await client.chat.postMessage({
+      channel: ctx.surfaceCtx.inboxChannelId,
+      text: doRescore
+        ? `:pencil: <@${userId}> updated *${ideaTitle}*. Rescoring now…`
+        : `:pencil: <@${userId}> updated *${ideaTitle}*. Scout will rescore on next tick.`,
+    });
 
     void rescoreDefault; // used only to populate the modal's default state
 
@@ -898,20 +899,16 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
         });
         const scored = result.entries.find((e) => e.ideaId === ideaId && e.score !== undefined);
         if (scored !== undefined) {
-          await postDmOrEphemeral(
-            client,
-            userId,
-            userId,
-            `Score: ${scored.score}`,
-          );
+          await client.chat.postMessage({
+            channel: ctx.surfaceCtx.inboxChannelId,
+            text: `*${ideaTitle}* → Score: *${scored.score}*`,
+          });
         }
       } catch (err) {
-        await postDmOrEphemeral(
-          client,
-          userId,
-          userId,
-          `✗ Rescore failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        await client.chat.postMessage({
+          channel: ctx.surfaceCtx.inboxChannelId,
+          text: `:warning: Rescore failed for *${ideaTitle}*: ${err instanceof Error ? err.message : String(err)}`,
+        });
       }
     }
   });
