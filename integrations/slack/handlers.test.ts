@@ -891,6 +891,99 @@ describe("/jarvis logs slash command", () => {
 void logsDir;
 
 // ---------------------------------------------------------------------------
+// /jarvis plan + /jarvis bug — slash flag parsing
+// ---------------------------------------------------------------------------
+
+describe("/jarvis plan slash flag parsing", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("flag form --app <name> <brief> resolves app correctly (not --app)", async () => {
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string; response_type?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: 'plan --app my-test-app "fix the nav bar"' },
+      respond: async (args) => { responds.push(args); },
+    });
+    // First respond is the "Strategist drafting" acknowledgement
+    expect(responds.length).toBeGreaterThanOrEqual(1);
+    expect(responds[0]?.response_type).toBe("ephemeral");
+    expect(responds[0]?.text).toContain("my-test-app");
+    expect(responds[0]?.text).not.toContain("--app");
+  });
+
+  it("positional form <app> <brief> still works", async () => {
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "plan my-test-app fix the nav bar" },
+      respond: async (args) => { responds.push(args); },
+    });
+    expect(responds.length).toBeGreaterThanOrEqual(1);
+    expect(responds[0]?.text).toContain("my-test-app");
+    expect(responds[0]?.text).not.toContain("--app");
+  });
+
+  it("--app with missing value returns parse-error ephemeral, no FS access", async () => {
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "plan --app" },
+      respond: async (args) => { responds.push(args); },
+    });
+    // Should get exactly one respond: the error message
+    expect(responds).toHaveLength(1);
+    expect(responds[0]?.text).toContain("Couldn't parse args");
+    // Verify no brain dir was accessed for --app
+    const enoentPath = path.join(sandbox.dataDir, "vaults", "personal", "brains", "--app");
+    expect(fs.existsSync(enoentPath)).toBe(false);
+  });
+
+  it("--app <name> with no brief returns usage ephemeral, no FS access on app path", async () => {
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "plan --app my-app" },
+      respond: async (args) => { responds.push(args); },
+    });
+    expect(responds).toHaveLength(1);
+    expect(responds[0]?.text).toContain("Usage");
+  });
+
+  it("bug flag form --app <name> <desc> resolves app correctly", async () => {
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: 'bug --app my-test-app "crash on login"' },
+      respond: async (args) => { responds.push(args); },
+    });
+    expect(responds.length).toBeGreaterThanOrEqual(1);
+    expect(responds[0]?.text).toContain("my-test-app");
+    expect(responds[0]?.text).not.toContain("--app");
+  });
+
+  it("bug --app with missing value returns parse-error ephemeral", async () => {
+    const { fake } = setupHarness(sandbox);
+    const responds: Array<{ text?: string }> = [];
+    await fake.invokeCommand("/jarvis", {
+      command: { text: "bug --app" },
+      respond: async (args) => { responds.push(args); },
+    });
+    expect(responds).toHaveLength(1);
+    expect(responds[0]?.text).toContain("Couldn't parse args");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // /jarvis status slash command
 // ---------------------------------------------------------------------------
 

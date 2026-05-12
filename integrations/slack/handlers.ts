@@ -58,6 +58,7 @@ import {
   formatScoreResults,
   parseScoutFlags,
 } from "./slash-commands.ts";
+import { parseSlashArgs } from "./slash-args.ts";
 import {
   surfacePlan,
   updateSurfacedPlan,
@@ -688,9 +689,9 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
 
     switch (subcommand) {
       case "plan":
-        return runSlashPlan(parts.slice(1), ctx, respond, "improvement");
+        return runSlashPlan(text.slice(subcommand.length).trim(), ctx, respond, "improvement");
       case "bug":
-        return runSlashPlan(parts.slice(1), ctx, respond, "improvement", "bugfix");
+        return runSlashPlan(text.slice(subcommand.length).trim(), ctx, respond, "improvement", "bugfix");
       case "inbox":
         return runSlashInbox(ctx, respond);
       case "triage":
@@ -1015,23 +1016,47 @@ type SlashRespond = (args: {
 }) => Promise<unknown>;
 
 async function runSlashPlan(
-  args: string[],
+  rawArgs: string,
   ctx: HandlerContext,
   respond: SlashRespond,
   planType: StrategistPlanType,
-  subtype?: string,
+  callerSubtype?: string,
 ): Promise<void> {
-  const subtypeLabel = subtype ? `${planType}/${subtype}` : planType;
-  const usage = subtype
-    ? "Usage: `/jarvis bug <app> <description>`"
-    : "Usage: `/jarvis plan <app> <brief>`";
+  const parsed = parseSlashArgs(rawArgs);
 
-  const app = args[0];
-  const brief = args.slice(1).join(" ");
-  if (!app || !brief) {
+  if (parsed.parseError) {
+    await respond({
+      response_type: "ephemeral",
+      text:
+        `Couldn't parse args: ${parsed.parseError}. ` +
+        `Use \`/jarvis ${callerSubtype ?? "plan"} --app <name> "<brief>"\` or \`/jarvis ${callerSubtype ?? "plan"} <name> "<brief>"\`.`,
+    });
+    return;
+  }
+
+  const app = parsed.app;
+  const brief = parsed.rest;
+  const subtype = callerSubtype ?? parsed.type;
+  const subtypeLabel = subtype ? `${planType}/${subtype}` : planType;
+  const usage = callerSubtype
+    ? `Usage: \`/jarvis bug <app> <description>\``
+    : `Usage: \`/jarvis plan <app> <brief>\``;
+
+  if (!app || app.startsWith("--")) {
+    await respond({
+      response_type: "ephemeral",
+      text:
+        `Couldn't parse app name from \`${rawArgs}\`. ` +
+        `Use \`/jarvis ${callerSubtype ?? "plan"} --app <name> "<brief>"\` or \`/jarvis ${callerSubtype ?? "plan"} <name> "<brief>"\`.`,
+    });
+    return;
+  }
+
+  if (!brief) {
     await respond({ response_type: "ephemeral", text: usage });
     return;
   }
+
   if (!isStrategistPlanType(planType)) return;
 
   await respond({
