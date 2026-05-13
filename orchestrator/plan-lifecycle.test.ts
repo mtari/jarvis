@@ -16,7 +16,6 @@ import {
   approvePlan,
   rejectPlan,
   revisePlan,
-  REVISE_CAP,
 } from "./plan-lifecycle.ts";
 import { recordFeedback } from "./feedback-store.ts";
 import { findPlan } from "./plan-store.ts";
@@ -245,11 +244,11 @@ describe("plan-lifecycle", () => {
       if (result.ok) expect(result.priorRevisions).toBe(0);
     });
 
-    it("hits the 3-cap escalation on the 4th attempt", () => {
+    it("has no revision cap — succeeds on the 4th attempt and beyond", () => {
       dropPlan(sandbox, "2026-04-28-cap", { status: "awaiting-review" });
       const seed = new Database(dbFile(sandbox.dataDir));
       try {
-        for (let i = 0; i < REVISE_CAP; i += 1) {
+        for (let i = 0; i < 3; i += 1) {
           recordFeedback(seed, {
             kind: "revise",
             actor: "user",
@@ -267,11 +266,8 @@ describe("plan-lifecycle", () => {
         "2026-04-28-cap",
         "fourth",
       );
-      expect(result.ok).toBe(false);
-      if (!result.ok && result.reason === "at-cap") {
-        expect(result.priorRevisions).toBe(REVISE_CAP);
-        expect(result.cap).toBe(REVISE_CAP);
-      }
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.priorRevisions).toBe(3);
     });
   });
 

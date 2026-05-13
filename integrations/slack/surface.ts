@@ -47,12 +47,15 @@ export interface SurfaceRecord {
   channel: string;
   messageTs: string;
   surfacedAt: string;
+  /** Set when this surface is a threaded reply under an earlier surface message. */
+  threadTs?: string;
 }
 
 interface SlackSurfacedPayload {
   planId: string;
   channel: string;
   messageTs: string;
+  threadTs?: string;
 }
 
 /** Returns the latest surface record for a plan, or null if not surfaced. */
@@ -75,6 +78,7 @@ export function findSurfaceRecord(
             channel: payload.channel,
             messageTs: payload.messageTs,
             surfacedAt: r.created_at,
+            ...(payload.threadTs ? { threadTs: payload.threadTs } : {}),
           };
         }
       } catch {
@@ -87,21 +91,60 @@ export function findSurfaceRecord(
   }
 }
 
+/**
+ * Returns true when the plan's latest `plan-redrafted` event is newer than its
+ * latest `slack-surfaced` event — i.e., the redrafted version still owes a
+ * Slack post. Used by the surface tick to pick up CLI-triggered redrafts.
+ */
+export function planNeedsResurface(
+  dbFilePath: string,
+  planId: string,
+): boolean {
+  const db = new Database(dbFilePath, { readonly: true });
+  try {
+    const lastSurfaced = db
+      .prepare(
+        "SELECT id FROM events WHERE kind = 'slack-surfaced' AND json_extract(payload, '$.planId') = ? ORDER BY id DESC LIMIT 1",
+      )
+      .get(planId) as { id: number } | undefined;
+    if (!lastSurfaced) return false; // never surfaced — not a re-surface case
+    const lastRedrafted = db
+      .prepare(
+        "SELECT id FROM events WHERE kind = 'plan-redrafted' AND json_extract(payload, '$.planId') = ? ORDER BY id DESC LIMIT 1",
+      )
+      .get(planId) as { id: number } | undefined;
+    if (!lastRedrafted) return false;
+    return lastRedrafted.id > lastSurfaced.id;
+  } finally {
+    db.close();
+  }
+}
+
 export interface SurfacePlanResult {
   /** True when this call actually posted a new message; false when an existing surface was reused. */
   posted: boolean;
   surface: SurfaceRecord;
 }
 
-/** Posts a plan to #jarvis-inbox and records the surface event. Idempotent. */
+export interface SurfacePlanOptions {
+  /** Anchor ts of the original (or any prior) surface message to thread under. */
+  threadTs?: string;
+  /** When threading, also broadcast back to the channel timeline. Defaults to true. */
+  broadcast?: boolean;
+  /** Bypass the idempotence check — required when re-surfacing after a redraft. */
+  force?: boolean;
+}
+
+/** Posts a plan to #jarvis-inbox and records the surface event. Idempotent unless `opts.force`. */
 export async function surfacePlan(
   ctx: SurfaceContext,
   record: PlanRecord,
+  opts: SurfacePlanOptions = {},
 ): Promise<SurfacePlanResult> {
-  // Skip if already surfaced. Re-surfacing on re-draft happens by the caller
-  // explicitly (e.g., `forceSurfacePlan`) — this default path is idempotent.
-  const existing = findSurfaceRecord(dbFile(ctx.dataDir), record.id);
-  if (existing) return { posted: false, surface: existing };
+  if (!opts.force) {
+    const existing = findSurfaceRecord(dbFile(ctx.dataDir), record.id);
+    if (existing) return { posted: false, surface: existing };
+  }
 
   const blocks = buildPlanReviewBlocks({
     planId: record.id,
@@ -109,11 +152,21 @@ export async function surfacePlan(
     path: record.path,
   });
 
-  const result = await ctx.client.chat.postMessage({
+  const baseArgs = {
     channel: ctx.inboxChannelId,
     blocks,
     text: `Plan to review: ${record.plan.metadata.title}`,
-  });
+  };
+  const postArgs: Parameters<typeof ctx.client.chat.postMessage>[0] =
+    opts.threadTs
+      ? {
+          ...baseArgs,
+          thread_ts: opts.threadTs,
+          reply_broadcast: opts.broadcast ?? true,
+        }
+      : baseArgs;
+
+  const result = await ctx.client.chat.postMessage(postArgs);
 
   if (!result.ok || !result.ts) {
     throw new Error(
@@ -131,6 +184,7 @@ export async function surfacePlan(
         planId: record.id,
         channel: ctx.inboxChannelId,
         messageTs: result.ts,
+        ...(opts.threadTs ? { threadTs: opts.threadTs } : {}),
       },
     });
   } finally {
@@ -143,8 +197,29 @@ export async function surfacePlan(
       channel: ctx.inboxChannelId,
       messageTs: result.ts,
       surfacedAt: new Date().toISOString(),
+      ...(opts.threadTs ? { threadTs: opts.threadTs } : {}),
     },
   };
+}
+
+/**
+ * Re-surfaces a redrafted plan as a threaded reply under its original surface
+ * message. Anchors on the prior surface's `threadTs` when present (so v3 lands
+ * in the same thread as v2, not nested under v2) and falls back to its
+ * `messageTs` (v1 is its own anchor). No-op when the plan was never surfaced.
+ */
+export async function resurfaceRedraftedPlan(
+  ctx: SurfaceContext,
+  record: PlanRecord,
+): Promise<SurfacePlanResult | null> {
+  const prior = findSurfaceRecord(dbFile(ctx.dataDir), record.id);
+  if (!prior) return null;
+  const anchor = prior.threadTs ?? prior.messageTs;
+  return surfacePlan(ctx, record, {
+    threadTs: anchor,
+    broadcast: true,
+    force: true,
+  });
 }
 
 /** Updates a previously-surfaced plan message in place. Useful after approve/revise/reject. */
@@ -197,6 +272,12 @@ export async function runSurfaceTick(ctx: SurfaceContext): Promise<{
       if (pending) {
         const result = await surfaceAmendmentReview(ctx, candidate, pending);
         if (result.posted) surfaced.push(`${candidate.id}@amendment`);
+      } else if (planNeedsResurface(dbFile(ctx.dataDir), candidate.id)) {
+        // CLI revise (and any other non-Slack redraft path) leaves the plan
+        // awaiting-review with a stale surface. Re-thread the new draft under
+        // the original message so the v2 lands in the conversation.
+        const result = await resurfaceRedraftedPlan(ctx, candidate);
+        if (result?.posted) surfaced.push(`${candidate.id}@redraft`);
       } else {
         const result = await surfacePlan(ctx, candidate);
         if (result.posted) surfaced.push(candidate.id);

@@ -9,7 +9,7 @@ import {
 } from "../../orchestrator/agent-sdk-runtime.ts";
 import { buildAgentCallRecorder } from "../../orchestrator/anthropic-instrument.ts";
 import { loadEnvFile } from "../../orchestrator/env-loader.ts";
-import { revisePlan, REVISE_CAP } from "../../orchestrator/plan-lifecycle.ts";
+import { revisePlan } from "../../orchestrator/plan-lifecycle.ts";
 import { dbFile, envFile, getDataDir } from "../paths.ts";
 
 export interface ReviseCommandDeps {
@@ -59,16 +59,6 @@ export async function runRevise(
   });
 
   if (!result.ok) {
-    if (result.reason === "at-cap") {
-      console.log(
-        `⚠ Plan ${planId} has been revised ${result.priorRevisions} times — at the cap of ${result.cap}.`,
-      );
-      console.log("  Strategist will not auto-redraft another time. Options:");
-      console.log("    - Approve the current draft as-is");
-      console.log("    - Reject and start over");
-      console.log(`    - Edit ${result.record.path} manually, then approve`);
-      return 0;
-    }
     console.error(`revise: ${result.message}`);
     return 1;
   }
@@ -84,7 +74,7 @@ export async function runRevise(
     mode: "subscription",
   });
   console.log(
-    `✓ Plan ${planId} sent back to draft (round ${result.priorRevisions + 1}/${REVISE_CAP}). Strategist redrafting…`,
+    `✓ Plan ${planId} sent back to draft (round ${result.priorRevisions + 1}). Strategist redrafting…`,
   );
   try {
     const redraft = await redraftPlan({

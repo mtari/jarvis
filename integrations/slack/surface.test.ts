@@ -32,6 +32,7 @@ import {
   runPostReviewSurfaceTick,
   runPrAnnouncementTick,
   runSetupTaskDeliveryTick,
+  resurfaceRedraftedPlan,
   runSurfaceTick,
   runTriageDeliveryTick,
   surfaceAmendmentReview,
@@ -55,6 +56,8 @@ interface PostMessageCall {
   channel: string;
   blocks: unknown[];
   text?: string;
+  thread_ts?: string;
+  reply_broadcast?: boolean;
 }
 
 interface UpdateCall {
@@ -74,11 +77,7 @@ function fakeWebClient(): {
   let counter = 1;
   const client = {
     chat: {
-      async postMessage(opts: {
-        channel: string;
-        blocks: unknown[];
-        text?: string;
-      }) {
+      async postMessage(opts: PostMessageCall) {
         posts.push({ ...opts });
         return { ok: true, ts: `1700000000.00${counter++}` };
       },
@@ -143,6 +142,110 @@ describe("surfacePlan", () => {
     expect(second.posted).toBe(false);
     expect(posts).toHaveLength(1);
   });
+
+  it("force: true bypasses the idempotence check", async () => {
+    dropPlan(sandbox, "2026-04-28-force", { status: "awaiting-review" });
+    const record = findPlan(sandbox.dataDir, "2026-04-28-force")!;
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    await surfacePlan(ctx, record);
+    const second = await surfacePlan(ctx, record, { force: true });
+    expect(second.posted).toBe(true);
+    expect(posts).toHaveLength(2);
+  });
+
+  it("threadTs posts a threaded reply with reply_broadcast", async () => {
+    dropPlan(sandbox, "2026-04-28-thr", { status: "awaiting-review" });
+    const record = findPlan(sandbox.dataDir, "2026-04-28-thr")!;
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    await surfacePlan(ctx, record, {
+      threadTs: "1700000000.111",
+      force: true,
+    });
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.thread_ts).toBe("1700000000.111");
+    expect(posts[0]?.reply_broadcast).toBe(true);
+
+    const stored = findSurfaceRecord(dbFile(sandbox.dataDir), "2026-04-28-thr");
+    expect(stored?.threadTs).toBe("1700000000.111");
+  });
+});
+
+describe("resurfaceRedraftedPlan", () => {
+  let sandbox: InstallSandbox;
+  let silencer: ConsoleSilencer;
+
+  beforeEach(async () => {
+    sandbox = await makeInstallSandbox();
+    silencer = silenceConsole();
+  });
+
+  afterEach(() => {
+    silencer.restore();
+    sandbox.cleanup();
+  });
+
+  it("anchors v2 under v1's messageTs and records threadTs on the new surface", async () => {
+    dropPlan(sandbox, "2026-04-28-rs", { status: "awaiting-review" });
+    const record = findPlan(sandbox.dataDir, "2026-04-28-rs")!;
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const v1 = await surfacePlan(ctx, record);
+    const v2 = await resurfaceRedraftedPlan(ctx, record);
+
+    expect(v2?.posted).toBe(true);
+    expect(posts).toHaveLength(2);
+    expect(posts[1]?.thread_ts).toBe(v1.surface.messageTs);
+    expect(posts[1]?.reply_broadcast).toBe(true);
+
+    const latest = findSurfaceRecord(dbFile(sandbox.dataDir), "2026-04-28-rs");
+    expect(latest?.threadTs).toBe(v1.surface.messageTs);
+  });
+
+  it("re-uses the same thread anchor on v3 (does not nest under v2)", async () => {
+    dropPlan(sandbox, "2026-04-28-rs3", { status: "awaiting-review" });
+    const record = findPlan(sandbox.dataDir, "2026-04-28-rs3")!;
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const v1 = await surfacePlan(ctx, record);
+    await resurfaceRedraftedPlan(ctx, record);
+    await resurfaceRedraftedPlan(ctx, record);
+
+    expect(posts).toHaveLength(3);
+    expect(posts[1]?.thread_ts).toBe(v1.surface.messageTs);
+    expect(posts[2]?.thread_ts).toBe(v1.surface.messageTs);
+  });
+
+  it("returns null when the plan was never surfaced", async () => {
+    dropPlan(sandbox, "2026-04-28-rs0", { status: "awaiting-review" });
+    const record = findPlan(sandbox.dataDir, "2026-04-28-rs0")!;
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const result = await resurfaceRedraftedPlan(ctx, record);
+    expect(result).toBeNull();
+    expect(posts).toHaveLength(0);
+  });
 });
 
 describe("runSurfaceTick", () => {
@@ -181,6 +284,52 @@ describe("runSurfaceTick", () => {
     const second = await runSurfaceTick(ctx);
     expect(second.surfaced).toEqual([]);
     expect(posts).toHaveLength(2); // no new posts
+  });
+
+  it("re-surfaces redrafted plans as a threaded reply under the original", async () => {
+    dropPlan(sandbox, "2026-04-28-rd", { status: "awaiting-review" });
+    const record = findPlan(sandbox.dataDir, "2026-04-28-rd")!;
+    const { client, posts } = fakeWebClient();
+    const ctx: SurfaceContext = {
+      dataDir: sandbox.dataDir,
+      client,
+      inboxChannelId: "C-INBOX",
+    };
+    const first = await runSurfaceTick(ctx);
+    expect(first.surfaced).toEqual(["2026-04-28-rd"]);
+    expect(posts).toHaveLength(1);
+    const v1Ts = findSurfaceRecord(
+      dbFile(sandbox.dataDir),
+      "2026-04-28-rd",
+    )!.messageTs;
+
+    // Simulate a redraft happening outside Slack (e.g., CLI revise)
+    const db = new Database(dbFile(sandbox.dataDir));
+    try {
+      appendEvent(db, {
+        appId: record.app,
+        vaultId: record.vault,
+        kind: "plan-redrafted",
+        payload: {
+          planId: "2026-04-28-rd",
+          revisionRound: 1,
+          author: "strategist",
+        },
+      });
+    } finally {
+      db.close();
+    }
+
+    const second = await runSurfaceTick(ctx);
+    expect(second.surfaced).toEqual(["2026-04-28-rd@redraft"]);
+    expect(posts).toHaveLength(2);
+    expect(posts[1]?.thread_ts).toBe(v1Ts);
+    expect(posts[1]?.reply_broadcast).toBe(true);
+
+    // Third tick with no further redrafts is a no-op
+    const third = await runSurfaceTick(ctx);
+    expect(third.surfaced).toEqual([]);
+    expect(posts).toHaveLength(2);
   });
 });
 

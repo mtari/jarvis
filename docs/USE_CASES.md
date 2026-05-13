@@ -41,7 +41,7 @@ Format: **User wants to X.** Constraint or context.
 
 21. **User reviews a plan in Slack.** Block Kit message with Approve / Modify / Reject buttons.
 22. **User rejects a plan with a reason.** Category picker: not-worth-effort / signal-unreliable / wrong-timing / duplicate-of-approved / scope-wrong / other.
-23. **User wants to modify a plan before approving.** `yarn jarvis revise <id> "drop the multi-property scope; just single-property bookings for v1"` (or Slack Revise button + free-form feedback). Strategist redrafts and re-surfaces in awaiting-review; revision count increments. Distinct from reject — keeps the plan alive. Default cap: 3 revisions, then escalation if still not converging.
+23. **User wants to modify a plan before approving.** `yarn jarvis revise <id> "drop the multi-property scope; just single-property bookings for v1"` (or Slack Revise button + free-form feedback). Strategist redrafts and re-surfaces in awaiting-review as a threaded reply under the original Slack message; revision count increments. Distinct from reject — keeps the plan alive. No cap on revisions.
 24. **User wants to approve a destructive plan.** Second confirmation required: Slack button or CLI `--confirm-destructive`.
 25. **User wants to see the 3-plan backlog for an app.** `yarn jarvis backlog --app <name>`.
 26. **User wants to reprioritize the backlog.** `yarn jarvis reprioritize --app <name> --plan <id> --priority <level>` or Slack reorder.

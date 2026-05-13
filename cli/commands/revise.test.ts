@@ -192,7 +192,7 @@ describe("runRevise — auto-redraft via Strategist", () => {
     }
   });
 
-  it("escalates without recording or transitioning when at the 3-revision cap", async () => {
+  it("has no revision cap — the 4th revise still records feedback and redrafts", async () => {
     const planId = "2026-04-27-cap";
     const planPath = dropPlan(sandbox, planId, {
       status: "awaiting-review",
@@ -220,26 +220,27 @@ describe("runRevise — auto-redraft via Strategist", () => {
     );
     expect(code).toBe(0);
 
-    // No new feedback row recorded
+    // New feedback row recorded (4 total)
     const db = new Database(dbFile(sandbox.dataDir), { readonly: true });
     try {
       const fb = db
         .prepare(
-          "SELECT * FROM feedback WHERE kind = 'revise' AND target_id = ?",
+          "SELECT note FROM feedback WHERE kind = 'revise' AND target_id = ? ORDER BY id",
         )
-        .all(planId) as unknown[];
-      expect(fb).toHaveLength(3); // unchanged
+        .all(planId) as Array<{ note: string }>;
+      expect(fb).toHaveLength(4);
+      expect(fb[3]?.note).toBe("fourth attempt");
     } finally {
       db.close();
     }
 
-    // Plan stays in awaiting-review (no transition)
+    // Plan was redrafted and lands back in awaiting-review
     expect(parsePlan(fs.readFileSync(planPath, "utf8")).metadata.status).toBe(
       "awaiting-review",
     );
 
-    // Strategist never called
-    expect(calls).toHaveLength(0);
+    // Strategist was called
+    expect(calls.length).toBeGreaterThan(0);
   });
 
   it("leaves the plan in 'draft' when redraft throws StrategistError", async () => {

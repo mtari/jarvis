@@ -60,6 +60,7 @@ import {
 } from "./slash-commands.ts";
 import { parseSlashArgs } from "./slash-args.ts";
 import {
+  resurfaceRedraftedPlan,
   surfacePlan,
   updateSurfacedPlan,
   updateSurfacedPost,
@@ -198,15 +199,11 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       { actor: `slack:${userId}` },
     );
     if (!reviseResult.ok) {
-      const summary =
-        reviseResult.reason === "at-cap"
-          ? `at the cap of ${reviseResult.cap} revisions`
-          : reviseResult.message;
       await postDmOrEphemeral(
         client,
         userId,
         body.user.id,
-        `✗ Revise failed: ${summary}`,
+        `✗ Revise failed: ${reviseResult.message}`,
       );
       return;
     }
@@ -216,7 +213,7 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       await updateSurfacedPlan(
         ctx.surfaceCtx,
         updatedRecord,
-        `↻ Sent back for revision by <@${userId}> (round ${reviseResult.priorRevisions + 1}/3). Strategist redrafting…`,
+        `↻ Sent back for revision by <@${userId}> (round ${reviseResult.priorRevisions + 1}). Strategist redrafting…`,
       );
     }
 
@@ -240,11 +237,12 @@ export function registerHandlers(app: BoltApp, ctx: HandlerContext): void {
       recorder.flush();
       ctx.log("redrafted via slack", { planId });
 
-      // Refresh the surfaced message with the new content + restored buttons
+      // Re-surface the new draft as a threaded reply under the original
+      // surface message. The prior message already shows "↻ Sent back for
+      // revision …" from the updateSurfacedPlan call above.
       const refreshedRecord = findPlan(ctx.dataDir, planId);
       if (refreshedRecord) {
-        // Re-surface as a fresh message (the old one is now closed/updated above)
-        await surfacePlan(ctx.surfaceCtx, refreshedRecord);
+        await resurfaceRedraftedPlan(ctx.surfaceCtx, refreshedRecord);
       }
     } catch (err) {
       recorder.flush();

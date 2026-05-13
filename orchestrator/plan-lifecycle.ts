@@ -223,16 +223,6 @@ export interface ReviseResult {
   priorRevisions: number;
 }
 
-export interface ReviseAtCapResult {
-  ok: false;
-  reason: "at-cap";
-  record: PlanRecord;
-  priorRevisions: number;
-  cap: number;
-}
-
-export const REVISE_CAP = 3;
-
 export interface ReviseOptions {
   actor?: string;
 }
@@ -243,7 +233,7 @@ export function revisePlan(
   planId: string,
   note: string,
   opts: ReviseOptions = {},
-): ReviseResult | LifecycleError | ReviseAtCapResult {
+): ReviseResult | LifecycleError {
   const record = findPlan(dataDir, planId);
   if (!record) {
     return {
@@ -275,15 +265,6 @@ export function revisePlan(
     } finally {
       readDb.close();
     }
-  }
-  if (priorRevisions >= REVISE_CAP) {
-    return {
-      ok: false,
-      reason: "at-cap",
-      record,
-      priorRevisions,
-      cap: REVISE_CAP,
-    };
   }
 
   const next = transitionPlan(record.plan, "draft");
