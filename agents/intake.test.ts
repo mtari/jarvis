@@ -142,13 +142,16 @@ describe("runIntakeAgent", () => {
 
   it("walks ask → save → done and writes the intake markdown", async () => {
     const { transport, calls } = scriptedTransport([
-      `<ask sectionId="audience-and-context">Who is this interview for?</ask>`,
-      `<save sectionId="audience-and-context" status="answered">For potential investors.</save>
-<ask sectionId="origin-story">Why did you start the business?</ask>`,
+      `<ask sectionId="origin-story">Why did you start the business?</ask>`,
       `<save sectionId="origin-story" status="answered">Saw a gap in the market.</save>
+<ask sectionId="problem-and-opportunity">What problem does it solve?</ask>`,
+      `<save sectionId="problem-and-opportunity" status="answered">Renters waste 20+ minutes per trip looking for parking.</save>
 <done>Captured 2 sections.</done>`,
     ]);
-    const { io, asked } = scriptedIO(["For potential investors.", "Saw a gap in the market."]);
+    const { io, asked } = scriptedIO([
+      "Saw a gap in the market.",
+      "Renters waste 20+ minutes per trip looking for parking.",
+    ]);
 
     const result = await runIntakeAgent({
       app: "demo",
@@ -161,40 +164,40 @@ describe("runIntakeAgent", () => {
     expect(result.finishedCleanly).toBe(true);
     expect(result.totalRounds).toBe(3);
     expect(result.sections.map((s) => s.id)).toEqual([
-      "audience-and-context",
       "origin-story",
+      "problem-and-opportunity",
     ]);
     expect(asked.map((a) => a.sectionId)).toEqual([
-      "audience-and-context",
       "origin-story",
+      "problem-and-opportunity",
     ]);
 
     const markdown = fs.readFileSync(intakeFilePath, "utf8");
     expect(markdown).toContain("# Intake — demo");
-    expect(markdown).toContain("## audience-and-context");
-    expect(markdown).toContain("For potential investors.");
     expect(markdown).toContain("## origin-story");
     expect(markdown).toContain("Saw a gap in the market.");
+    expect(markdown).toContain("## problem-and-opportunity");
+    expect(markdown).toContain("Renters waste 20+ minutes per trip looking for parking.");
     expect(markdown).toContain("## Summary");
     expect(markdown).toContain("Captured 2 sections.");
 
     // The agent's STATE on round 2 carries the user's round-1 answer
     const turn2Prompt = calls[1]?.prompt ?? "";
-    expect(turn2Prompt).toContain('"For potential investors."');
-    expect(turn2Prompt).toContain("last asked: audience-and-context");
-    // Audience is sniffed from the save's body, so it lands in round 3's STATE
+    expect(turn2Prompt).toContain('"Saw a gap in the market."');
+    expect(turn2Prompt).toContain("last asked: origin-story");
+    // STATE no longer carries an audience field — intake is audience-blind.
     const turn3Prompt = calls[2]?.prompt ?? "";
-    expect(turn3Prompt).toContain("audience: investor");
+    expect(turn3Prompt).not.toContain("audience:");
   });
 
   it("persists intake.md after every save (mid-interview crash safety)", async () => {
     const { transport } = scriptedTransport([
-      `<ask sectionId="audience-and-context">Who?</ask>`,
-      `<save sectionId="audience-and-context" status="answered">Mentor.</save>
-<ask sectionId="origin-story">Why?</ask>`,
+      `<ask sectionId="origin-story">Why?</ask>`,
+      `<save sectionId="origin-story" status="answered">Saw a gap.</save>
+<ask sectionId="problem-and-opportunity">What problem?</ask>`,
       // Pretend the third turn never returns by throwing
     ]);
-    const { io } = scriptedIO(["Mentor.", "Story here.", "extra"]);
+    const { io } = scriptedIO(["Saw a gap.", "Story here.", "extra"]);
 
     // Wrap transport to error on the third call so we simulate a crash AFTER
     // the second save has been persisted.
@@ -217,16 +220,16 @@ describe("runIntakeAgent", () => {
 
     // The first save survived to disk.
     const markdown = fs.readFileSync(intakeFilePath, "utf8");
-    expect(markdown).toContain("## audience-and-context");
-    expect(markdown).toContain("Mentor.");
+    expect(markdown).toContain("## origin-story");
+    expect(markdown).toContain("Saw a gap.");
   });
 
   it("forwards a skip request to the agent's STATE block", async () => {
     const { transport, calls } = scriptedTransport([
-      `<ask sectionId="audience-and-context">Q1</ask>`,
-      `<save sectionId="audience-and-context" status="skipped">user skipped</save>
-<ask sectionId="origin-story">Q2</ask>`,
-      `<save sectionId="origin-story" status="answered">A2</save>
+      `<ask sectionId="origin-story">Q1</ask>`,
+      `<save sectionId="origin-story" status="skipped">user skipped</save>
+<ask sectionId="problem-and-opportunity">Q2</ask>`,
+      `<save sectionId="problem-and-opportunity" status="answered">A2</save>
 <done>1 skipped, 1 answered.</done>`,
     ]);
     const { io } = scriptedIO([{ skip: true }, "A2"]);
@@ -338,8 +341,8 @@ describe("runIntakeAgent", () => {
 
   it("treats { kind: 'end' } from readUserAnswer as user-signaled end", async () => {
     const { transport, calls } = scriptedTransport([
-      `<ask sectionId="audience-and-context">Who?</ask>`,
-      `<save sectionId="audience-and-context" status="partial">no answer
+      `<ask sectionId="origin-story">Why?</ask>`,
+      `<save sectionId="origin-story" status="partial">no answer
 Gap: not collected</save>
 <done>User wrapped early.</done>`,
     ]);
@@ -397,9 +400,9 @@ Gap: not collected</save>
 
   it("caps at maxRounds without <done>", async () => {
     const { transport } = scriptedTransport([
-      `<ask sectionId="audience-and-context">Q1</ask>`,
-      `<save sectionId="audience-and-context" status="answered">A1</save>
-<ask sectionId="origin-story">Q2</ask>`,
+      `<ask sectionId="origin-story">Q1</ask>`,
+      `<save sectionId="origin-story" status="answered">A1</save>
+<ask sectionId="problem-and-opportunity">Q2</ask>`,
     ]);
     // Round 2 emits <save>+<ask>, so the loop reads a second answer before
     // the cap check exits the loop.

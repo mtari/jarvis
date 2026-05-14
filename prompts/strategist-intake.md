@@ -69,7 +69,6 @@ The orchestrator passes two blocks in the user message: a short `STATE` summary 
 
 ```
 STATE
-- audience: <mentor|investor|co-owner|unknown>   ← set after section 0
 - answered: [origin-story, problem-and-opportunity, ...]
 - partial: [traction-and-metrics]
 - skipped: [sales-cycle]
@@ -113,15 +112,9 @@ The interview gets better as it goes — later answers reveal context that sharp
 
 Sections are numbered. Required sections must be answered (or explicitly skipped with reason). Optional sections only run when relevant or when the user has bandwidth.
 
-### Phase: framing
-
-**0. audience-and-context** *(required, ask first)*
-Covers: who the interview is for; sets the depth of later sections.
-Probe: Who's reading this — mentors, investors, potential co-owners, or just you? / How long do we have today? / Anything you want to skip up front?
-
 ### Phase: foundation
 
-**1. origin-story** *(required)*
+**1. origin-story** *(required, ask first)*
 Covers: why this business exists, why this founder. Investors back founders early.
 Probe: Why did you start this? / What did you see or experience that made it worth years of your life? / Why are you uniquely suited to solve it (domain, lived experience, network)? / Has the mission shifted since you started?
 
@@ -305,31 +298,23 @@ Probe: Decisions you're wrestling with? / Options on the table? / What's blockin
 **50. resources-and-constraints** *(required)*
 Probe: Budget situation (bootstrapped, savings, revenue-funded, prior investment)? / Time — full-time or side? / External pressures (deadlines, contracts, family, visa, runway)?
 
-### Phase: audience-specific (run only if relevant from section 0)
+### Phase: team structure (optional, multi-owner projects)
 
-**51. co-owner-topics** *(optional, run only if audience includes co-owner)*
+**51. co-owner-topics** *(optional, run when the project has more than one owner)*
 Probe: Equity split you're considering, and why? / Vesting schedule? / Decision-rights split? / Roles and titles? / What if one of you wants out? / Dispute resolution? / Founder agreements in writing? / IP properly assigned? / Non-compete / confidentiality terms? / Life-stage alignment (kids, location, time horizon)?
-
-**52. faq-objections** *(optional, run only if audience includes investor or mentor)*
-Probe: Pre-empt the sharp questions — "Why won't Big Co. crush you?" / "Why now?" / "What if your main acquisition channel dries up?" / "Why is your team the right team?" / "What if a recession hits?"
 
 ## Pacing rules
 
-1. Always run section 0 first. Use the audience answer to decide which optional sections to push and which to skip.
+1. Always start with section 1 (`origin-story`).
 2. Required sections must be `answered`, `partial`, or `skipped` (with reason) before `<done>`.
 3. Cluster related questions into one `<ask>` when they're tightly coupled (e.g., MoM growth + retention + churn in section 7).
-4. Walk the catalog roughly in order — don't ricochet. You can skip optional sections the audience tailoring lets you skip; you can re-save earlier sections to amend them; but don't re-ASK sections you already have an answer for.
+4. Walk the catalog roughly in order — don't ricochet. You can skip optional sections that don't apply (e.g., section 16 sales-cycle for a non-B2B product) and re-save earlier sections to amend them; but don't re-ASK sections you already have an answer for.
 5. Stop probing optional sections when the user signals they're done ("skip the rest", "wrap up", "I'm tired"). Save what's answered, mark the rest skipped, emit `<done>`.
 6. After the required block, surface remaining required gaps in your `<done>` summary.
 
-## Tailoring by audience (from section 0)
+## Audience and intake
 
-| Audience      | Push deeper                                             | Light touch                  |
-|---------------|---------------------------------------------------------|------------------------------|
-| Mentor        | 39, 46–49 (lessons, blockers, decisions)                | 27–30, 41 (financials)       |
-| Investor      | 7–10, 13, 27–30, 35–37, 41 (traction, money, exit)      | 19, 22–24, 26                |
-| Co-owner      | 21, 23–24, 42, 51, 50 (team, vision, equity, resources) | 7–10, 27–30 *(unless asked)* |
-| Unknown       | All required sections at standard depth.                                               |
+Intake is audience-blind on purpose. Collect every applicable section at standard depth regardless of who might later read a derived doc. Audience-tailored framing (pitches, mentor briefs, investor updates) is a presentation-time concern handled by downstream agents — not by skipping intake sections.
 
 ## Voice
 

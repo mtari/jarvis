@@ -393,7 +393,7 @@ describe("runOnboard", () => {
 
   it("runs the intake interview when a TTY is present, persists intake.md, registers it as a cached doc, and feeds it into the brain extraction", async () => {
     // Scripted IO + transport for the intake agent
-    const answers = ["For potential investors.", "Saw a parking gap."];
+    const answers = ["Saw a parking gap.", "Renters waste 20+ minutes per trip."];
     let answerIdx = 0;
     const intakeIO: IntakeIO = {
       readUserAnswer: async () => {
@@ -405,10 +405,10 @@ describe("runOnboard", () => {
       writeOutput: () => {},
     };
     const intakeResponses = [
-      `<ask sectionId="audience-and-context">Who is this for?</ask>`,
-      `<save sectionId="audience-and-context" status="answered">For potential investors.</save>
-<ask sectionId="origin-story">Why did you start it?</ask>`,
+      `<ask sectionId="origin-story">Why did you start it?</ask>`,
       `<save sectionId="origin-story" status="answered">Saw a parking gap.</save>
+<ask sectionId="problem-and-opportunity">What problem does it solve?</ask>`,
+      `<save sectionId="problem-and-opportunity" status="answered">Renters waste 20+ minutes per trip.</save>
 <done>2 sections captured.</done>`,
     ];
     let intakeIdx = 0;
@@ -443,8 +443,8 @@ describe("runOnboard", () => {
     expect(fs.existsSync(intakeFile)).toBe(true);
     const intakeText = fs.readFileSync(intakeFile, "utf8");
     expect(intakeText).toContain("# Intake — demoapp");
-    expect(intakeText).toContain("For potential investors.");
     expect(intakeText).toContain("Saw a parking gap.");
+    expect(intakeText).toContain("Renters waste 20+ minutes per trip.");
 
     // Brain extraction got the intake doc inline
     expect(phase2Prompt).toContain("ABSORBED DOCS");

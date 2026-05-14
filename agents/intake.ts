@@ -146,7 +146,6 @@ interface IntakeState {
   skipped: string[];
   lastAsked?: string;
   lastUserMessage: string;
-  audience?: string;
   userSignaledEnd: boolean;
   /** Status per saved sectionId — used when rendering the PRIOR ANSWERS
    * block so each section is shown with its current status. */
@@ -164,7 +163,6 @@ function buildUserPrompt(
   lines.push(`Repo root: ${input.repoRoot}`);
   lines.push("");
   lines.push("STATE");
-  lines.push(`- audience: ${state.audience ?? "unknown"}`);
   lines.push(`- answered: [${state.answered.join(", ")}]`);
   lines.push(`- partial: [${state.partial.join(", ")}]`);
   lines.push(`- skipped: [${state.skipped.join(", ")}]`);
@@ -237,24 +235,7 @@ function applyTurn(
     else state.skipped.push(save.sectionId);
 
     state.savedStatuses.set(save.sectionId, save.status);
-
-    if (
-      save.sectionId === "audience-and-context" &&
-      state.audience === undefined
-    ) {
-      state.audience = sniffAudience(save.body);
-    }
   }
-}
-
-function sniffAudience(body: string): string {
-  const haystack = body.toLowerCase();
-  const hits: string[] = [];
-  if (/\binvestors?\b|\bvc\b|\bfunding\b|\braise\b/.test(haystack)) hits.push("investor");
-  if (/\bmentors?\b|\bcoach(es)?\b|\badvisers?\b|\badvisors?\b/.test(haystack)) hits.push("mentor");
-  if (/\bco-?owners?\b|\bco-?founders?\b|\bpartners?\b/.test(haystack)) hits.push("co-owner");
-  if (hits.length === 0) return "unknown";
-  return hits.join("/");
 }
 
 function renderIntakeMarkdown(

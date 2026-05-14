@@ -81,11 +81,11 @@ That's it — no markdown text outside the tags, no comments inside the JSON, no
 Skip any optional field you can't ground in evidence. Better to omit than to invent. **If absorbed docs describe what the app does, populate `scope` from them — that's the whole point of the absorption.**
 
 When the intake transcript is present, mine it for:
-- `scope.userTypes` ← the founder's own description of who the app serves (intake sections `market-and-customers`, `audience-and-context`)
+- `scope.userTypes` ← the founder's own description of who the app serves (intake section `market-and-customers`)
 - `scope.primaryFlows` ← intake `solution`, `tech-and-product` (the user-journey description)
 - `scope.domainRules` ← intake `legal-and-operational`, `regulatory-compliance`, `risks`, plus any "must / never / only" phrasing in `solution` or `business-model`
 - `priorities` ← intake `plans-by-horizon`, `what-youre-looking-for`, `biggest-current-problem`, `where-stuck`. Each becomes a `{id, title, score, source}` entry; score 80+ when the founder marks it as blocking, 50–70 for normal-priority, 30 for nice-to-have. `source` is `"intake.<sectionId>"`.
-- `brand.voice`, `brand.audience`, `brand.languages` ← intake `brand-positioning` and `audience-and-context`. The founder's own words are the source of truth for tone.
+- `brand.voice`, `brand.audience`, `brand.languages` ← intake `brand-positioning`. The founder's own words are the source of truth for tone.
 
 Sections in the intake marked `partial` or `skipped` are weaker evidence — extract them but don't elevate them into `domainRules` or top-priority items unless other sources confirm.
 
