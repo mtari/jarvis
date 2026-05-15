@@ -76,6 +76,8 @@ Plans are drafted by the Strategist via two paths, both converging on the same r
   - **Confident path:** intent is clear and well-grounded → Strategist drafts directly. The `## Problem` section records the why-chain it inferred.
   - **Clarification path:** ambiguity or dissonance remains → Strategist asks 1–3 clarifying questions (Slack thread or CLI prompt). You answer → it redrafts or proceeds. Up to 3 rounds; beyond that it drafts with best-effort assumptions under `## Open questions / assumptions`. Each Q/A round is logged to the feedback store (§7 → Feedback store) and feeds the learning loop.
 
+  **Duplicate-plan check.** Every drafting brief — user-initiated, signal-initiated, project-audit, and the jarvis self-audit — includes a `Currently open plans` block listing every non-terminal plan for the app (statuses: `awaiting-review`, `approved`, `executing`, `paused`, `blocked`, `shipped-pending-impact`; any type, any subtype including `meta`). Per-app prompts (`strategist-improvement.md`, `strategist-business.md`, `strategist-marketing.md`) instruct Strategist to return `<clarify>` instead of drafting whenever a new draft would substantially overlap an open plan (same problem / same primary capability / same target subsystem). The backlog-depth gate (§5, cap of 3) caps *volume*; the open-plans block prevents *duplicates within the cap* — three near-identical plans on consecutive days would otherwise still slip through.
+
   (Amendment clauses remain reserved for execution-time pause conditions, not draft-time assumptions.)
 
 - **Signal-initiated.** Analyst detects a signal crossing its trigger threshold → asks Strategist to draft a plan → plan review surfaces in your inbox.

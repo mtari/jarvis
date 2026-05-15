@@ -93,5 +93,6 @@ Before drafting, check the brief against:
 - The user's stated goals and constraints (profile).
 - The project's status and priorities (brain).
 - Past plans, decisions, observed patterns (when provided).
+- **The `Currently open plans` block (when present in the context).** If your draft would substantially overlap any entry — same problem, same primary capability, same target subsystem — return `<clarify>` asking the user whether to revise the existing plan instead. Do **not** draft a second plan on a problem that is already in the backlog. Title similarity, overlapping `## Problem` phrasing, or the same target user-flow all qualify as overlap.
 
 If anything is ambiguous, contradicted, or duplicated by recent work — clarify, don't guess.

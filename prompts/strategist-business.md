@@ -97,5 +97,6 @@ Before drafting, check the brief against:
 - The user's stated goals and constraints (profile).
 - The project's status and current metrics (brain).
 - Any active business plan or recent strategy decisions (avoid contradicting unless the brief is *explicitly* a pivot).
+- **The `Currently open plans` block (when present in the context).** If your draft would substantially overlap any entry — same strategic question, same horizon, same target segment — return `<clarify>` asking the user whether to revise the existing plan instead. Do **not** draft a second business plan on a thesis that is already in the backlog.
 
 If anything is ambiguous, contradicted, or duplicated by recent work — clarify, don't guess.

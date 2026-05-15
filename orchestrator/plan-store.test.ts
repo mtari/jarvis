@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   findPlan,
   listPlans,
+  openPlansContextBlock,
   savePlan,
   scanPlans,
 } from "./plan-store.ts";
@@ -110,5 +111,147 @@ describe("plan store", () => {
       "ignore me",
     );
     expect(listPlans(dataDir)).toHaveLength(1);
+  });
+
+  function planWith(opts: {
+    id: string;
+    app: string;
+    title: string;
+    status: string;
+    type?: string;
+    subtype?: string;
+    priority?: string;
+  }): string {
+    return `# Plan: ${opts.title}
+Type: ${opts.type ?? "improvement"}
+Subtype: ${opts.subtype ?? "new-feature"}
+ImplementationReview: required
+App: ${opts.app}
+Priority: ${opts.priority ?? "normal"}
+Destructive: false
+Status: ${opts.status}
+Author: strategist
+Confidence: 60
+
+## Problem
+x
+
+## Build plan
+y
+
+## Testing strategy
+z
+
+## Acceptance criteria
+- ok
+`;
+  }
+
+  function dropAppPlan(app: string, id: string, text: string): void {
+    const dir = path.join(dataDir, "vaults", "personal", "plans", app);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${id}.md`), text);
+  }
+
+  it("openPlansContextBlock returns null when no plans for the app", () => {
+    dropAppPlan(
+      "erdei-fahazak",
+      "2026-05-11-one",
+      planWith({
+        id: "2026-05-11-one",
+        app: "erdei-fahazak",
+        title: "Owner self-service",
+        status: "awaiting-review",
+      }),
+    );
+    expect(openPlansContextBlock(dataDir, "huntech-dev")).toBeNull();
+  });
+
+  it("openPlansContextBlock lists open plans with title + type/subtype + status + priority", () => {
+    dropAppPlan(
+      "erdei-fahazak",
+      "2026-05-11-one",
+      planWith({
+        id: "2026-05-11-one",
+        app: "erdei-fahazak",
+        title: "Owner self-service listing submission",
+        status: "awaiting-review",
+        priority: "high",
+      }),
+    );
+    dropAppPlan(
+      "erdei-fahazak",
+      "2026-05-12-two",
+      planWith({
+        id: "2026-05-12-two",
+        app: "erdei-fahazak",
+        title: "Owner onboarding flow",
+        status: "approved",
+        priority: "high",
+      }),
+    );
+
+    const block = openPlansContextBlock(dataDir, "erdei-fahazak");
+    expect(block).not.toBeNull();
+    expect(block).toContain("Currently open plans for this app");
+    expect(block).toContain('2026-05-11-one — "Owner self-service listing submission"');
+    expect(block).toContain("(improvement/new-feature, status=awaiting-review, priority=high)");
+    expect(block).toContain('2026-05-12-two — "Owner onboarding flow"');
+    expect(block).toContain("status=approved");
+    expect(block).toContain("DO NOT draft a second plan");
+    // Sorted by id ascending so the earlier plan appears first
+    const firstIdx = block!.indexOf("2026-05-11-one");
+    const secondIdx = block!.indexOf("2026-05-12-two");
+    expect(firstIdx).toBeLessThan(secondIdx);
+  });
+
+  it("openPlansContextBlock excludes terminal-state plans", () => {
+    for (const status of [
+      "draft",
+      "done",
+      "cancelled",
+      "rejected",
+      "success",
+      "null-result",
+      "regression",
+    ]) {
+      dropAppPlan(
+        "erdei-fahazak",
+        `2026-05-11-${status}`,
+        planWith({
+          id: `2026-05-11-${status}`,
+          app: "erdei-fahazak",
+          title: `Plan in ${status}`,
+          status,
+        }),
+      );
+    }
+    expect(openPlansContextBlock(dataDir, "erdei-fahazak")).toBeNull();
+  });
+
+  it("openPlansContextBlock filters by app", () => {
+    dropAppPlan(
+      "erdei-fahazak",
+      "2026-05-11-erdei",
+      planWith({
+        id: "2026-05-11-erdei",
+        app: "erdei-fahazak",
+        title: "Erdei plan",
+        status: "awaiting-review",
+      }),
+    );
+    dropAppPlan(
+      "huntech-dev",
+      "2026-05-11-huntech",
+      planWith({
+        id: "2026-05-11-huntech",
+        app: "huntech-dev",
+        title: "Huntech plan",
+        status: "awaiting-review",
+      }),
+    );
+    const block = openPlansContextBlock(dataDir, "erdei-fahazak");
+    expect(block).toContain("Erdei plan");
+    expect(block).not.toContain("Huntech plan");
   });
 });

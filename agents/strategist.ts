@@ -7,7 +7,11 @@ import type { Brain } from "../orchestrator/brain.ts";
 import { loadBrain } from "../orchestrator/brain.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
 import { recordFeedback } from "../orchestrator/feedback-store.ts";
-import { findPlan, savePlan } from "../orchestrator/plan-store.ts";
+import {
+  findPlan,
+  openPlansContextBlock,
+  savePlan,
+} from "../orchestrator/plan-store.ts";
 import { parsePlan, transitionPlan } from "../orchestrator/plan.ts";
 import type { Plan } from "../orchestrator/plan.ts";
 import { notesContextBlock } from "../orchestrator/notes.ts";
@@ -81,6 +85,7 @@ export async function runStrategist(
   const profile = loadProfile(profileFile(input.dataDir));
   const systemPrompt = loadStrategistPrompt(planType);
   const notes = notesContextBlock(input.dataDir, input.vault, input.app);
+  const openPlans = openPlansContextBlock(input.dataDir, input.app);
 
   const initialContext = buildContext({
     brain,
@@ -89,6 +94,7 @@ export async function runStrategist(
     planType,
     ...(input.subtype !== undefined && { subtypeHint: input.subtype }),
     ...(notes !== null && { notes }),
+    ...(openPlans !== null && { openPlans }),
   });
 
   const conversation: Array<{ role: "user" | "assistant"; content: string }> = [
@@ -277,6 +283,8 @@ function buildContext(args: {
   subtypeHint?: string;
   /** Free-text notes block from `notesContextBlock(...)`. Optional. */
   notes?: string;
+  /** Currently-open plans for this app from `openPlansContextBlock(...)`. Optional. */
+  openPlans?: string;
 }): string {
   const lines: string[] = [];
   lines.push(`Plan type: ${args.planType}`);
@@ -325,6 +333,10 @@ function buildContext(args: {
   if (args.notes) {
     lines.push("");
     lines.push(args.notes);
+  }
+  if (args.openPlans) {
+    lines.push("");
+    lines.push(args.openPlans);
   }
   return lines.join("\n");
 }

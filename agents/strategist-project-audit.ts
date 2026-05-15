@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { runStrategist, StrategistError } from "./strategist.ts";
 import type { AnthropicClient } from "../orchestrator/agent-sdk-runtime.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
-import { listPlans } from "../orchestrator/plan-store.ts";
+import { listPlans, openPlansContextBlock } from "../orchestrator/plan-store.ts";
 import { loadBrain, type Brain } from "../orchestrator/brain.ts";
 import { notesContextBlock } from "../orchestrator/notes.ts";
 import { dbFile, brainFile } from "../cli/paths.ts";
@@ -432,6 +432,12 @@ function composeBrief(args: ComposeBriefInput): string {
   lines.push(`- Plan transitions: ${args.transitionsCount}`);
   lines.push(`- Signals recorded: ${args.signalsCount}`);
   lines.push("");
+
+  const openPlans = openPlansContextBlock(args.dataDir, args.app);
+  if (openPlans !== null) {
+    lines.push(openPlans);
+    lines.push("");
+  }
 
   const notes = notesContextBlock(args.dataDir, args.vault, args.app);
   if (notes !== null) {

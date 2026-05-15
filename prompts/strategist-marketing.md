@@ -132,5 +132,6 @@ Before drafting, check the brief against:
 - The project's brand from the brain.
 - Any active business plan's target segment.
 - Past marketing plans for this app (avoid duplicate angles).
+- **The `Currently open plans` block (when present in the context).** If your draft would substantially overlap any entry — same campaign angle, same content piece, same channel + audience pairing — return `<clarify>` asking the user whether to revise the existing plan instead. Do **not** draft a second marketing plan on the same angle.
 
 If anything is ambiguous, contradicted, or duplicated by recent work — clarify, don't guess.

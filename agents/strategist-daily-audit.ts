@@ -7,7 +7,7 @@ import {
 import { runLearnScan, type LearnReport } from "./analyst-learn.ts";
 import type { AnthropicClient } from "../orchestrator/agent-sdk-runtime.ts";
 import { appendEvent } from "../orchestrator/event-log.ts";
-import { listPlans } from "../orchestrator/plan-store.ts";
+import { listPlans, openPlansContextBlock } from "../orchestrator/plan-store.ts";
 import { dbFile } from "../cli/paths.ts";
 
 /**
@@ -143,7 +143,13 @@ export async function runDailyAudit(
   // self-documenting).
   const telemetry = computeTelemetry({ dataDir: input.dataDir, now });
   const learnReport = runLearnScan({ dataDir: input.dataDir, now });
-  const brief = composeBrief({ telemetry, learnReport, now });
+  const openPlans = openPlansContextBlock(input.dataDir, JARVIS_APP);
+  const brief = composeBrief({
+    telemetry,
+    learnReport,
+    now,
+    ...(openPlans !== null && { openPlans }),
+  });
 
   // Bail out cleanly when there's truly nothing to point at — no plan
   // transitions, no feedback, nothing in the learning loop. Avoids
@@ -345,6 +351,8 @@ function composeBrief(args: {
   telemetry: TelemetryReport;
   learnReport: LearnReport;
   now: Date;
+  /** Currently-open `jarvis` plans from `openPlansContextBlock(...)`. Optional. */
+  openPlans?: string;
 }): string {
   const lines: string[] = [];
   lines.push("Daily self-audit for the `jarvis` app itself.");
@@ -430,6 +438,10 @@ function composeBrief(args: {
     for (const r of args.learnReport.recommendations.slice(0, 5)) {
       lines.push(`- ${r}`);
     }
+  }
+  if (args.openPlans) {
+    lines.push("");
+    lines.push(args.openPlans);
   }
   return lines.join("\n");
 }
