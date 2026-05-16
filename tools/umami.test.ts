@@ -3,6 +3,7 @@ import {
   createUmamiClient,
   readUmamiConnection,
   UmamiApiError,
+  type UmamiEventCount,
 } from "./umami.ts";
 
 const SAMPLE_STATS = {
@@ -169,6 +170,131 @@ describe("createUmamiClient.getStats", () => {
   });
 });
 
+describe("createUmamiClient.getEvents", () => {
+  const SAMPLE_EVENTS_RAW = [
+    { x: "newsletter_signup", y: 8 },
+    { x: "owner_signup", y: 3 },
+  ];
+  const SAMPLE_EVENTS: UmamiEventCount[] = [
+    { eventName: "newsletter_signup", total: 8 },
+    { eventName: "owner_signup", total: 3 },
+  ];
+
+  it("builds correct URL with type=event and startAt/endAt params", async () => {
+    const calls: string[] = [];
+    const fetcher: typeof fetch = (async (url: string) => {
+      calls.push(url);
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const client = createUmamiClient({
+      apiUrl: "https://umami-self-seven.vercel.app",
+      apiToken: "tok_abc",
+      fetch: fetcher,
+    });
+
+    await client.getEvents("site-uuid", { startAt: 100, endAt: 200 });
+
+    expect(calls[0]).toBe(
+      "https://umami-self-seven.vercel.app/api/websites/site-uuid/metrics?type=event&startAt=100&endAt=200",
+    );
+  });
+
+  it("sends Authorization + Accept headers", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const fetcher: typeof fetch = (async (url: string, init?: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const client = createUmamiClient({
+      apiUrl: "https://u",
+      apiToken: "tok_events",
+      fetch: fetcher,
+    });
+
+    await client.getEvents("site", { startAt: 0, endAt: 1 });
+
+    const headers = calls[0]!.init!.headers as Record<string, string>;
+    expect(headers["Authorization"]).toBe("Bearer tok_events");
+    expect(headers["Accept"]).toBe("application/json");
+  });
+
+  it("parses {x, y}[] response into UmamiEventCount[]", async () => {
+    const fetcher: typeof fetch = (async () =>
+      new Response(JSON.stringify(SAMPLE_EVENTS_RAW), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    const client = createUmamiClient({ apiUrl: "https://u", apiToken: "t", fetch: fetcher });
+
+    const events = await client.getEvents("site", { startAt: 0, endAt: 1 });
+
+    expect(events).toEqual(SAMPLE_EVENTS);
+  });
+
+  it("returns [] on empty array response", async () => {
+    const fetcher: typeof fetch = (async () =>
+      new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    const client = createUmamiClient({ apiUrl: "https://u", apiToken: "t", fetch: fetcher });
+
+    const events = await client.getEvents("site", { startAt: 0, endAt: 1 });
+
+    expect(events).toEqual([]);
+  });
+
+  it("4xx throws non-transient UmamiApiError", async () => {
+    const fetcher: typeof fetch = (async () =>
+      new Response("Forbidden", { status: 403, statusText: "Forbidden" })) as typeof fetch;
+    const client = createUmamiClient({ apiUrl: "https://u", apiToken: "t", fetch: fetcher });
+
+    const err = await client
+      .getEvents("site", { startAt: 0, endAt: 1 })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UmamiApiError);
+    expect((err as UmamiApiError).status).toBe(403);
+    expect((err as UmamiApiError).transient).toBe(false);
+    expect((err as UmamiApiError).message).toMatch(/unauthenticated/);
+  });
+
+  it("schema mismatch on 2xx throws non-transient UmamiApiError", async () => {
+    const fetcher: typeof fetch = (async () =>
+      new Response(JSON.stringify([{ wrong: "shape" }]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    const client = createUmamiClient({ apiUrl: "https://u", apiToken: "t", fetch: fetcher });
+
+    const err = await client
+      .getEvents("site", { startAt: 0, endAt: 1 })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UmamiApiError);
+    expect((err as UmamiApiError).transient).toBe(false);
+    expect((err as UmamiApiError).message).toMatch(/schema/i);
+  });
+
+  it("network failure throws transient UmamiApiError with status 0", async () => {
+    const fetcher: typeof fetch = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as typeof fetch;
+    const client = createUmamiClient({ apiUrl: "https://u", apiToken: "t", fetch: fetcher });
+
+    const err = await client
+      .getEvents("site", { startAt: 0, endAt: 1 })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UmamiApiError);
+    expect((err as UmamiApiError).status).toBe(0);
+    expect((err as UmamiApiError).transient).toBe(true);
+  });
+});
+
 describe("readUmamiConnection", () => {
   it("returns null when umami key is absent", () => {
     expect(readUmamiConnection({})).toBeNull();
@@ -205,6 +331,17 @@ describe("readUmamiConnection", () => {
     });
     expect(conn).not.toBeNull();
     expect(conn?.websiteId).toBeUndefined();
+  });
+
+  it("parses trackedEvents field", () => {
+    const conn = readUmamiConnection({
+      umami: {
+        status: "connected",
+        scriptUrl: "https://x/script.js",
+        trackedEvents: ["newsletter_signup"],
+      },
+    });
+    expect(conn?.trackedEvents).toEqual(["newsletter_signup"]);
   });
 
   it("accepts domainsAttribute as null (huntech-dev shape)", () => {
