@@ -35,6 +35,7 @@ const umamiConnectionSchema = z.object({
   wiredAtCommit: z.string().optional(),
   domainsAttribute: z.string().nullable().optional(),
   note: z.string().optional(),
+  trackedEvents: z.array(z.string().min(1)).optional(),
 });
 
 export type UmamiConnection = z.infer<typeof umamiConnectionSchema>;
@@ -96,11 +97,25 @@ const umamiStatsResponseSchema = z.object({
 
 export type UmamiStats = z.infer<typeof umamiStatsResponseSchema>;
 
+export interface UmamiEventCount {
+  eventName: string;
+  total: number;
+}
+
+// Umami /metrics?type=event returns {x: eventName, y: count}[]
+const umamiEventsResponseSchema = z
+  .array(z.object({ x: z.string(), y: z.number() }))
+  .transform((arr) => arr.map((e) => ({ eventName: e.x, total: e.y })));
+
 export interface UmamiClient {
   getStats(
     websiteId: string,
     window: UmamiStatsWindow,
   ): Promise<UmamiStats>;
+  getEvents(
+    websiteId: string,
+    window: UmamiStatsWindow,
+  ): Promise<UmamiEventCount[]>;
 }
 
 export class UmamiApiError extends Error {
@@ -198,6 +213,76 @@ export function createUmamiClient(opts: UmamiClientOptions): UmamiClient {
       if (!parsed.success) {
         throw new UmamiApiError(
           `Umami stats response failed schema validation: ${parsed.error.message}`,
+          { status: response.status, transient: false },
+        );
+      }
+      return parsed.data;
+    },
+
+    async getEvents(websiteId, window) {
+      if (websiteId.trim().length === 0) {
+        throw new UmamiApiError("websiteId is required", {
+          status: 0,
+          transient: false,
+        });
+      }
+      const url =
+        `${baseUrl}/api/websites/${encodeURIComponent(websiteId)}/metrics` +
+        `?type=event&startAt=${window.startAt}&endAt=${window.endAt}`;
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      let response: Response;
+      try {
+        response = await fetcher(url, {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${opts.apiToken}`,
+            Accept: "application/json",
+          },
+          signal: controller.signal,
+        });
+      } catch (err) {
+        throw new UmamiApiError(
+          `network error calling Umami events: ${err instanceof Error ? err.message : String(err)}`,
+          { status: 0, transient: true },
+        );
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (!response.ok) {
+        const transient = response.status >= 500 || response.status === 429;
+        let detail = "";
+        try {
+          const text = await response.text();
+          detail = text.slice(0, 500);
+        } catch {
+          // best-effort
+        }
+        const hint =
+          response.status === 401 || response.status === 403
+            ? " (unauthenticated — check UMAMI_API_TOKEN scope)"
+            : "";
+        throw new UmamiApiError(
+          `Umami events ${response.status} ${response.statusText}${hint}: ${detail}`,
+          { status: response.status, transient },
+        );
+      }
+
+      let json: unknown;
+      try {
+        json = await response.json();
+      } catch (err) {
+        throw new UmamiApiError(
+          `Umami events 2xx but body wasn't JSON: ${err instanceof Error ? err.message : String(err)}`,
+          { status: response.status, transient: false },
+        );
+      }
+      const parsed = umamiEventsResponseSchema.safeParse(json);
+      if (!parsed.success) {
+        throw new UmamiApiError(
+          `Umami events response failed schema validation: ${parsed.error.message}`,
           { status: response.status, transient: false },
         );
       }
