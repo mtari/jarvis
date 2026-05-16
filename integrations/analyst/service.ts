@@ -15,6 +15,7 @@ import { cleanupSuppressions } from "../../orchestrator/suppressions.ts";
 import { dbFile } from "../../cli/paths.ts";
 import brokenLinksCollector from "../../tools/scanners/broken-links.ts";
 import contentFreshnessCollector from "../../tools/scanners/content-freshness.ts";
+import umamiMetricsCollector from "../../tools/scanners/umami-metrics.ts";
 import yarnAuditCollector from "../../tools/scanners/yarn-audit.ts";
 import type {
   CollectorContext,
@@ -33,6 +34,7 @@ const DEFAULT_COLLECTORS: ReadonlyArray<SignalCollector> = [
   yarnAuditCollector,
   brokenLinksCollector,
   contentFreshnessCollector,
+  umamiMetricsCollector,
 ];
 
 const DEFAULT_TICK_MS = 60 * 60 * 1000; // 1 hour
@@ -234,7 +236,7 @@ export async function runAnalystTick(
     const cwd = brain.repo.monorepoPath
       ? path.join(brain.repo.rootPath, brain.repo.monorepoPath)
       : brain.repo.rootPath;
-    const ctx: CollectorContext = { cwd, app };
+    const ctx: CollectorContext = { cwd, app, connections: brain.connections };
 
     try {
       const scan = await runAnalystScan({

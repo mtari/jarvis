@@ -440,7 +440,7 @@ export async function observeImpact(
     dataDir: input.dataDir,
     app,
     vault,
-    ctx: { cwd, app },
+    ctx: { cwd, app, connections: brain.connections },
     collectors: input.collectors,
   });
 

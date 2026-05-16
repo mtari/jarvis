@@ -1,14 +1,16 @@
 import { parseArgs } from "node:util";
 import { runAnalystScan } from "../../agents/analyst.ts";
 import { loadBrain } from "../../orchestrator/brain.ts";
+import { loadEnvFile } from "../../orchestrator/env-loader.ts";
 import brokenLinksCollector from "../../tools/scanners/broken-links.ts";
 import contentFreshnessCollector from "../../tools/scanners/content-freshness.ts";
+import umamiMetricsCollector from "../../tools/scanners/umami-metrics.ts";
 import yarnAuditCollector from "../../tools/scanners/yarn-audit.ts";
 import type {
   SignalCollector,
   Signal,
 } from "../../tools/scanners/types.ts";
-import { brainFile, getDataDir } from "../paths.ts";
+import { brainFile, envFile, getDataDir } from "../paths.ts";
 import path from "node:path";
 
 /**
@@ -24,6 +26,7 @@ const DEFAULT_COLLECTORS: ReadonlyArray<SignalCollector> = [
   yarnAuditCollector,
   brokenLinksCollector,
   contentFreshnessCollector,
+  umamiMetricsCollector,
 ];
 
 export async function runScan(
@@ -53,6 +56,7 @@ export async function runScan(
   const vault = v.vault ?? "personal";
 
   const dataDir = getDataDir();
+  loadEnvFile(envFile(dataDir));
   let brain;
   try {
     brain = loadBrain(brainFile(dataDir, vault, v.app));
@@ -83,7 +87,7 @@ export async function runScan(
     dataDir,
     app: v.app,
     vault,
-    ctx: { cwd, app: v.app },
+    ctx: { cwd, app: v.app, connections: brain.connections },
     collectors,
   });
 

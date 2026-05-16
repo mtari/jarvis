@@ -51,6 +51,18 @@ export interface CollectorContext {
   cwd: string;
   /** App id from the brain. Goes onto recorded signal events. */
   app: string;
+  /**
+   * Optional `brain.connections` map for the app being scanned. Passed
+   * by the daemon / scan CLI / observe-impact path so connection-aware
+   * collectors (Umami metrics, future Facebook health, etc.) can read
+   * per-app credentials and IDs without reloading the brain. Collectors
+   * that don't need connection data can ignore this field.
+   *
+   * Typed as `Record<string, unknown>` to avoid coupling the scanner
+   * contract to the brain schema — each collector validates the slot it
+   * cares about (see `readUmamiConnection` in `tools/umami.ts`).
+   */
+  connections?: Record<string, unknown>;
 }
 
 /**
