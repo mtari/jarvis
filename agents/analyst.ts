@@ -440,7 +440,12 @@ export async function observeImpact(
     dataDir: input.dataDir,
     app,
     vault,
-    ctx: { cwd, app, connections: brain.connections },
+    ctx: {
+      cwd,
+      app,
+      connections: brain.connections,
+      ...(brain.alertThresholds !== undefined ? { alertThresholds: brain.alertThresholds } : {}),
+    },
     collectors: input.collectors,
   });
 
