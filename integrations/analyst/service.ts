@@ -236,7 +236,12 @@ export async function runAnalystTick(
     const cwd = brain.repo.monorepoPath
       ? path.join(brain.repo.rootPath, brain.repo.monorepoPath)
       : brain.repo.rootPath;
-    const ctx: CollectorContext = { cwd, app, connections: brain.connections };
+    const ctx: CollectorContext = {
+      cwd,
+      app,
+      connections: brain.connections,
+      ...(brain.alertThresholds !== undefined ? { alertThresholds: brain.alertThresholds } : {}),
+    };
 
     try {
       const scan = await runAnalystScan({

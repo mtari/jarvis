@@ -860,7 +860,7 @@ Analyst is reactive: watch everything, filter aggressively, only a tiny fraction
 
 ### Signal sources
 
-- **App metrics:** Umami (traffic, funnel, source attribution — self-hosted) + Supabase (signups, active users, conversions, revenue when live).
+- **App metrics:** Umami (traffic, funnel, source attribution — self-hosted) + Supabase (signups, active users, conversions, revenue when live). Traffic signals are now graded low/medium/high/critical; `critical` (site went dark) auto-triggers Strategist; medium/high land in the inbox for manual review.
 - **Security:** `yarn audit`, GitHub Dependabot alerts, monitored CVE feeds.
 - **Dependency health:** outdated majors, deprecated packages, security advisories.
 - **Link health:** periodic broken-link crawl per app.
@@ -1393,7 +1393,7 @@ Once the code-repo structure is in place, write `jarvis/CLAUDE.md` (the repo-lev
 
 **Shipped (PRs #17–#43):**
 
-- ✅ **Analyst** — signal collector framework + `yarn-audit`, `broken-links`, `content-freshness`, and `umami-metrics` collectors (PRs #17, #21, #22; umami-metrics — Tier 1 raw-snapshot collector, plan `2026-05-16-umami-metrics-collector-tier-1`, `tools/umami.ts` + `tools/scanners/umami-metrics.ts`). Hourly daemon sweep across every onboarded app with `brain.repo` configured (#18). Auto-draft hand-off to Strategist when signals at/above a severity threshold land (#19). Suppressions table with glob pattern matching (#20, #24) plus per-tick GC of expired/cleared rows (#23). Per-vault SQL signals listing CLI (#25). Post-merge observation primitive `observeImpact` + auto-fire on `shipped-pending-impact` plans aged ≥24h (#28, #29). Weekly triage report (CLI `yarn jarvis triage` + daemon-driven Monday-morning file write at `<dataDir>/triage/<date>.md`, PRs #26, #27).
+- ✅ **Analyst** — signal collector framework + `yarn-audit`, `broken-links`, `content-freshness`, and `umami-metrics` collectors (PRs #17, #21, #22; umami-metrics — Tier 1 raw-snapshot collector, plan `2026-05-16-umami-metrics-collector-tier-1`, `tools/umami.ts` + `tools/scanners/umami-metrics.ts`). Hourly daemon sweep across every onboarded app with `brain.repo` configured (#18). Auto-draft hand-off to Strategist when signals at/above a severity threshold land (#19). Suppressions table with glob pattern matching (#20, #24) plus per-tick GC of expired/cleared rows (#23). Per-vault SQL signals listing CLI (#25). Post-merge observation primitive `observeImpact` + auto-fire on `shipped-pending-impact` plans aged ≥24h (#28, #29). Weekly triage report (CLI `yarn jarvis triage` + daemon-driven Monday-morning file write at `<dataDir>/triage/<date>.md`, PRs #26, #27). ✅ **Umami metrics collector — Tier 2** — anomaly detection with graded signals (low/medium/high/critical); per-app `alertThresholds.umami` overrides; prior-24h comparison via second API call; `critical` signals (site went dark) auto-trigger Strategist; medium/high land in the inbox for manual review.
 - ✅ **Scout** — `Business_Ideas.md` format + parser (#30). LLM-driven scoring with strict `<score>` JSON protocol (#31). Top-N recommendations in the triage report with an "unscored" hint that drives the user to `yarn jarvis scout score` (#32). Auto-draft of high-scoring ideas to Strategist via `yarn jarvis scout draft` (#33).
 - ✅ **§12 amendment flow + escalate-within-plan** — AMEND text protocol from Developer, checkpoint capture, plan-body update, `[AMEND]` inbox tag, auto-resume from checkpoint after approval, checkpoint cleanup on reject (PRs #34–#36). Slack amendment review surface with proposal context + approve/revise/reject buttons (#38). See §12 for the full implementation status.
 - ✅ **Slack-primary buildout** — Slack now surfaces every actionable plan event and every notable system event:
@@ -1407,7 +1407,7 @@ Once the code-repo structure is in place, write `jarvis/CLAUDE.md` (the repo-lev
 **Deferred to later phases:**
 
 - **Marketer in executor pool** — blocked on the Phase 3 Marketer agent build.
-- **Umami metrics collector — Tier 2 (anomaly detection)** — Tier 1 raw-snapshot collector shipped (`tools/scanners/umami-metrics.ts`; emits one low-severity observation per app per day). Remaining: week-over-week severity escalation, per-event tracking (newsletter_signup, etc.), tunable thresholds in `brain.alertThresholds`, wiring into Analyst's auto-draft path so a meaningful traffic drop triggers a Strategist plan.
+- **Umami metrics collector — Tier 3** — 7-day rolling comparison, per-event tracking (funnel analysis, `newsletter_signup` conversions via `/api/websites/:id/events`), same-day-last-week baseline to handle weekday/weekend cycles.
 - **Scheduled-post review** Slack surface — depends on Marketer (Phase 3).
 - **Slash-command coverage gaps** — `/jarvis scout score|draft`, `/jarvis scan`, `/jarvis approve|revise|reject <id>` aren't slash-aliased yet. Buttons cover the approve/revise/reject path; the rest lands as polish if/when the typing rate justifies it.
 - **Multi-vault Slack channel mapping** — current architecture assumes one inbox + one alerts channel for the whole portfolio; multi-vault mapping is a Phase 4+ refinement.

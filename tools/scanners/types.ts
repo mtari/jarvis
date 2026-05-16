@@ -63,6 +63,12 @@ export interface CollectorContext {
    * cares about (see `readUmamiConnection` in `tools/umami.ts`).
    */
   connections?: Record<string, unknown>;
+  /**
+   * Optional `brain.alertThresholds` for the app being scanned. Passed
+   * by the same callsites that pass `connections`. Collectors that don't
+   * use threshold logic ignore this field.
+   */
+  alertThresholds?: Record<string, unknown>;
 }
 
 /**

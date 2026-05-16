@@ -87,7 +87,12 @@ export async function runScan(
     dataDir,
     app: v.app,
     vault,
-    ctx: { cwd, app: v.app, connections: brain.connections },
+    ctx: {
+        cwd,
+        app: v.app,
+        connections: brain.connections,
+        ...(brain.alertThresholds !== undefined ? { alertThresholds: brain.alertThresholds } : {}),
+      },
     collectors,
   });
 
